@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from dreamer4.modality import Modality, TokenLayout
-from dreamer4.layers import SpaceAttention, TimeAttention, BlockCausalLayer
+from dreamer4.transformer.layers import SpaceAttention, TimeAttention, BlockCausalLayer
 
 
 def _encoder_layout(n_latents: int = 4, n_patches: int = 16) -> TokenLayout:

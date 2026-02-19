@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from dreamer4.mlp import SwiGLU
+from dreamer4.transformer.mlp import SwiGLU
 
 
 def test_output_shape():

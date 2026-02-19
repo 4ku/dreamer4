@@ -62,8 +62,8 @@ import torch
 import torch.nn as nn
 
 from dreamer4.modality import TokenLayout
-from dreamer4.norms import RMSNorm
-from dreamer4.layers import BlockCausalLayer
+from dreamer4.transformer.norms import RMSNorm
+from dreamer4.transformer.layers import BlockCausalLayer
 
 
 class BlockCausalTransformer(nn.Module):

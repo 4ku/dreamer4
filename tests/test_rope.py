@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from dreamer4.rope import build_rope_cache, apply_rope, build_rope_2d
+from dreamer4.transformer.rope import build_rope_cache, apply_rope, build_rope_2d
 
 
 # ===== Shape tests =====

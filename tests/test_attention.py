@@ -3,8 +3,8 @@
 import torch
 import pytest
 
-from dreamer4.attention import MultiheadAttention
-from dreamer4.rope import build_rope_cache
+from dreamer4.transformer.attention import MultiheadAttention
+from dreamer4.transformer.rope import build_rope_cache
 
 
 # ===== Shape tests =====

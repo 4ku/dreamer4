@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from dreamer4.norms import RMSNorm, QKNorm
+from dreamer4.transformer.norms import RMSNorm, QKNorm
 
 
 # ===== RMSNorm tests =====

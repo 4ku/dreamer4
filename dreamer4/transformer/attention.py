@@ -38,8 +38,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dreamer4.norms import QKNorm
-from dreamer4.rope import apply_rope
+from dreamer4.transformer.norms import QKNorm
+from dreamer4.transformer.rope import apply_rope
 
 
 class MultiheadAttention(nn.Module):
