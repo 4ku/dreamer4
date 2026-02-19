@@ -1,0 +1,43 @@
+[project]
+name = "dreamer4-pytorch"
+version = "0.1.0"
+description = "Dreamer 4 — PyTorch implementation of a scalable world model agent"
+requires-python = ">=3.10"
+
+dependencies = [
+    # Core
+    "torch>=2.2",
+    # Perceptual loss for tokenizer training
+    "lpips",
+    # Config
+    "pyyaml",
+    # Utilities
+    "numpy",
+    "einops",
+    # Visualization
+    "matplotlib",
+    # Testing
+    "pytest",
+]
+
+[project.optional-dependencies]
+envs = [
+    # Environments — install separately: uv pip install -e ".[envs]"
+    # Requires Python <=3.12 for pre-built mujoco/labmaze wheels.
+    "dm_control",
+    "gymnasium",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dreamer4*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
