@@ -1,9 +1,9 @@
 # Toy Examples for the Block-Causal Transformer
 
-Four runnable scripts that verify the transformer works end-to-end on
-synthetic tasks.  Each script trains a tiny model, asserts that the loss
-drops significantly, and saves visualisation plots to the `outputs/`
-directory.
+Five runnable scripts that verify the transformer and tokenizer work
+end-to-end on synthetic tasks.  Each script trains a tiny model, asserts
+that the loss drops significantly, and saves visualisation plots to the
+`outputs/` directory.
 
 ## Prerequisites
 
@@ -87,6 +87,31 @@ must learn spatial structure (where is the ball?) and temporal dynamics
 |------|-------------|
 | `outputs/bouncing_ball_loss.png` | Training loss (log scale) vs step. |
 | `outputs/bouncing_ball_frames.png` | Three rows: ground-truth target frames, model-predicted frames, and the absolute difference.  After training the predictions should closely match. |
+
+### 5. Tokenizer Reconstruction (Causal Tokenizer)
+
+```bash
+python -m examples.tokenizer_recon
+```
+
+Trains the full **Causal Tokenizer** (Encoder -> bottleneck -> Decoder)
+to reconstruct bouncing-ball video frames using the paper's exact training
+objective (Section 3.1, Eq. 5):
+
+    L = L_MSE + 0.2 * L_LPIPS    (both RMS-normalized)
+
+MAE masking with `p ~ U(0, 0.9)` drops random encoder input patches.
+MSE is computed on masked patches only (`recon_loss_from_mae`), while
+LPIPS is computed on composited full images (`lpips_on_mae_recon`).
+Both loss terms are RMS-normalized before combining (`RMSLossNormalizer`).
+
+**Plots saved:**
+
+| File | Description |
+|------|-------------|
+| `outputs/tokenizer_recon_loss.png` | Combined loss, MSE, LPIPS, and eval MSE vs step (log scale). |
+| `outputs/tokenizer_recon_frames.png` | Ground-truth frames vs tokenizer reconstructions for several eval trajectories. |
+| `outputs/tokenizer_recon_mae_pipeline.png` | MAE pipeline: original frames, masked encoder input, and reconstructed output. |
 
 ## Output directory
 

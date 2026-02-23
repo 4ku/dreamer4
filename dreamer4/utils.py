@@ -1,16 +1,15 @@
 """
 Utility functions for Dreamer 4.
 
-This module provides low-level helpers used across the codebase,
-starting with image patchification (splitting images into non-overlapping
-patches and reassembling them).
+This module provides low-level helpers used across the codebase:
 
-Patchification is the first step in the Dreamer 4 tokenizer:
-  raw image (C, H, W) -> grid of patches (N_patches, patch_dim)
+1. **Patchify / Unpatchify** — split images into non-overlapping patches
+   and reassemble them. First step in the tokenizer pipeline.
 
-Each patch is a small square region of the image (e.g., 16x16 pixels)
-flattened into a vector. For a 224x224 image with 16x16 patches, we get
-(224/16) * (224/16) = 196 patches, each of dimension 16*16*3 = 768.
+2. **Bottleneck packing** — reshape tokenizer bottleneck representations
+   for consumption by the dynamics model. The tokenizer produces
+   (N_b, D_b) latents which are packed to (N_z, D_b * k) spatial tokens
+   where N_z = N_b / k  (Paper Appendix A).
 """
 
 import torch
@@ -107,3 +106,55 @@ def unpatchify(
     images = F.fold(x, output_size=(H, W), kernel_size=patch_size, stride=patch_size)
 
     return images.reshape(B, T, C, H, W)
+
+
+# ---------------------------------------------------------------------------
+# Bottleneck packing (tokenizer <-> dynamics interface)
+# ---------------------------------------------------------------------------
+
+def pack_bottleneck_to_spatial(
+    z: torch.Tensor, *, n_spatial: int, k: int
+) -> torch.Tensor:
+    """
+    Pack tokenizer bottleneck into dynamics spatial tokens.
+
+    The tokenizer bottleneck has shape (B, T, N_b, D_b) where N_b = n_spatial * k.
+    This reshapes to (B, T, n_spatial, D_b * k) for the dynamics model.
+
+    Example (Minecraft, Appendix A):
+        N_b=512, D_b=16, k=2 -> n_spatial=256, D_spatial=32
+
+    Args:
+        z: (B, T, N_b, D_b) bottleneck tensor.
+        n_spatial: Number of spatial tokens for dynamics.
+        k: Packing factor (N_b / n_spatial).
+
+    Returns:
+        (B, T, n_spatial, D_b * k) packed tensor.
+    """
+    B, T, N_b, D_b = z.shape
+    assert N_b == n_spatial * k, (
+        f"N_b={N_b} must equal n_spatial*k={n_spatial * k}"
+    )
+    return z.reshape(B, T, n_spatial, k * D_b)
+
+
+def unpack_spatial_to_bottleneck(
+    z: torch.Tensor, *, k: int
+) -> torch.Tensor:
+    """
+    Unpack dynamics spatial tokens back to tokenizer bottleneck shape.
+
+    Inverse of pack_bottleneck_to_spatial.
+
+    Args:
+        z: (B, T, n_spatial, D_b * k) packed tensor.
+        k: Packing factor.
+
+    Returns:
+        (B, T, n_spatial * k, D_b) bottleneck tensor.
+    """
+    B, T, S, DK = z.shape
+    assert DK % k == 0, f"Last dim {DK} must be divisible by k={k}"
+    D_b = DK // k
+    return z.reshape(B, T, S * k, D_b)
