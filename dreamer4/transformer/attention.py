@@ -89,7 +89,7 @@ class MultiheadAttention(nn.Module):
 
         # Q has n_heads * head_dim = d_model parameters
         # K, V each have n_kv_heads * head_dim parameters (less if GQA)
-        self.q_proj = nn.Linear(d_model, n_heads * self.head_dim, bias=True)
+        self.q_proj = nn.Linear(d_model, d_model, bias=True)
         self.k_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=True)
         self.out_proj = nn.Linear(d_model, d_model, bias=True)
@@ -174,7 +174,7 @@ class MultiheadAttention(nn.Module):
             drop = self.dropout_p if self.training else 0.0
             if drop > 0:
                 weights = F.dropout(weights, p=drop)
-            y = torch.matmul(weights, v)
+            y = torch.matmul(weights, v) # (N, n_heads, L, head_dim)
         else:
             # Use PyTorch's fused SDPA (faster, no logit capping)
             drop = self.dropout_p if self.training else 0.0
@@ -183,7 +183,7 @@ class MultiheadAttention(nn.Module):
                 attn_mask=attn_mask,
                 dropout_p=drop,
                 is_causal=is_causal,
-            )
+            ) # (N, n_heads, L, head_dim)
 
         # Concat heads and project out: (N, n_heads, L, head_dim) -> (N, L, D)
         y = y.transpose(1, 2).contiguous().view(N, L, D)

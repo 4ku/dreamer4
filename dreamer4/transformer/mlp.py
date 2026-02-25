@@ -59,7 +59,7 @@ class SwiGLU(nn.Module):
         torch.Size([2, 16, 256])
     """
 
-    def __init__(self, d_model: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+    def __init__(self, d_model: int, mlp_ratio: float = 8/3, dropout: float = 0.0):
         super().__init__()
         hidden = int(d_model * mlp_ratio)
 
