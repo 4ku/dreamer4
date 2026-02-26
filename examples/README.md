@@ -1,8 +1,8 @@
 # Toy Examples for the Block-Causal Transformer
 
-Seven runnable scripts that verify the transformer, tokenizer, dynamics
-model, and agent heads end-to-end on synthetic tasks.  Each script trains
-a tiny model, asserts that the loss drops significantly, and saves
+Eight runnable scripts that verify the transformer, tokenizer, dynamics
+model, agent heads, and imagination training end-to-end.  Each script
+trains a tiny model, asserts that the loss drops, and saves
 visualisation plots to the `outputs/` directory.
 
 ## Prerequisites
@@ -260,6 +260,52 @@ four evaluation trajectories, five rows are displayed:
 A bottom legend explains all border colors and line styles.
 
 ![full_pipeline_frames](outputs/full_pipeline_frames.png)
+
+### 8. DMControl Imagination Training (Full Pipeline)
+
+```bash
+MUJOCO_GL=egl python -m examples.dmcontrol_imagination
+```
+
+End-to-end demonstration of the **complete Dreamer 4 pipeline** on a real
+visual RL task (cartpole-swingup from DMControl).  Uses the new Module 5
+imagination training infrastructure (`dreamer4.imagination`,
+`dreamer4.envs`, `dreamer4.replay`) to run all paper phases on 64x64
+pixel observations with continuous actions:
+
+1. **Phase 0 — Data collection** — collects random-policy episodes into a
+   replay buffer (~40 episodes, ~20k transitions).
+2. **Phase 1a — Tokenizer pretraining** — trains the causal Encoder-Decoder
+   on video subsequences from the replay buffer with MSE + 0.2 LPIPS.
+3. **Phase 1b — Dynamics pretraining** — freezes the tokenizer, encodes
+   replay data to latent space, trains the `DynamicsModel` with shortcut
+   forcing.
+4. **Phase 2 — Agent finetuning** — creates a dynamics model with agent
+   tokens, copies pretrained weights, and jointly trains dynamics +
+   `PolicyHead` (behavior cloning) + `RewardHead` (reward prediction).
+5. **Phase 3 — Imagination training** — freezes the world model; uses
+   `imagine_rollout()` to generate trajectories inside the learned world
+   model with the policy sampling actions; trains the `ValueHead` with
+   TD(lambda) and finetunes the policy via `imagination_training_step()`
+   using PMPO with KL regularization to a behavioral prior.
+6. **Evaluation** — runs the learned policy in the real environment and
+   reports episode returns.
+
+Uses tiny model sizes (~300K-2.7M parameters) and completes in ~4 minutes
+on a single GPU.
+
+**Requires:** `dm_control`, `mujoco`, `gymnasium` (all pre-installed).
+Set `MUJOCO_GL=egl` for headless rendering.
+
+**Plots saved:**
+
+| File | Description |
+|------|-------------|
+| `outputs/dmc_tok_loss.png` | Tokenizer pretraining loss vs step. |
+| `outputs/dmc_dyn_loss.png` | Dynamics shortcut forcing loss vs step. |
+| `outputs/dmc_agent_loss.png` | Phase 2 losses: dynamics, BC, reward prediction. |
+| `outputs/dmc_imagination_loss.png` | Phase 3: PMPO policy loss + TD-lambda value loss (dual Y-axes). |
+| `outputs/dmc_frames.png` | Visualization comparing GT frames, tokenizer reconstructions, and dynamics-generated frames for cartpole-swingup trajectories. Green border = context; blue = predicted. |
 
 ## Output directory
 
