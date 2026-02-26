@@ -333,20 +333,20 @@ class TestTokenizer:
 
 class TestReconLoss:
 
-    def test_zero_when_no_mask(self):
-        """If nothing is masked, MSE loss should be 0."""
+    def test_zero_when_all_masked(self):
+        """If everything is masked (hidden from encoder), no visible patches -> loss 0."""
         pred = torch.rand(B, T, N_PATCHES, PATCH_DIM)
         target = torch.rand(B, T, N_PATCHES, PATCH_DIM)
-        mask = torch.zeros(B, T, N_PATCHES, 1, dtype=torch.bool)
+        mask = torch.ones(B, T, N_PATCHES, 1, dtype=torch.bool)
 
         loss = recon_loss_from_mae(pred, target, mask)
         assert loss.item() == 0.0
 
-    def test_correct_when_all_masked(self):
-        """If everything is masked, loss should equal full MSE."""
+    def test_correct_when_no_mask(self):
+        """If nothing is masked, all patches are visible -> full MSE."""
         pred = torch.rand(B, T, N_PATCHES, PATCH_DIM)
         target = torch.rand(B, T, N_PATCHES, PATCH_DIM)
-        mask = torch.ones(B, T, N_PATCHES, 1, dtype=torch.bool)
+        mask = torch.zeros(B, T, N_PATCHES, 1, dtype=torch.bool)
 
         loss = recon_loss_from_mae(pred, target, mask)
         expected = (pred.float() - target.float()).pow(2).mean()
@@ -361,17 +361,16 @@ class TestReconLoss:
         loss.backward()
         assert pred.grad is not None
 
-    def test_only_masked_contributes(self):
-        """Only masked patches should affect the gradient."""
+    def test_only_visible_contributes(self):
+        """Only visible (not masked) patches should affect the gradient."""
         pred = torch.rand(1, 1, 4, PATCH_DIM, requires_grad=True)
         target = torch.rand(1, 1, 4, PATCH_DIM)
-        mask = torch.zeros(1, 1, 4, 1, dtype=torch.bool)
-        mask[0, 0, 0, 0] = True  # only patch 0 masked
+        mask = torch.ones(1, 1, 4, 1, dtype=torch.bool)
+        mask[0, 0, 0, 0] = False  # only patch 0 visible
 
         loss = recon_loss_from_mae(pred, target, mask)
         loss.backward()
 
-        # Gradient should be nonzero only for patch 0
         assert pred.grad[0, 0, 0].abs().sum() > 0
         assert pred.grad[0, 0, 1].abs().sum() == 0
         assert pred.grad[0, 0, 2].abs().sum() == 0

@@ -1,9 +1,9 @@
 # Toy Examples for the Block-Causal Transformer
 
-Five runnable scripts that verify the transformer and tokenizer work
-end-to-end on synthetic tasks.  Each script trains a tiny model, asserts
-that the loss drops significantly, and saves visualisation plots to the
-`outputs/` directory.
+Six runnable scripts that verify the transformer, tokenizer, and dynamics
+model work end-to-end on synthetic tasks.  Each script trains a tiny
+model, asserts that the loss drops significantly, and saves visualisation
+plots to the `outputs/` directory.
 
 ## Prerequisites
 
@@ -156,6 +156,46 @@ Both loss terms are RMS-normalized before combining (`RMSLossNormalizer`).
 *MAE pipeline visualisation with 34% of patches masked. Top row: original frames. Middle row: encoder input after MAE masking -- several patches are zeroed out, visibly removing parts of the ball. Bottom row: decoder reconstruction, which recovers the full ball despite the missing patches, demonstrating the tokenizer's robustness to partial observations.*
 
 ![tokenizer_recon_mae_pipeline](outputs/tokenizer_recon_mae_pipeline.png)
+
+### 6. Dynamics Bouncing Ball (Full Pipeline)
+
+```bash
+python -m examples.dynamics_bouncing_ball
+```
+
+End-to-end test of the **Shortcut Forcing dynamics pipeline** with a
+real causal tokenizer.  Runs three phases:
+
+1. **Tokenizer pretraining** — trains the full Encoder-Decoder with
+   the paper's Eq. 5 loss (MSE + 0.2·LPIPS, RMS-normalized) so the
+   tokenizer learns a meaningful latent space.
+2. **Dynamics training** — freezes the tokenizer, encodes all data
+   into the latent space via `pack_bottleneck_to_spatial`, and trains
+   the `DynamicsModel` with shortcut forcing (flow matching +
+   bootstrap self-consistency).
+3. **Sampling & decode** — generates frames autoregressively in
+   latent space using K-step Euler denoising, then decodes back to
+   pixels through the tokenizer decoder.
+
+**Plots saved:**
+
+| File | Description |
+|------|-------------|
+| `outputs/dynamics_ball_tok_loss.png` | Tokenizer pretraining loss (combined + eval MSE) vs step. |
+| `outputs/dynamics_ball_loss.png` | Dynamics shortcut forcing loss (combined, flow MSE, bootstrap MSE) vs step. |
+| `outputs/dynamics_ball_frames.png` | For each trajectory: ground-truth frames (TRUE), tokenizer reconstruction (RECON, grey border), and dynamics-generated frames (GEN). Green border = context frames fed as input; blue border = predicted frames from autoregressive rollout. |
+
+*Tokenizer pretraining: combined RMS-normalized loss (blue) stabilises around 1.0; eval full-image MSE (orange) drops to ~2e-5, indicating near-perfect reconstruction.*
+
+![dynamics_ball_tok_loss](outputs/dynamics_ball_tok_loss.png)
+
+*Dynamics training: combined shortcut forcing loss (blue) drops from ~0.2 to ~0.006 over 3000 steps. Flow MSE (orange, dashed) and bootstrap MSE (green, dotted) both decrease steadily.*
+
+![dynamics_ball_loss](outputs/dynamics_ball_loss.png)
+
+*Four trajectories (8 frames each) with three rows per trajectory. TRUE: ground-truth frames. RECON (grey border): tokenizer-only encode-decode, confirming the latent space is faithful. GEN: dynamics model output decoded through the tokenizer — green-bordered frames are ground-truth context fed as input, blue-bordered frames are autoregressively generated predictions. The generated ball positions track the true trajectory.*
+
+![dynamics_ball_frames](outputs/dynamics_ball_frames.png)
 
 ## Output directory
 

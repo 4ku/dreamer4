@@ -1,6 +1,8 @@
+.cursor/
 .venv/
 .pytest_cache/
 __pycache__
 *.egg-info/
 dreamer4_unofficial
 dreamer4_lucidrains
+shortcut-models/
