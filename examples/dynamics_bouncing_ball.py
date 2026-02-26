@@ -343,7 +343,7 @@ def main() -> None:
     HORIZON = T - N_CTX
 
     with torch.no_grad():
-        gen_z = sample_sequence(
+        gen_z, _ = sample_sequence(
             dynamics,
             context=eval_z[:, :N_CTX],
             horizon=HORIZON,

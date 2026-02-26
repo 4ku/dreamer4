@@ -394,16 +394,20 @@ class TestSampling:
     def test_sample_one_timestep_shape(self, dynamics, device):
         dynamics.eval()
         past = torch.randn(B, 3, N_SPATIAL, D_SPATIAL, device=device)
-        out = sample_one_timestep(
+        out, a_out = sample_one_timestep(
             dynamics, past_packed=past, k_max=K_MAX, K=2,
         )
         assert out.shape == (B, N_SPATIAL, D_SPATIAL)
+        if dynamics.n_agent > 0:
+            assert a_out.shape == (B, dynamics.n_agent, dynamics.d_model)
+        else:
+            assert a_out is None
 
     def test_sample_one_timestep_with_actions(self, dynamics, device):
         dynamics.eval()
         past = torch.randn(B, 3, N_SPATIAL, D_SPATIAL, device=device)
         actions = torch.randn(B, 4, ACTION_DIM, device=device)
-        out = sample_one_timestep(
+        out, _ = sample_one_timestep(
             dynamics, past_packed=past, k_max=K_MAX, K=2,
             actions=actions,
         )
@@ -412,7 +416,7 @@ class TestSampling:
     def test_sample_one_timestep_finite(self, dynamics, device):
         dynamics.eval()
         past = torch.randn(B, 2, N_SPATIAL, D_SPATIAL, device=device)
-        out = sample_one_timestep(
+        out, _ = sample_one_timestep(
             dynamics, past_packed=past, k_max=K_MAX, K=2,
         )
         assert torch.isfinite(out).all()
@@ -420,7 +424,7 @@ class TestSampling:
     def test_sample_one_timestep_no_context(self, dynamics, device):
         dynamics.eval()
         past = torch.randn(B, 0, N_SPATIAL, D_SPATIAL, device=device)
-        out = sample_one_timestep(
+        out, _ = sample_one_timestep(
             dynamics, past_packed=past, k_max=K_MAX, K=2,
         )
         assert out.shape == (B, N_SPATIAL, D_SPATIAL)
@@ -428,16 +432,21 @@ class TestSampling:
     def test_sample_sequence_shape(self, dynamics, device):
         dynamics.eval()
         context = torch.randn(B, 2, N_SPATIAL, D_SPATIAL, device=device)
-        out = sample_sequence(
+        out, a_outs = sample_sequence(
             dynamics, context=context, horizon=3,
             k_max=K_MAX, K=2,
         )
         assert out.shape == (B, 5, N_SPATIAL, D_SPATIAL)
+        if dynamics.n_agent > 0:
+            assert len(a_outs) == 3
+            assert a_outs[0].shape == (B, dynamics.n_agent, dynamics.d_model)
+        else:
+            assert a_outs is None
 
     def test_sample_sequence_context_preserved(self, dynamics, device):
         dynamics.eval()
         context = torch.randn(B, 2, N_SPATIAL, D_SPATIAL, device=device)
-        out = sample_sequence(
+        out, _ = sample_sequence(
             dynamics, context=context, horizon=2,
             k_max=K_MAX, K=2, tau_ctx=0.0,
         )

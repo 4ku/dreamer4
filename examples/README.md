@@ -1,9 +1,9 @@
 # Toy Examples for the Block-Causal Transformer
 
-Six runnable scripts that verify the transformer, tokenizer, and dynamics
-model work end-to-end on synthetic tasks.  Each script trains a tiny
-model, asserts that the loss drops significantly, and saves visualisation
-plots to the `outputs/` directory.
+Seven runnable scripts that verify the transformer, tokenizer, dynamics
+model, and agent heads end-to-end on synthetic tasks.  Each script trains
+a tiny model, asserts that the loss drops significantly, and saves
+visualisation plots to the `outputs/` directory.
 
 ## Prerequisites
 
@@ -196,6 +196,70 @@ real causal tokenizer.  Runs three phases:
 *Four trajectories (8 frames each) with three rows per trajectory. TRUE: ground-truth frames. RECON (grey border): tokenizer-only encode-decode, confirming the latent space is faithful. GEN: dynamics model output decoded through the tokenizer — green-bordered frames are ground-truth context fed as input, blue-bordered frames are autoregressively generated predictions. The generated ball positions track the true trajectory.*
 
 ![dynamics_ball_frames](outputs/dynamics_ball_frames.png)
+
+### 7. Full Pipeline (All Modules)
+
+```bash
+python -m examples.full_pipeline
+```
+
+End-to-end demonstration of the **complete Dreamer 4 pipeline**, exercising
+all four implemented modules (Transformer, Tokenizer, Dynamics, Agent Heads)
+on a bouncing-ball task with rewards.  Mirrors the paper's three training
+phases:
+
+1. **Phase 1a — Tokenizer pretraining** — trains the causal Encoder-Decoder
+   with MSE + 0.2·LPIPS (Eq. 5).
+2. **Phase 1b — Dynamics pretraining** — freezes the tokenizer, encodes
+   data to latent space, trains `DynamicsModel` with `n_agent=0` via
+   shortcut forcing (flow matching + bootstrap self-consistency).
+3. **Phase 2 — Agent finetuning** — creates a new `DynamicsModel` with
+   `n_agent=1` (space_mode `wm_agent`), copies pretrained weights, and
+   jointly trains dynamics + `PolicyHead` (behavior cloning with MTP) +
+   `RewardHead` (SymExpTwoHot with MTP) using `TaskEncoder` for agent
+   token inputs.
+4. **Phase 3 — Imagination training** — freezes the world model; uses
+   dynamics forward passes with flow-schedule corruption on training data
+   to extract agent embeddings; trains `ValueHead` with TD(lambda) targets
+   and finetunes the policy via a bounded reinforce objective (PMPO-style
+   with clamped log-probabilities).
+
+The environment produces a reward signal (+1 when the ball is in the right
+half of the frame, 0 otherwise), giving the agent a meaningful signal to
+learn from.
+
+**Plots saved:**
+
+| File | Description |
+|------|-------------|
+| `outputs/full_pipeline_tok_loss.png` | Tokenizer pretraining loss (combined + eval MSE) vs step. |
+| `outputs/full_pipeline_dyn_loss.png` | Dynamics shortcut forcing loss (combined, flow, bootstrap) vs step. |
+| `outputs/full_pipeline_agent_loss.png` | Phase 2 losses: dynamics, BC (policy), and reward prediction — all three converge. |
+| `outputs/full_pipeline_imagination_loss.png` | Phase 3 losses: PMPO policy loss (bounded) and TD-lambda value loss (dual Y-axes). |
+| `outputs/full_pipeline_frames.png` | Combined visualization (see below). |
+
+*Phase 2 agent finetuning: dynamics loss (blue) stabilises, BC policy loss (orange) drops steadily as the policy learns to imitate the ball's velocity, and reward prediction loss (green) converges to a low level.*
+
+![full_pipeline_agent_loss](outputs/full_pipeline_agent_loss.png)
+
+*Phase 3 imagination: PMPO policy loss (blue, left axis) oscillates in a bounded range as the policy trades off increasing log-probability under positive advantages vs decreasing it under negative ones. Value loss (orange, right axis) converges, indicating the value head learns the TD-lambda targets.*
+
+![full_pipeline_imagination_loss](outputs/full_pipeline_imagination_loss.png)
+
+**Combined visualization** (`full_pipeline_frames.png`) — for each of the
+four evaluation trajectories, five rows are displayed:
+
+| Row | Left label | Description |
+|-----|-----------|-------------|
+| 1 | **#N GT** | Ground-truth video frames (no border). |
+| 2 | **#N Dyn** | Dynamics-only predictions from the pretrained model (`n_agent=0`). Green border = context frames (GT input); orange border = autoregressively predicted frames. |
+| 3 | **#N Agent** | Agent-conditioned predictions from the finetuned model (`n_agent=1`). Green border = context; blue border = predicted. |
+| 4 | **#N R** | Reward bar chart comparing GT rewards (green bars) to predicted rewards (blue bars) at each predicted timestep. |
+| 5 | **#N V** | Value curve: predicted state value (purple circles, solid line) plotted alongside the GT lambda-return target (green squares, dashed line). |
+
+A bottom legend explains all border colors and line styles.
+
+![full_pipeline_frames](outputs/full_pipeline_frames.png)
 
 ## Output directory
 

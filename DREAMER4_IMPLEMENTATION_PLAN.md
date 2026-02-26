@@ -7,7 +7,7 @@
 | Module 1: Core Transformer Building Blocks | pending |
 | Module 2: Causal Tokenizer | pending |
 | Module 3: Dynamics + Shortcut Forcing | pending |
-| Module 4: Agent Heads (policy, reward, value) | pending |
+| Module 4: Agent Heads (policy, reward, value) | done |
 | Module 5: Imagination Training | pending |
 | Module 6: Environment Interface + Online Loop | pending |
 | Module 7: Config, Logging, Checkpointing | pending |

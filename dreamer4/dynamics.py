@@ -590,7 +590,8 @@ def sample_one_timestep(
     K: int = 4,
     actions: Optional[torch.Tensor] = None,
     tau_ctx: float = 0.1,
-) -> torch.Tensor:
+    agent_tokens: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Generate one new frame by K-step shortcut denoising.
 
@@ -599,16 +600,22 @@ def sample_one_timestep(
     steps. We slightly corrupt the past inputs to signal level tau_ctx=0.1."
 
     Args:
-        dynamics:    The DynamicsModel (should be in eval mode).
-        past_packed: (B, t, n_spatial, d_spatial) context frames.
-        k_max:       Maximum sampling steps.
-        K:           Number of denoising steps for the new frame.
-        actions:     (B, t+1, action_dim) or None. Must include the action
-                     for the frame being generated.
-        tau_ctx:     Signal level for corrupting context (default 0.1).
+        dynamics:     The DynamicsModel (should be in eval mode).
+        past_packed:  (B, t, n_spatial, d_spatial) context frames.
+        k_max:        Maximum sampling steps.
+        K:            Number of denoising steps for the new frame.
+        actions:      (B, t+1, action_dim) or None. Must include the action
+                      for the frame being generated.
+        tau_ctx:      Signal level for corrupting context (default 0.1).
+        agent_tokens: (B, t+1, n_agent, d_model) or None.  When provided,
+                      passed to the dynamics forward call and the agent_out
+                      for the *last* timestep of the final denoising step
+                      is returned.
 
     Returns:
-        (B, n_spatial, d_spatial) generated frame.
+        z_new:     (B, n_spatial, d_spatial) generated frame.
+        agent_out: (B, n_agent, d_model) or None.  Agent embeddings for the
+                   newly generated timestep (from the last denoising step).
     """
     device = past_packed.device
     dtype = past_packed.dtype
@@ -616,7 +623,6 @@ def sample_one_timestep(
     n_spatial, d_spatial = past_packed.shape[2], past_packed.shape[3]
     emax = _log2_int(k_max)
 
-    # Corrupt context slightly: tau_ctx is the noise fraction (e.g. 0.1 = 10% noise)
     signal_level = 1.0 - tau_ctx
     if tau_ctx > 0 and t_ctx > 0:
         noise = torch.randn_like(past_packed)
@@ -631,6 +637,8 @@ def sample_one_timestep(
 
     ctx_signal_val = int(round(signal_level * k_max))
     ctx_signal_val = min(ctx_signal_val, k_max)
+
+    last_agent_out: Optional[torch.Tensor] = None
 
     for i in range(K):
         tau_i = i * d
@@ -647,17 +655,22 @@ def sample_one_timestep(
         signal_idxs[:, -1] = sig_i
 
         actions_in = actions[:, :T_total] if actions is not None else None
+        agent_in = agent_tokens[:, :T_total] if agent_tokens is not None else None
 
-        z1_hat, _ = dynamics(
+        z1_hat, a_out = dynamics(
             actions_in, step_idxs, signal_idxs, packed_seq,
+            agent_tokens=agent_in,
         )
         z1_hat_new = z1_hat[:, -1:, :, :]  # (B, 1, Nz, Dz)
+
+        if a_out is not None:
+            last_agent_out = a_out[:, -1]  # (B, n_agent, d_model)
 
         denom = max(1e-4, 1.0 - tau_i)
         velocity = (z1_hat_new.float() - z.float()) / denom
         z = (z.float() + velocity * d).to(dtype)
 
-    return z[:, 0]  # (B, n_spatial, d_spatial)
+    return z[:, 0], last_agent_out
 
 
 @torch.no_grad()
@@ -670,39 +683,51 @@ def sample_sequence(
     K: int = 4,
     actions: Optional[torch.Tensor] = None,
     tau_ctx: float = 0.1,
-) -> torch.Tensor:
+    agent_tokens: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[list[torch.Tensor]]]:
     """
     Autoregressively generate a sequence of frames.
 
     Args:
-        dynamics:  The DynamicsModel (should be in eval mode).
-        context:   (B, t_ctx, n_spatial, d_spatial) context frames.
-        horizon:   Number of frames to generate.
-        k_max:     Maximum sampling steps.
-        K:         Denoising steps per frame.
-        actions:   (B, t_ctx + horizon, action_dim) or None.
-        tau_ctx:   Context corruption level.
+        dynamics:     The DynamicsModel (should be in eval mode).
+        context:      (B, t_ctx, n_spatial, d_spatial) context frames.
+        horizon:      Number of frames to generate.
+        k_max:        Maximum sampling steps.
+        K:            Denoising steps per frame.
+        actions:      (B, t_ctx + horizon, action_dim) or None.
+        tau_ctx:      Context corruption level.
+        agent_tokens: (B, t_ctx + horizon, n_agent, d_model) or None.
+                      When provided, agent embeddings from each generated
+                      timestep are collected and returned.
 
     Returns:
-        (B, t_ctx + horizon, n_spatial, d_spatial) full sequence
-        (context + generated).
+        frames:     (B, t_ctx + horizon, n_spatial, d_spatial) full sequence
+                    (context + generated).
+        agent_outs: List of ``horizon`` tensors each (B, n_agent, d_model),
+                    one per generated timestep.  None when agent_tokens is
+                    not provided.
     """
     B = context.shape[0]
     t_ctx = context.shape[1]
 
     frames = [context[:, t] for t in range(t_ctx)]
+    agent_outs: list[torch.Tensor] = []
 
     for h in range(horizon):
         past = torch.stack(frames, dim=1)  # (B, t, Nz, Dz)
 
-        z_next = sample_one_timestep(
+        z_next, a_out = sample_one_timestep(
             dynamics,
             past_packed=past,
             k_max=k_max,
             K=K,
             actions=actions,
             tau_ctx=tau_ctx,
+            agent_tokens=agent_tokens,
         )
         frames.append(z_next)
+        if a_out is not None:
+            agent_outs.append(a_out)
 
-    return torch.stack(frames, dim=1)
+    seq = torch.stack(frames, dim=1)
+    return seq, agent_outs if agent_outs else None
