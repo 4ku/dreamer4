@@ -4,14 +4,14 @@
 
 | Module | Status |
 |--------|--------|
-| Module 1: Core Transformer Building Blocks | pending |
-| Module 2: Causal Tokenizer | pending |
-| Module 3: Dynamics + Shortcut Forcing | pending |
+| Module 1: Core Transformer Building Blocks | done |
+| Module 2: Causal Tokenizer | done |
+| Module 3: Dynamics + Shortcut Forcing | done |
 | Module 4: Agent Heads (policy, reward, value) | done |
-| Module 5: Imagination Training | pending |
-| Module 6: Environment Interface + Online Loop | pending |
-| Module 7: Config, Logging, Checkpointing | pending |
-| End-to-end Integration Test | pending |
+| Module 5: Imagination Training | done |
+| Module 6: Environment Interface + Online Loop | done |
+| Module 7: Config, Logging, Checkpointing | done |
+| End-to-end Integration Test | done |
 
 ## Architecture Overview
 

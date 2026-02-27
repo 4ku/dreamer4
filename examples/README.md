@@ -5,6 +5,10 @@ model, agent heads, and imagination training end-to-end.  Each script
 trains a tiny model, asserts that the loss drops, and saves
 visualisation plots to the `outputs/` directory.
 
+The full training system (Module 6+7) provides an **online training loop**
+(`dreamer4.train`) with YAML configuration, checkpointing, and
+TensorBoard logging.
+
 ## Prerequisites
 
 ```bash
@@ -306,6 +310,136 @@ Set `MUJOCO_GL=egl` for headless rendering.
 | `outputs/dmc_agent_loss.png` | Phase 2 losses: dynamics, BC, reward prediction. |
 | `outputs/dmc_imagination_loss.png` | Phase 3: PMPO policy loss + TD-lambda value loss (dual Y-axes). |
 | `outputs/dmc_frames.png` | Visualization comparing GT frames, tokenizer reconstructions, and dynamics-generated frames for cartpole-swingup trajectories. Green border = context; blue = predicted. |
+
+### 9. Online Training Loop (Module 6)
+
+Module 6 provides the `Dreamer4Agent` class and `online_training_loop`
+function in `dreamer4/train.py`.  These combine all previously implemented
+components into a DreamerV3-style training pipeline:
+
+```python
+from dreamer4.train import Dreamer4Agent, TrainConfig, online_training_loop
+from dreamer4.envs import DMControlEnv, TimeLimitWrapper
+
+config = TrainConfig(
+    domain="cartpole",
+    task="swingup",
+    total_steps=100_000,
+    n_envs=4,
+)
+
+agent = Dreamer4Agent(config)
+
+# Attach a pretrained tokenizer (from Phase 1a)
+# agent.set_tokenizer(pretrained_tok)
+
+env_fns = [
+    lambda: TimeLimitWrapper(
+        DMControlEnv(config.domain, config.task, size=config.image_size),
+        max_steps=config.time_limit,
+    )
+    for _ in range(config.n_envs)
+]
+
+history = online_training_loop(agent, env_fns, config)
+```
+
+The loop follows the standard Dreamer schedule:
+
+1. **Prefill** — collect random-action episodes into the replay buffer.
+2. **Collect** — run the learned policy in parallel environments.
+3. **Train WM** — tokenizer reconstruction + shortcut forcing + agent
+   head behavior cloning and reward prediction on replay data.
+4. **Imagine** — unroll the world model with the policy, compute
+   TD(lambda) returns, update the value head and policy via PMPO.
+
+**Module 6 components:**
+
+| File | Description |
+|------|-------------|
+| `dreamer4/envs.py` | `DMControlEnv`, `MultiCameraEnv`, and composable wrappers (`ActionRepeatWrapper`, `NormalizeActionWrapper`, `TimeLimitWrapper`). |
+| `dreamer4/driver.py` | `Driver` class for parallel environment collection with `ThreadPoolExecutor`. |
+| `dreamer4/replay.py` | Episode-based `ReplayBuffer` with O(1) deque eviction and prefill gating. |
+| `dreamer4/train.py` | `Dreamer4Agent` orchestrator and `online_training_loop`. |
+
+### 10. Configuration, Logging, and Checkpointing (Module 7)
+
+Module 7 adds a YAML-based configuration system, TensorBoard logging,
+and checkpoint save/load/resume support.
+
+#### YAML Config
+
+```python
+from dreamer4.config import TrainConfig, load_config, save_config
+
+# Load from preset
+cfg = load_config("config/dmcontrol.yaml")
+
+# Override specific fields
+cfg = load_config("config/defaults.yaml", overrides={"domain": "walker", "task": "walk"})
+
+# Save config for reproducibility
+save_config(cfg, "runs/exp01/config.yaml")
+```
+
+**Preset files in `config/`:**
+
+| File | Description |
+|------|-------------|
+| `config/defaults.yaml` | All default values matching `TrainConfig`. |
+| `config/dmcontrol.yaml` | DMControl-specific overrides (4 envs, 500K steps). |
+| `config/debug.yaml` | Tiny model for fast debugging (CPU, 500 steps). |
+
+#### TensorBoard Logging
+
+All metrics are written to TensorBoard. View with:
+
+```bash
+tensorboard --logdir runs/exp01/tb
+```
+
+Metrics are automatically grouped by prefix:
+- `wm/` — world model (dynamics_loss, tokenizer_loss)
+- `agent/` — agent heads (bc_loss, reward_pred_loss)
+- `imagine/` — imagination (policy_loss, value_loss)
+- `env/` — environment (episode_return, env_steps)
+
+#### Checkpointing
+
+```python
+from dreamer4.checkpoint import save_checkpoint, load_checkpoint
+
+# Save
+save_checkpoint("ckpt/step_1000.pt", agent, optimizers,
+                train_step=1000, env_steps=50000, config=cfg)
+
+# Load and resume
+meta = load_checkpoint("ckpt/step_1000.pt", agent, optimizers)
+# meta["train_step"] == 1000, meta["env_steps"] == 50000
+```
+
+The training loop auto-saves periodic checkpoints and a final checkpoint:
+
+```python
+online_training_loop(
+    agent, env_fns, cfg,
+    tokenizer=tok,
+    log_dir="runs/exp01/tb",
+    checkpoint_dir="runs/exp01/ckpts",
+    resume_from="runs/exp01/ckpts/final.pt",  # optional
+)
+```
+
+#### Module 7 Components
+
+| File | Description |
+|------|-------------|
+| `dreamer4/config.py` | YAML config loading/saving, validation, `TrainConfig` dataclass. |
+| `dreamer4/checkpoint.py` | `save_checkpoint`, `load_checkpoint`, `AutoCheckpoint`. |
+| `dreamer4/logging.py` | `MetricsLogger` (TensorBoard backend), `setup_logging`. |
+| `config/defaults.yaml` | Default config preset. |
+| `config/dmcontrol.yaml` | DMControl preset. |
+| `config/debug.yaml` | Debug preset (tiny model). |
 
 ## Output directory
 

@@ -1,0 +1,47 @@
+# Dreamer 4 — Debug preset
+# Tiny model for fast iteration and testing.
+
+domain: cartpole
+task: swingup
+image_size: 32
+action_repeat: 2
+n_envs: 1
+time_limit: 50
+
+# Tiny architecture
+d_model: 64
+d_spatial: 32
+n_spatial: 8
+n_register: 2
+n_agent: 1
+n_heads: 2
+depth: 2
+k_max: 4
+
+patch_size: 4
+d_bottleneck: 8
+n_bottleneck: 32
+packing_k: 4
+
+mtp_length: 4
+policy_mlp_depth: 1
+policy_mlp_ratio: 2.0
+reward_num_bins: 31
+value_num_bins: 31
+
+# Short training
+total_steps: 500
+prefill_steps: 100
+train_every: 8
+batch_size: 4
+seq_len: 8
+imagination_horizon: 4
+imagination_K: 2
+replay_capacity: 10000
+
+log_every: 10
+eval_every: 100
+checkpoint_every: 100
+keep_last_n: 2
+
+device: cpu

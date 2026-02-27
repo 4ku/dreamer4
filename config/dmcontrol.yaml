@@ -1,0 +1,29 @@
+# Dreamer 4 — DMControl preset
+# Overrides for dm_control continuous-control tasks.
+
+domain: cartpole
+task: swingup
+image_size: 64
+action_repeat: 2
+n_envs: 4
+time_limit: 500
+
+d_model: 256
+d_spatial: 64
+n_spatial: 16
+depth: 8
+n_heads: 4
+k_max: 4
+
+total_steps: 500000
+prefill_steps: 5000
+batch_size: 16
+seq_len: 16
+
+gamma: 0.997
+lam: 0.95
+imagination_horizon: 15
+
+log_every: 100
+eval_every: 10000
+checkpoint_every: 10000

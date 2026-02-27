@@ -1,43 +1,89 @@
 """
-Simple episode-based replay buffer for Dreamer 4.
+Episode-based replay buffer for Dreamer 4.
 
-Stores transitions as complete episodes and samples contiguous
-subsequences for world model and agent training.
+Stores experience as complete episodes with O(1) eviction via
+:class:`collections.deque` and supports contiguous subsequence
+sampling that never crosses episode boundaries.
+
+Usage::
 
     buf = ReplayBuffer(capacity=100_000)
-    buf.add(obs, action, reward, done)
+    buf.add(obs, action, reward, done)          # transition-level
+    buf.add_episode(obs, actions, rewards)       # episode-level
     batch = buf.sample_sequence(batch_size=16, seq_len=16)
 """
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 
-class ReplayBuffer:
-    """Episode-based replay buffer.
+@dataclass
+class _StoredEpisode:
+    """Internal storage for a single episode."""
+    obs: list[torch.Tensor]
+    actions: list[torch.Tensor]
+    rewards: list[float]
+    dones: list[bool]
 
-    Stores observations, actions, rewards, and done flags.  Episodes are
-    delimited by ``done=True`` transitions.  ``sample_sequence`` draws
-    random contiguous subsequences that do not cross episode boundaries.
+    @property
+    def length(self) -> int:
+        return len(self.obs)
+
+
+class ReplayBuffer:
+    """Episode-based replay buffer with O(1) eviction.
+
+    Episodes are stored in a :class:`collections.deque` and evicted
+    oldest-first when the total transition count exceeds ``capacity``.
+
+    Supports both transition-level insertion (``add``) and bulk episode
+    insertion (``add_episode``).  ``sample_sequence`` draws random
+    contiguous subsequences that stay within a single episode.
 
     Args:
-        capacity: Maximum number of transitions stored.
+        capacity:     Maximum number of transitions stored.
+        min_episodes: Minimum episodes before ``sample_sequence`` is allowed
+                      (useful as a prefill gate for online training).
     """
 
-    def __init__(self, capacity: int = 100_000):
+    def __init__(self, capacity: int = 100_000, min_episodes: int = 0):
         self.capacity = capacity
-        self._obs: list[torch.Tensor] = []
-        self._actions: list[torch.Tensor] = []
-        self._rewards: list[float] = []
-        self._dones: list[bool] = []
-        self._episode_starts: list[int] = []
-        self._current_ep_start: int = 0
+        self.min_episodes = min_episodes
+
+        self._episodes: deque[_StoredEpisode] = deque()
+        self._current: _StoredEpisode | None = None
+        self._total_transitions: int = 0
+        self._total_episodes: int = 0
+
+    # -- Public properties ---------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self._obs)
+        n = self._total_transitions
+        if self._current is not None:
+            n += self._current.length
+        return n
+
+    @property
+    def total_transitions(self) -> int:
+        """Number of transitions in completed episodes."""
+        return self._total_transitions
+
+    @property
+    def total_episodes(self) -> int:
+        """Number of completed episodes currently stored."""
+        return self._total_episodes
+
+    @property
+    def is_ready(self) -> bool:
+        """True when there are enough completed episodes for sampling."""
+        return self._total_episodes >= max(1, self.min_episodes)
+
+    # -- Transition-level insertion ------------------------------------------
 
     def add(
         self,
@@ -57,109 +103,35 @@ class ReplayBuffer:
             reward: Scalar reward.
             done:   Whether the episode ended.
         """
-        idx = len(self._obs)
+        if self._current is None:
+            self._current = _StoredEpisode([], [], [], [])
 
-        if idx == 0 or (len(self._dones) > 0 and self._dones[-1]):
-            self._current_ep_start = idx
-            self._episode_starts.append(idx)
+        self._current.obs.append(obs.detach().cpu())
+        self._current.actions.append(action.detach().cpu())
+        self._current.rewards.append(reward)
+        self._current.dones.append(done)
 
-        self._obs.append(obs.detach().cpu())
-        self._actions.append(action.detach().cpu())
-        self._rewards.append(reward)
-        self._dones.append(done)
+        if done:
+            self._commit_current()
 
-        while len(self._obs) > self.capacity:
-            self._obs.pop(0)
-            self._actions.pop(0)
-            self._rewards.pop(0)
-            self._dones.pop(0)
-            self._episode_starts = [
-                s - 1 for s in self._episode_starts if s > 0
-            ]
-            if self._episode_starts and self._episode_starts[0] < 0:
-                self._episode_starts.pop(0)
+    def _commit_current(self) -> None:
+        """Move the in-progress episode into permanent storage."""
+        if self._current is None or self._current.length == 0:
+            return
+        self._episodes.append(self._current)
+        self._total_transitions += self._current.length
+        self._total_episodes += 1
+        self._current = None
+        self._evict()
 
-    def _rebuild_episode_starts(self) -> list[int]:
-        """Recompute episode start indices from done flags."""
-        starts = [0]
-        for i, d in enumerate(self._dones):
-            if d and i + 1 < len(self._dones):
-                starts.append(i + 1)
-        return starts
+    def _evict(self) -> None:
+        """Remove oldest episodes until we are within capacity."""
+        while self._total_transitions > self.capacity and self._episodes:
+            old = self._episodes.popleft()
+            self._total_transitions -= old.length
+            self._total_episodes -= 1
 
-    def sample_sequence(
-        self,
-        batch_size: int,
-        seq_len: int,
-        device: Optional[torch.device] = None,
-    ) -> dict[str, torch.Tensor]:
-        """Sample random contiguous subsequences.
-
-        Each subsequence stays within one episode.
-
-        Args:
-            batch_size: Number of sequences to sample.
-            seq_len:    Length of each sequence.
-            device:     Target device for tensors.
-
-        Returns:
-            Dict with keys:
-                ``obs``:     (B, T, C, H, W) or (B, T, D)
-                ``actions``: (B, T, action_dim)
-                ``rewards``: (B, T)
-                ``dones``:   (B, T) bool
-        """
-        ep_starts = self._rebuild_episode_starts()
-        N = len(self._obs)
-
-        valid_starts: list[int] = []
-        for i, es in enumerate(ep_starts):
-            if i + 1 < len(ep_starts):
-                ep_end = ep_starts[i + 1]
-            else:
-                ep_end = N
-            ep_len = ep_end - es
-            if ep_len >= seq_len:
-                for s in range(es, ep_end - seq_len + 1):
-                    valid_starts.append(s)
-
-        if not valid_starts:
-            raise ValueError(
-                f"No valid subsequences of length {seq_len} found in "
-                f"{len(ep_starts)} episodes ({N} transitions total)."
-            )
-
-        idxs = torch.randint(0, len(valid_starts), (batch_size,))
-        chosen = [valid_starts[i.item()] for i in idxs]
-
-        obs_batch = []
-        act_batch = []
-        rew_batch = []
-        done_batch = []
-
-        for start in chosen:
-            obs_seq = torch.stack(self._obs[start : start + seq_len])
-            act_seq = torch.stack(self._actions[start : start + seq_len])
-            rew_seq = torch.tensor(
-                self._rewards[start : start + seq_len], dtype=torch.float32,
-            )
-            done_seq = torch.tensor(
-                self._dones[start : start + seq_len], dtype=torch.bool,
-            )
-            obs_batch.append(obs_seq)
-            act_batch.append(act_seq)
-            rew_batch.append(rew_seq)
-            done_batch.append(done_seq)
-
-        result = {
-            "obs": torch.stack(obs_batch),
-            "actions": torch.stack(act_batch),
-            "rewards": torch.stack(rew_batch),
-            "dones": torch.stack(done_batch),
-        }
-        if device is not None:
-            result = {k: v.to(device) for k, v in result.items()}
-        return result
+    # -- Episode-level insertion ---------------------------------------------
 
     def add_episode(
         self,
@@ -175,6 +147,100 @@ class ReplayBuffer:
             rewards: (T,) scalar rewards.
         """
         T = obs.shape[0]
-        for t in range(T):
-            done = t == T - 1
-            self.add(obs[t], actions[t], rewards[t].item(), done)
+        ep = _StoredEpisode(
+            obs=[obs[t].detach().cpu() for t in range(T)],
+            actions=[actions[t].detach().cpu() for t in range(T)],
+            rewards=[rewards[t].item() for t in range(T)],
+            dones=[t == T - 1 for t in range(T)],
+        )
+        self._episodes.append(ep)
+        self._total_transitions += T
+        self._total_episodes += 1
+        self._evict()
+
+    # -- Sampling ------------------------------------------------------------
+
+    def sample_sequence(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: Optional[torch.device] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Sample random contiguous subsequences.
+
+        Each subsequence stays within one episode.  Sampling is uniform
+        over valid starting positions across all episodes.
+
+        Args:
+            batch_size: Number of sequences to sample.
+            seq_len:    Length of each sequence.
+            device:     Target device for tensors.
+
+        Returns:
+            Dict with keys:
+                ``obs``:     (B, T, ...) observations
+                ``actions``: (B, T, action_dim)
+                ``rewards``: (B, T)
+                ``dones``:   (B, T) bool
+        """
+        valid: list[tuple[int, int]] = []  # (episode_idx, start_within_ep)
+        for ep_idx, ep in enumerate(self._episodes):
+            ep_len = ep.length
+            if ep_len >= seq_len:
+                for s in range(ep_len - seq_len + 1):
+                    valid.append((ep_idx, s))
+
+        if not valid:
+            raise ValueError(
+                f"No valid subsequences of length {seq_len} found in "
+                f"{self._total_episodes} episodes "
+                f"({self._total_transitions} transitions total)."
+            )
+
+        indices = torch.randint(0, len(valid), (batch_size,))
+
+        obs_batch, act_batch, rew_batch, done_batch = [], [], [], []
+
+        for idx in indices:
+            ep_idx, start = valid[idx.item()]
+            ep = self._episodes[ep_idx]
+            end = start + seq_len
+
+            obs_batch.append(torch.stack(ep.obs[start:end]))
+            act_batch.append(torch.stack(ep.actions[start:end]))
+            rew_batch.append(torch.tensor(ep.rewards[start:end],
+                                          dtype=torch.float32))
+            done_batch.append(torch.tensor(ep.dones[start:end],
+                                           dtype=torch.bool))
+
+        result = {
+            "obs": torch.stack(obs_batch),
+            "actions": torch.stack(act_batch),
+            "rewards": torch.stack(rew_batch),
+            "dones": torch.stack(done_batch),
+        }
+        if device is not None:
+            result = {k: v.to(device) for k, v in result.items()}
+        return result
+
+    # -- Compatibility shims -------------------------------------------------
+
+    @property
+    def _obs(self) -> list[torch.Tensor]:
+        """Flat list of observations (for backward compat with old tests)."""
+        out: list[torch.Tensor] = []
+        for ep in self._episodes:
+            out.extend(ep.obs)
+        if self._current is not None:
+            out.extend(self._current.obs)
+        return out
+
+    @property
+    def _dones(self) -> list[bool]:
+        """Flat list of done flags (for backward compat with old tests)."""
+        out: list[bool] = []
+        for ep in self._episodes:
+            out.extend(ep.dones)
+        if self._current is not None:
+            out.extend(self._current.dones)
+        return out
