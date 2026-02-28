@@ -16,8 +16,13 @@ dependencies = [
     "einops",
     # Visualization
     "matplotlib",
+    "torchvision",
     # TensorBoard logging
     "tensorboard",
+    # Video writing
+    "imageio",
+    "imageio-ffmpeg",
+    "moviepy",
     # Testing
     "pytest",
 ]
@@ -28,6 +33,9 @@ envs = [
     # Requires Python <=3.12 for pre-built mujoco/labmaze wheels.
     "dm_control",
     "gymnasium",
+]
+interactive = [
+    "pygame",
 ]
 dev = [
     "pytest",

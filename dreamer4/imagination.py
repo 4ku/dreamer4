@@ -33,6 +33,14 @@ from dreamer4.agent import (
 )
 
 
+def _grad_norm(module: nn.Module) -> float:
+    """Total L2 norm of gradients across all parameters."""
+    params = [p for p in module.parameters() if p.grad is not None]
+    if not params:
+        return 0.0
+    return torch.nn.utils.clip_grad_norm_(params, float("inf")).item()
+
+
 @dataclass
 class ImaginedTrajectory:
     """Data produced by a single imagination rollout.
@@ -64,29 +72,29 @@ def imagine_rollout(
     k_max: int = 4,
     K: int = 4,
     tau_ctx: float = 0.1,
+    max_context_window: int = 16,
 ) -> ImaginedTrajectory:
     """Generate imagined trajectories inside the world model.
 
     Paper Section 3.3: "Imagined rollouts start from contexts of the dataset.
     We start only one rollout from each context, prioritizing data diversity."
 
-    The dynamics model and reward head are kept frozen (no_grad); the policy
-    is also evaluated without gradients here — policy gradients are applied
-    separately in ``imagination_training_step`` via re-evaluation.
+    Uses a sliding context window to avoid quadratic memory growth.
 
     Args:
-        dynamics:        Dynamics model (frozen, eval mode).
-        policy:          Policy head for action sampling.
-        reward_head:     Reward head for trajectory annotation.
-        value_head:      Value head for trajectory annotation.
-        task_encoder:    Task encoder for agent token inputs.
-        context:         (B, t_ctx, n_spatial, d_spatial) tokenized context.
-        context_actions: (B, t_ctx, action_dim) or None — actions during context.
-        task_ids:        (B,) long task indices, or None (defaults to 0).
-        horizon:         Number of steps to imagine.
-        k_max:           Maximum shortcut sampling steps.
-        K:               Denoising steps per generated frame.
-        tau_ctx:         Context corruption signal level.
+        dynamics:            Dynamics model (frozen, eval mode).
+        policy:              Policy head for action sampling.
+        reward_head:         Reward head for trajectory annotation.
+        value_head:          Value head for trajectory annotation.
+        task_encoder:        Task encoder for agent token inputs.
+        context:             (B, t_ctx, n_spatial, d_spatial) tokenized context.
+        context_actions:     (B, t_ctx, action_dim) or None.
+        task_ids:            (B,) long task indices, or None (defaults to 0).
+        horizon:             Number of steps to imagine.
+        k_max:               Maximum shortcut sampling steps.
+        K:                   Denoising steps per generated frame.
+        tau_ctx:             Context corruption signal level.
+        max_context_window:  Maximum frames kept as context (sliding window).
 
     Returns:
         ImaginedTrajectory with H=horizon time steps.
@@ -117,12 +125,17 @@ def imagine_rollout(
     agent_embeds_out: list[torch.Tensor] = []
 
     for h in range(horizon):
-        past = torch.stack(frames, dim=1)  # (B, t, Nz, Dz)
+        # Sliding window: keep at most max_context_window frames
+        win_start = max(0, len(frames) - max_context_window)
+        past_frames = frames[win_start:]
+        past_actions = all_actions_list[win_start:]
+
+        past = torch.stack(past_frames, dim=1)  # (B, W, Nz, Dz)
         T_cur = past.shape[1]
 
-        all_act = torch.stack(all_actions_list, dim=1)  # (B, t, A)
+        all_act = torch.stack(past_actions, dim=1)  # (B, W, A)
         placeholder_act = torch.zeros(B, 1, action_dim, device=device)
-        act_in = torch.cat([all_act, placeholder_act], dim=1)  # (B, t+1, A)
+        act_in = torch.cat([all_act, placeholder_act], dim=1)  # (B, W+1, A)
 
         agent_tok = agent_tok_base.expand(B, T_cur + 1, -1, -1)
 
@@ -177,6 +190,7 @@ def imagination_training_step(
     lam: float = 0.95,
     alpha: float = 0.5,
     beta: float = 0.3,
+    entropy_scale: float = 3e-3,
     max_grad_norm: float = 100.0,
 ) -> dict[str, float]:
     """One gradient step of imagination training (Phase 3).
@@ -196,6 +210,7 @@ def imagination_training_step(
         lam:            Lambda for TD(lambda).
         alpha:          PMPO alpha (positive/negative balance).
         beta:           PMPO KL regularization weight.
+        entropy_scale:  Weight on entropy bonus to prevent policy collapse.
         max_grad_norm:  Gradient clipping norm.
 
     Returns:
@@ -222,11 +237,12 @@ def imagination_training_step(
 
     value_optim.zero_grad()
     val_loss.backward()
+    value_grad_norm = _grad_norm(value_head)
     if max_grad_norm > 0:
         nn.utils.clip_grad_norm_(value_head.parameters(), max_grad_norm)
     value_optim.step()
 
-    # -- Policy loss (Eq. 11): PMPO with optional KL to prior --
+    # -- Policy loss with entropy regularization --
     advantages = (lambda_returns - values_sg).detach()
 
     policy_params = policy.forward(agent_embeds, head_idx=0)
@@ -238,14 +254,19 @@ def imagination_training_step(
             prior_params = prior_policy.forward(agent_embeds, head_idx=0)
             prior_lp = prior_policy.log_prob(prior_params, actions)
 
-    pol_loss = pmpo_policy_loss(
+    pol_loss, pmpo_info = pmpo_policy_loss(
         log_probs, advantages,
         prior_log_probs=prior_lp,
         alpha=alpha, beta=beta,
     )
 
+    entropy = policy.entropy(policy_params).mean()
+    pol_loss = pol_loss - entropy_scale * entropy
+
     policy_optim.zero_grad()
     pol_loss.backward()
+
+    policy_grad_norm = _grad_norm(policy)
     if max_grad_norm > 0:
         nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
     policy_optim.step()
@@ -253,10 +274,16 @@ def imagination_training_step(
     return {
         "policy_loss": pol_loss.item(),
         "value_loss": val_loss.item(),
+        "policy_entropy": entropy.item(),
         "mean_reward": rewards.mean().item(),
         "mean_value": values_sg.mean().item(),
         "mean_advantage": advantages.mean().item(),
         "mean_lambda_return": lambda_returns.mean().item(),
+        "policy_grad_norm": policy_grad_norm,
+        "value_grad_norm": value_grad_norm,
+        "action_mean": actions.mean().item(),
+        "action_std": actions.std().item(),
+        **pmpo_info,
     }
 
 

@@ -131,7 +131,6 @@ class TestEndToEnd:
         }
         metrics = agent.train_world_model_step(batch, opts)
         assert "dynamics_loss" in metrics
-        assert "bc_loss" in metrics
         assert "reward_pred_loss" in metrics
         assert "tokenizer_loss" in metrics
 
@@ -239,7 +238,7 @@ class TestEndToEnd:
         im_metrics = agent.imagine_and_train(batch, opts)
 
         all_keys = set(wm_metrics) | set(im_metrics)
-        expected = {"dynamics_loss", "bc_loss", "reward_pred_loss",
+        expected = {"dynamics_loss", "reward_pred_loss",
                     "tokenizer_loss", "policy_loss", "value_loss"}
         assert expected.issubset(all_keys)
 

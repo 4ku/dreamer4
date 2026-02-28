@@ -103,6 +103,9 @@ class Driver:
     episode terminates it is auto-reset and the completed episode
     is recorded.
 
+    Env states are **persistent** across ``collect`` calls so that
+    partial episodes continue from where they left off.
+
     Args:
         env_fns:     List of callables, each returning an env instance.
         n_threads:   Worker threads for stepping envs.  0 = sequential.
@@ -117,11 +120,21 @@ class Driver:
         self._n_envs = len(env_fns)
         self._n_threads = n_threads
         self._envs: list[Any] | None = None
+        self._states: list[_EnvState] | None = None
 
     def _ensure_envs(self) -> list[Any]:
         if self._envs is None:
             self._envs = [fn() for fn in self._env_fns]
         return self._envs
+
+    def _ensure_states(self) -> list[_EnvState]:
+        """Get (or create) persistent per-env states."""
+        if self._states is None:
+            envs = self._ensure_envs()
+            self._states = [_EnvState(env) for env in envs]
+            for s in self._states:
+                s.start_episode()
+        return self._states
 
     @property
     def n_envs(self) -> int:
@@ -131,25 +144,20 @@ class Driver:
         self,
         n_steps: int,
         policy_fn: PolicyFn,
-    ) -> list[Episode]:
+    ) -> tuple[list[Episode], int]:
         """Collect *n_steps* total transitions across all environments.
 
-        Each environment runs independently.  Completed episodes are
-        gathered and returned.  Partial (in-progress) episodes at the
-        end of collection are discarded.
+        Env states persist across calls so partial episodes are continued,
+        not discarded. Completed episodes are returned.
 
         Args:
             n_steps:   Minimum total transitions to collect.
             policy_fn: ``(obs_history, act_history) -> action`` callable.
 
         Returns:
-            List of completed ``Episode`` objects.
+            Tuple of (completed episodes, actual transitions taken).
         """
-        envs = self._ensure_envs()
-        states = [_EnvState(env) for env in envs]
-        for s in states:
-            s.start_episode()
-
+        states = self._ensure_states()
         completed: list[Episode] = []
         total_transitions = 0
 
@@ -179,7 +187,7 @@ class Driver:
                     completed.append(ep)
                     s.start_episode()
 
-        return completed
+        return completed, total_transitions
 
     def _collect_actions_threaded(
         self,
@@ -197,22 +205,26 @@ class Driver:
                 actions[idx] = future.result()
         return actions  # type: ignore[return-value]
 
-    def collect_random(self, n_steps: int) -> list[Episode]:
+    def collect_random(self, n_steps: int) -> tuple[list[Episode], int]:
         """Collect transitions using random actions (no policy needed).
 
         Convenience method for initial replay buffer prefilling.
+
+        Returns:
+            Tuple of (completed episodes, actual transitions taken).
         """
-        envs = self._ensure_envs()
+        states = self._ensure_states()
 
         def random_policy(
             obs_history: list[torch.Tensor],
             act_history: list[torch.Tensor],
         ) -> torch.Tensor:
-            return envs[0].sample_random_action()
+            return states[0].env.sample_random_action()
 
         return self.collect(n_steps, random_policy)
 
     def close(self) -> None:
         """Close all environments."""
+        self._states = None
         if self._envs is not None:
             self._envs = None

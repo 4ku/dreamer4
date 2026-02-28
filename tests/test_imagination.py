@@ -191,7 +191,7 @@ class TestImaginationTrainingStep:
     def trajectory(self, device):
         return ImaginedTrajectory(
             latents=torch.randn(B, HORIZON, N_SPATIAL, D_SPATIAL, device=device),
-            actions=torch.randn(B, HORIZON, ACTION_DIM, device=device),
+            actions=torch.tanh(torch.randn(B, HORIZON, ACTION_DIM, device=device)),
             log_probs=torch.randn(B, HORIZON, device=device),
             rewards=torch.rand(B, HORIZON, device=device),
             values=torch.randn(B, HORIZON, device=device),
@@ -207,11 +207,12 @@ class TestImaginationTrainingStep:
             policy_optim, value_optim,
         )
         assert isinstance(result, dict)
-        assert "policy_loss" in result
-        assert "value_loss" in result
-        assert "mean_reward" in result
-        assert "mean_value" in result
-        assert "mean_advantage" in result
+        for key in (
+            "policy_loss", "value_loss", "mean_reward", "mean_value",
+            "mean_advantage", "policy_grad_norm", "value_grad_norm",
+            "advantage_std", "advantage_pos_frac", "action_mean", "action_std",
+        ):
+            assert key in result, f"Missing key: {key}"
 
     def test_gradients_only_on_policy_and_value(
         self, trajectory, policy, value_head, dynamics, reward_head,
@@ -292,7 +293,7 @@ class TestMakePriorPolicy:
     def test_prior_diverges_after_training(self, policy, device):
         prior = make_prior_policy(policy)
         embed = torch.randn(B, D_MODEL, device=device)
-        actions = torch.randn(B, ACTION_DIM, device=device)
+        actions = torch.tanh(torch.randn(B, ACTION_DIM, device=device))
 
         optim = torch.optim.Adam(policy.parameters(), lr=0.1)
         for _ in range(5):

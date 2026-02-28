@@ -82,6 +82,8 @@ class TrainConfig:
     policy_mlp_ratio: float = 2.0
     reward_num_bins: int = 127
     value_num_bins: int = 127
+    bin_low: float = -20.0
+    bin_high: float = 20.0
     agent_lr: float = 3e-4
     num_tasks: int = 1
 
@@ -96,6 +98,7 @@ class TrainConfig:
     # -- PMPO --
     pmpo_alpha: float = 0.5
     pmpo_beta: float = 0.3
+    entropy_scale: float = 1e-2
 
     # -- Policy inference --
     policy_max_context: int = 8
@@ -120,6 +123,7 @@ class TrainConfig:
     # -- Logging --
     log_every: int = 100
     eval_every: int = 10_000
+    wm_video_every: int = 20_000
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 

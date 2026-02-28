@@ -30,6 +30,43 @@ from torch.distributions import Normal, Categorical
 
 from dreamer4.distributions import SymExpTwoHot
 
+_TANH_LOG_PROB_EPS = 1e-6
+
+
+class TanhNormal:
+    """Normal distribution followed by tanh squashing.
+
+    Produces actions in (-1, 1) with correct log-probability Jacobian
+    correction: log p(a) = log p_base(atanh(a)) - sum log(1 - a^2).
+    """
+
+    def __init__(self, base_dist: Normal):
+        self.base_dist = base_dist
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return torch.tanh(self.base_dist.mean)
+
+    def rsample(self) -> torch.Tensor:
+        return torch.tanh(self.base_dist.rsample())
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        """Log prob of squashed actions (per action dimension)."""
+        raw = torch.atanh(actions.clamp(-1 + _TANH_LOG_PROB_EPS,
+                                        1 - _TANH_LOG_PROB_EPS))
+        log_p = self.base_dist.log_prob(raw)
+        log_p = log_p - torch.log(1 - actions.pow(2) + _TANH_LOG_PROB_EPS)
+        return log_p
+
+    def entropy(self) -> torch.Tensor:
+        """Approximate entropy (base entropy, ignoring Jacobian).
+
+        Exact entropy of TanhNormal has no closed form. The base Normal
+        entropy is an upper bound and tracks the true value well enough
+        for the entropy bonus.
+        """
+        return self.base_dist.entropy()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -185,20 +222,23 @@ class PolicyHead(nn.Module):
 
     def dist(
         self, params: torch.Tensor
-    ) -> Normal | Categorical:
+    ) -> TanhNormal | Categorical:
         """
         Build a distribution from raw parameters.
+
+        For continuous actions returns a TanhNormal that produces
+        actions in (-1, 1) with correct Jacobian correction.
 
         Args:
             params: Output of ``forward()``.
 
         Returns:
-            torch.distributions.Normal or Categorical.
+            TanhNormal (continuous) or Categorical (discrete).
         """
         if self.action_type == "continuous":
             mean, log_std = params.split(self.action_dim, dim=-1)
             std = F.softplus(log_std) + self.min_std
-            return Normal(mean, std)
+            return TanhNormal(Normal(mean, std))
         else:
             logits = params.reshape(*params.shape[:-1],
                                     self.action_dim, self.num_categories)
@@ -212,16 +252,14 @@ class PolicyHead(nn.Module):
 
         Args:
             params:  Output of ``forward()``.
-            actions: (*, action_dim) for continuous; (*, action_dim) long for discrete.
+            actions: (*, action_dim) for continuous (in [-1,1]);
+                     (*, action_dim) long for discrete.
 
         Returns:
             (*) total log probability (summed over action dimensions).
         """
         d = self.dist(params)
-        if self.action_type == "continuous":
-            return d.log_prob(actions).sum(dim=-1)
-        else:
-            return d.log_prob(actions).sum(dim=-1)
+        return d.log_prob(actions).sum(dim=-1)
 
     def sample(
         self, params: torch.Tensor
@@ -233,7 +271,7 @@ class PolicyHead(nn.Module):
             params: Output of ``forward()``.
 
         Returns:
-            actions:   (*, action_dim).
+            actions:   (*, action_dim) in [-1, 1] for continuous.
             log_probs: (*) total log probability.
         """
         d = self.dist(params)
@@ -464,44 +502,57 @@ def pmpo_policy_loss(
     prior_log_probs: Optional[torch.Tensor] = None,
     alpha: float = 0.5,
     beta: float = 0.3,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, dict[str, float]]:
     """
-    PMPO policy objective (paper Eq. 11).
+    PMPO policy loss with normalized advantage weighting (paper Eq. 11).
 
-    Uses the *sign* of advantages, ignoring their magnitude, and balances
-    positive and negative feedback equally. This alleviates the need for
-    return/advantage normalization.
+    Splits imagined states into positive-advantage (D+) and
+    negative-advantage (D-) sets. Weights log-probs by normalized
+    advantage magnitude within each set, balanced by alpha.
+
+    A reverse-KL term KL[pi_theta || pi_prior] regularizes toward the
+    behavioral prior.
 
     Args:
-        log_probs:      (B, T) log pi_theta(a|s) under the current policy.
-        advantages:     (B, T) A_t = R_t^lambda - v_t.
-        prior_log_probs: (B, T) log pi_prior(a|s) from behavioral prior
-                         (for reverse KL regularization). None to skip.
-        alpha:          Weight on positive advantages (default 0.5).
-        beta:           KL regularization strength (default 0.3).
+        log_probs:       (B, T) log pi_theta(a|s) under the current policy.
+        advantages:      (B, T) A_t = R_t^lambda - v_t.
+        prior_log_probs: (B, T) log pi_prior(a|s) from behavioral prior.
+        alpha:           Balance between D+ and D- (0.5 = equal weight).
+        beta:            KL regularization strength.
 
     Returns:
-        Scalar policy loss.
+        (loss, info) where info contains diagnostic scalars.
     """
-    pos_mask = advantages >= 0
-    neg_mask = ~pos_mask
+    adv = advantages.detach()
+
+    adv_std = adv.std().clamp_min(1e-8)
+    adv_norm = adv / adv_std
+
+    pos_mask = adv_norm >= 0  # D+
+    neg_mask = ~pos_mask      # D-
 
     n_pos = pos_mask.sum().clamp_min(1)
     n_neg = neg_mask.sum().clamp_min(1)
 
-    # Maximize log_prob where advantage is positive, minimize where negative
-    pos_term = (log_probs * pos_mask.float()).sum() / n_pos
-    neg_term = (log_probs * neg_mask.float()).sum() / n_neg
+    loss_pos = -(log_probs * adv_norm.abs() * pos_mask.float()).sum() / n_pos
+    loss_neg = (log_probs * adv_norm.abs() * neg_mask.float()).sum() / n_neg
 
-    loss = -(alpha * pos_term) + (1.0 - alpha) * neg_term
+    loss = alpha * loss_pos + (1.0 - alpha) * loss_neg
 
+    kl_val = 0.0
     if prior_log_probs is not None and beta > 0:
-        # Reverse KL: KL[pi_prior || pi_theta] = E_{pi_prior}[log pi_prior - log pi_theta]
-        # Approximated per-sample as (prior_log_prob - log_prob)
-        kl = (prior_log_probs - log_probs).mean()
+        kl = (log_probs - prior_log_probs).mean()
+        kl_val = kl.item()
         loss = loss + beta * kl
 
-    return loss
+    info = {
+        "advantage_std": adv_std.item(),
+        "advantage_pos_frac": (pos_mask.sum().float() / max(adv.numel(), 1)).item(),
+        "kl_to_prior": kl_val,
+        "log_prob_mean": log_probs.mean().item(),
+    }
+
+    return loss, info
 
 
 def behavior_cloning_loss(

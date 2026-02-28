@@ -75,6 +75,44 @@ def save_checkpoint(
     return path
 
 
+def _fix_ddp_keys(
+    state_dict: dict[str, Any],
+    agent: torch.nn.Module,
+) -> dict[str, Any]:
+    """Reconcile DDP ``.module.`` key prefixes between checkpoint and model.
+
+    Handles cases where only some submodules were DDP-wrapped (e.g. dynamics
+    and tokenizer wrapped, but policy/value heads not).
+    """
+    model_keys = set(agent.state_dict().keys())
+    saved_keys = set(state_dict.keys())
+    if model_keys == saved_keys:
+        return state_dict
+
+    missing = model_keys - saved_keys
+    unexpected = saved_keys - model_keys
+    if not missing or not unexpected:
+        return state_dict
+
+    fixed: dict[str, Any] = {}
+    n_stripped = 0
+    for k, v in state_dict.items():
+        if k in model_keys:
+            fixed[k] = v
+        else:
+            stripped = k.replace(".module.", ".", 1)
+            if stripped in model_keys:
+                fixed[stripped] = v
+                n_stripped += 1
+            else:
+                fixed[k] = v
+
+    if n_stripped:
+        logger.info("Stripped DDP '.module.' prefix from %d checkpoint keys", n_stripped)
+
+    return fixed
+
+
 def load_checkpoint(
     path: Union[str, Path],
     agent: torch.nn.Module,
@@ -98,7 +136,9 @@ def load_checkpoint(
     path = Path(path)
     payload = torch.load(path, map_location=map_location, weights_only=False)
 
-    agent.load_state_dict(payload["agent_state_dict"])
+    state_dict = payload["agent_state_dict"]
+    state_dict = _fix_ddp_keys(state_dict, agent)
+    agent.load_state_dict(state_dict)
 
     if optimizers is not None:
         saved_opts = payload.get("optimizer_state_dicts", {})

@@ -156,8 +156,9 @@ class TestDriver:
 
     def test_collect_random_returns_episodes(self):
         driver = Driver(env_fns=[_make_short_env])
-        episodes = driver.collect_random(n_steps=50)
+        episodes, n_trans = driver.collect_random(n_steps=50)
         assert len(episodes) > 0
+        assert n_trans >= 50
         for ep in episodes:
             assert isinstance(ep, Episode)
             assert ep.obs.dim() == 4  # (T, C, H, W)
@@ -171,20 +172,22 @@ class TestDriver:
         def policy(obs_hist, act_hist):
             return torch.rand(1) * 2 - 1
 
-        episodes = driver.collect(n_steps=50, policy_fn=policy)
+        episodes, n_trans = driver.collect(n_steps=50, policy_fn=policy)
         assert len(episodes) > 0
+        assert n_trans >= 50
         driver.close()
 
     def test_multi_env_collect(self):
         driver = Driver(env_fns=[_make_short_env for _ in range(2)])
-        episodes = driver.collect_random(n_steps=100)
+        episodes, n_trans = driver.collect_random(n_steps=100)
         total = sum(ep.length for ep in episodes)
         assert total >= 10
+        assert n_trans >= 100
         driver.close()
 
     def test_episode_return_tracking(self):
         driver = Driver(env_fns=[_make_short_env])
-        episodes = driver.collect_random(n_steps=200)
+        episodes, _ = driver.collect_random(n_steps=200)
         for ep in episodes:
             assert isinstance(ep.total_return, float)
             assert ep.length > 0
@@ -262,7 +265,7 @@ class TestDriverReplayIntegration:
 
     def test_collect_store_sample(self):
         driver = Driver(env_fns=[_make_short_env])
-        episodes = driver.collect_random(n_steps=200)
+        episodes, _ = driver.collect_random(n_steps=200)
         driver.close()
 
         buf = ReplayBuffer(capacity=10000)

@@ -104,6 +104,19 @@ class DMControlEnv:
         img = torch.from_numpy(pixels.copy()).float().div(255.0)
         return img.permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
 
+    def render_rgb(self, size: int | None = None) -> np.ndarray:
+        """Render current state as (H, W, 3) uint8 numpy array.
+
+        Useful for display backends (pygame, OpenCV) that expect raw RGB.
+
+        Args:
+            size: Override render resolution. Defaults to ``self._size``.
+        """
+        s = size or self._size
+        return self._env.physics.render(
+            height=s, width=s, camera_id=self._camera_id,
+        ).copy()
+
     def reset(self) -> torch.Tensor:
         """Reset environment. Returns observation (C, H, W)."""
         self._env.reset()
@@ -179,6 +192,10 @@ class EnvWrapper:
 
     def sample_random_action(self) -> torch.Tensor:
         return self._env.sample_random_action()
+
+    def render_rgb(self, size: int | None = None) -> np.ndarray:
+        """Forward render_rgb to the inner env if available."""
+        return self._env.render_rgb(size=size)
 
 
 class ActionRepeatWrapper(EnvWrapper):

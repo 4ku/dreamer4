@@ -333,14 +333,15 @@ class TestTokenizer:
 
 class TestReconLoss:
 
-    def test_zero_when_all_masked(self):
-        """If everything is masked (hidden from encoder), no visible patches -> loss 0."""
+    def test_nonzero_when_all_masked(self):
+        """Loss is on ALL patches regardless of mask (decoder must reconstruct everything)."""
         pred = torch.rand(B, T, N_PATCHES, PATCH_DIM)
         target = torch.rand(B, T, N_PATCHES, PATCH_DIM)
         mask = torch.ones(B, T, N_PATCHES, 1, dtype=torch.bool)
 
         loss = recon_loss_from_mae(pred, target, mask)
-        assert loss.item() == 0.0
+        expected = (pred.float() - target.float()).pow(2).mean()
+        torch.testing.assert_close(loss, expected, atol=1e-5, rtol=1e-5)
 
     def test_correct_when_no_mask(self):
         """If nothing is masked, all patches are visible -> full MSE."""
@@ -361,20 +362,18 @@ class TestReconLoss:
         loss.backward()
         assert pred.grad is not None
 
-    def test_only_visible_contributes(self):
-        """Only visible (not masked) patches should affect the gradient."""
+    def test_all_patches_contribute(self):
+        """All patches contribute to the loss regardless of mask."""
         pred = torch.rand(1, 1, 4, PATCH_DIM, requires_grad=True)
         target = torch.rand(1, 1, 4, PATCH_DIM)
         mask = torch.ones(1, 1, 4, 1, dtype=torch.bool)
-        mask[0, 0, 0, 0] = False  # only patch 0 visible
+        mask[0, 0, 0, 0] = False  # mask doesn't matter
 
         loss = recon_loss_from_mae(pred, target, mask)
         loss.backward()
 
-        assert pred.grad[0, 0, 0].abs().sum() > 0
-        assert pred.grad[0, 0, 1].abs().sum() == 0
-        assert pred.grad[0, 0, 2].abs().sum() == 0
-        assert pred.grad[0, 0, 3].abs().sum() == 0
+        for i in range(4):
+            assert pred.grad[0, 0, i].abs().sum() > 0
 
     def test_finite_output(self):
         pred = torch.rand(B, T, N_PATCHES, PATCH_DIM)

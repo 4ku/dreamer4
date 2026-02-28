@@ -224,7 +224,7 @@ class TestPolicyHeadContinuous:
     def test_log_prob_shape(self, head):
         x = torch.randn(2, 8, 64)
         params = head(x)
-        actions = torch.randn(2, 8, 4)
+        actions = torch.tanh(torch.randn(2, 8, 4))
         lp = head.log_prob(params, actions)
         assert lp.shape == (2, 8)
 
@@ -234,6 +234,13 @@ class TestPolicyHeadContinuous:
         actions, lp = head.sample(params)
         assert actions.shape == (2, 8, 4)
         assert lp.shape == (2, 8)
+
+    def test_sample_bounded(self, head):
+        """Continuous actions should be in (-1, 1) due to tanh squashing."""
+        x = torch.randn(4, 16, 64)
+        params = head(x)
+        actions, _ = head.sample(params)
+        assert (actions > -1).all() and (actions < 1).all()
 
     def test_entropy_shape(self, head):
         x = torch.randn(2, 8, 64)
@@ -454,8 +461,8 @@ class TestPMPO:
         adv = torch.tensor([1.0, 1.0, 1.0, 1.0])
         lp_low = torch.tensor([-2.0, -2.0, -2.0, -2.0])
         lp_high = torch.tensor([-0.5, -0.5, -0.5, -0.5])
-        loss_low = pmpo_policy_loss(lp_low, adv, alpha=0.5, beta=0.0)
-        loss_high = pmpo_policy_loss(lp_high, adv, alpha=0.5, beta=0.0)
+        loss_low, _ = pmpo_policy_loss(lp_low, adv, alpha=0.5, beta=0.0)
+        loss_high, _ = pmpo_policy_loss(lp_high, adv, alpha=0.5, beta=0.0)
         assert loss_high < loss_low
 
     def test_negative_advantages_increase_loss(self):
@@ -463,42 +470,42 @@ class TestPMPO:
         adv = torch.tensor([-1.0, -1.0, -1.0, -1.0])
         lp_low = torch.tensor([-2.0, -2.0, -2.0, -2.0])
         lp_high = torch.tensor([-0.5, -0.5, -0.5, -0.5])
-        loss_low = pmpo_policy_loss(lp_low, adv, alpha=0.5, beta=0.0)
-        loss_high = pmpo_policy_loss(lp_high, adv, alpha=0.5, beta=0.0)
+        loss_low, _ = pmpo_policy_loss(lp_low, adv, alpha=0.5, beta=0.0)
+        loss_high, _ = pmpo_policy_loss(lp_high, adv, alpha=0.5, beta=0.0)
         assert loss_high > loss_low
 
     def test_kl_regularization(self):
-        """Adding KL regularization should increase loss when policies differ."""
+        """Adding KL regularization should change loss when policies differ."""
         lp = torch.tensor([[-1.0, -1.0]])
         adv = torch.tensor([[1.0, -1.0]])
-        prior_lp = torch.tensor([[-0.5, -0.5]])  # prior is different
+        prior_lp = torch.tensor([[-0.5, -0.5]])
 
-        loss_no_kl = pmpo_policy_loss(lp, adv, beta=0.0)
-        loss_kl = pmpo_policy_loss(lp, adv, prior_log_probs=prior_lp, beta=0.3)
+        loss_no_kl, _ = pmpo_policy_loss(lp, adv, beta=0.0)
+        loss_kl, info = pmpo_policy_loss(lp, adv, prior_log_probs=prior_lp, beta=0.3)
         assert loss_kl != loss_no_kl
+        assert "kl_to_prior" in info
 
-    def test_alpha_balancing(self):
-        """With alpha=1.0 only positive advantages matter."""
-        adv = torch.tensor([[1.0, -1.0]])
-        lp = torch.tensor([[-1.0, -1.0]])
-        loss = pmpo_policy_loss(lp, adv, alpha=1.0, beta=0.0)
-        # Only pos term: -(1.0 * (-1.0) / 1) = 1.0
-        assert loss.item() == pytest.approx(1.0, abs=1e-5)
+    def test_returns_info_dict(self):
+        """Should return (loss, info) tuple with diagnostic keys."""
+        lp = torch.randn(4, 8)
+        adv = torch.randn(4, 8)
+        loss, info = pmpo_policy_loss(lp, adv, beta=0.0)
+        assert loss.dim() == 0
+        for key in ("advantage_std", "advantage_pos_frac", "kl_to_prior", "log_prob_mean"):
+            assert key in info
 
     def test_scalar_output(self):
         lp = torch.randn(4, 8)
         adv = torch.randn(4, 8)
-        loss = pmpo_policy_loss(lp, adv, beta=0.0)
+        loss, _ = pmpo_policy_loss(lp, adv, beta=0.0)
         assert loss.dim() == 0
 
     def test_gradient_direction(self):
         """Gradient should push log_prob up for positive advantages."""
         lp = torch.tensor([-1.0, -1.0], requires_grad=True)
         adv = torch.tensor([1.0, 1.0])
-        loss = pmpo_policy_loss(lp, adv, alpha=0.5, beta=0.0)
+        loss, _ = pmpo_policy_loss(lp, adv, alpha=0.5, beta=0.0)
         loss.backward()
-        # Loss = -alpha * mean(lp[pos]) so grad w.r.t. lp = -alpha / n_pos
-        # Negative gradient -> optimizer step increases lp (good!)
         assert (lp.grad < 0).all()
 
 
@@ -513,7 +520,7 @@ class TestBehaviorCloningLoss:
             mtp_length=4, mlp_depth=1, mlp_ratio=2.0,
         )
         embed = torch.randn(2, 8, 32)
-        actions = torch.randn(2, 8, 2)
+        actions = torch.tanh(torch.randn(2, 8, 2))
         loss = behavior_cloning_loss(head, embed, actions, mtp_length=4)
         assert loss.dim() == 0
 
@@ -524,7 +531,7 @@ class TestBehaviorCloningLoss:
             mtp_length=2, mlp_depth=1, mlp_ratio=2.0,
         )
         embed = torch.randn(4, 8, 32)
-        actions = torch.randn(4, 8, 2)
+        actions = torch.tanh(torch.randn(4, 8, 2))
         opt = torch.optim.Adam(head.parameters(), lr=1e-3)
 
         losses = []
@@ -544,7 +551,7 @@ class TestBehaviorCloningLoss:
             mtp_length=3, mlp_depth=1, mlp_ratio=2.0,
         )
         embed = torch.randn(1, 5, 32)
-        actions = torch.randn(1, 5, 2)
+        actions = torch.tanh(torch.randn(1, 5, 2))
         loss = behavior_cloning_loss(head, embed, actions, mtp_length=3)
         loss.backward()
         for p in head.parameters():
@@ -697,7 +704,7 @@ class TestIntegration:
         step_idx = torch.zeros(B, T, dtype=torch.long)
         signal_idx = torch.zeros(B, T, dtype=torch.long)
         agent_tokens = torch.randn(B, T, N_AGENT, D_MODEL)
-        target_actions = torch.randn(B, T, 2)
+        target_actions = torch.tanh(torch.randn(B, T, 2))
 
         _, agent_out = dynamics(
             actions, step_idx, signal_idx, z_noisy,
@@ -742,7 +749,7 @@ class TestEdgeCases:
             mtp_length=8, mlp_depth=1,
         )
         embed = torch.randn(1, 3, 32)
-        actions = torch.randn(1, 3, 2)
+        actions = torch.tanh(torch.randn(1, 3, 2))
         loss = behavior_cloning_loss(head, embed, actions, mtp_length=8)
         assert loss.dim() == 0
         assert not torch.isnan(loss)

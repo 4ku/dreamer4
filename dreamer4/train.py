@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -32,7 +33,8 @@ from dreamer4.agent import (
     RewardHead,
     TaskEncoder,
     ValueHead,
-    behavior_cloning_loss,
+    compute_lambda_returns,
+    pmpo_policy_loss,
     reward_prediction_loss,
 )
 from dreamer4.checkpoint import AutoCheckpoint, load_checkpoint, save_checkpoint
@@ -40,8 +42,7 @@ from dreamer4.config import TrainConfig
 from dreamer4.driver import Driver, Episode
 from dreamer4.dynamics import (
     DynamicsModel,
-    corrupt_representations,
-    sample_flow_schedule,
+    sample_one_timestep,
     shortcut_forcing_loss,
 )
 from dreamer4.imagination import (
@@ -53,7 +54,12 @@ from dreamer4.imagination import (
 from dreamer4.logging import MetricsLogger, setup_logging
 from dreamer4.replay import ReplayBuffer
 from dreamer4.tokenizer import RMSLossNormalizer, Tokenizer, recon_loss_from_mae
-from dreamer4.utils import pack_bottleneck_to_spatial, patchify
+from dreamer4.utils import (
+    pack_bottleneck_to_spatial,
+    patchify,
+    unpack_spatial_to_bottleneck,
+    unpatchify,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,10 +118,14 @@ class Dreamer4Agent(nn.Module):
             d_model=config.d_model,
             mtp_length=config.mtp_length,
             num_bins=config.reward_num_bins,
+            bin_low=config.bin_low,
+            bin_high=config.bin_high,
         )
         self.value_head = ValueHead(
             d_model=config.d_model,
             num_bins=config.value_num_bins,
+            bin_low=config.bin_low,
+            bin_high=config.bin_high,
         )
 
         self.prior_policy: Optional[PolicyHead] = None
@@ -161,7 +171,6 @@ class Dreamer4Agent(nn.Module):
 
         agent_params = (
             list(self.task_encoder.parameters())
-            + list(self.policy.parameters())
             + list(self.reward_head.parameters())
         )
         optimizers["agent"] = torch.optim.Adam(
@@ -200,8 +209,9 @@ class Dreamer4Agent(nn.Module):
             obs_flat = obs.reshape(B * T, 1, C, H, W)
 
         patches = patchify(obs_flat, cfg.patch_size)
+        tok = _unwrap(self.tokenizer)
         with torch.no_grad():
-            z = self.tokenizer.encode(patches)
+            z = tok.encode(patches)
 
         if N_cam > 1:
             z = z.reshape(B, T, N_cam, -1, z.shape[-1])
@@ -287,48 +297,46 @@ class Dreamer4Agent(nn.Module):
         optimizers["dynamics"].step()
         metrics["dynamics_loss"] = dyn_loss_raw.item()
 
-        # --- 4. Agent heads (BC + reward prediction) ---
-        with torch.no_grad():
-            d, step_idx, tau, signal_idx = sample_flow_schedule(
-                B, T, cfg.k_max, device,
-            )
-            z_tilde, _ = corrupt_representations(z_packed, tau)
-            _, agent_embed = self.dynamics(
-                actions, step_idx, signal_idx, z_tilde,
-                agent_tokens=agent_tok,
-            )
+        # --- 4. Agent heads (reward prediction) ---
+        # Forward pass with clean signal (tau=1) to get agent embeddings.
+        # Gradients flow into task_encoder and reward_head; dynamics weights
+        # are detached so this loss doesn't interfere with the dynamics loss.
+        dynamics_raw = _unwrap(self.dynamics)
+        step_idx = torch.zeros(B, T, dtype=torch.long, device=device)
+        signal_idx = torch.full((B, T), cfg.k_max, dtype=torch.long, device=device)
+
+        z_packed_detached = z_packed.detach()
+        agent_tok_fresh = self.task_encoder(
+            torch.zeros(B, dtype=torch.long, device=device),
+        ).expand(B, T, -1, -1)
+
+        _, agent_embed = dynamics_raw(
+            actions.detach(), step_idx, signal_idx, z_packed_detached,
+            agent_tokens=agent_tok_fresh,
+        )
 
         if agent_embed is not None:
             if agent_embed.dim() == 4:
                 agent_embed = agent_embed.mean(dim=-2)
 
-            bc_loss_raw = behavior_cloning_loss(
-                self.policy, agent_embed, actions,
-                mtp_length=cfg.mtp_length,
-            )
             rew_loss_raw = reward_prediction_loss(
                 self.reward_head, agent_embed, rewards,
                 mtp_length=cfg.mtp_length,
             )
 
-            self.loss_normalizer.update(2, bc_loss_raw)
             self.loss_normalizer.update(3, rew_loss_raw)
-            bc_loss = self.loss_normalizer.normalize(2, bc_loss_raw)
             rew_loss = self.loss_normalizer.normalize(3, rew_loss_raw)
 
-            agent_loss = bc_loss + rew_loss
             optimizers["agent"].zero_grad()
-            agent_loss.backward()
+            rew_loss.backward()
             if cfg.max_grad_norm > 0:
                 params = (
                     list(self.task_encoder.parameters())
-                    + list(self.policy.parameters())
                     + list(self.reward_head.parameters())
                 )
                 nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
             optimizers["agent"].step()
 
-            metrics["bc_loss"] = bc_loss_raw.item()
             metrics["reward_pred_loss"] = rew_loss_raw.item()
 
         return metrics
@@ -361,8 +369,9 @@ class Dreamer4Agent(nn.Module):
         context = z_packed[:, :ctx_len]
         ctx_actions = actions[:, :ctx_len]
 
+        dynamics_raw = _unwrap(self.dynamics)
         trajectory = imagine_rollout(
-            self.dynamics,
+            dynamics_raw,
             self.policy,
             self.reward_head,
             self.value_head,
@@ -373,6 +382,7 @@ class Dreamer4Agent(nn.Module):
             k_max=cfg.k_max,
             K=cfg.imagination_K,
             tau_ctx=cfg.imagination_tau_ctx,
+            max_context_window=cfg.policy_max_context,
         )
 
         if self.prior_policy is None:
@@ -389,10 +399,97 @@ class Dreamer4Agent(nn.Module):
             lam=cfg.lam,
             alpha=cfg.pmpo_alpha,
             beta=cfg.pmpo_beta,
+            entropy_scale=cfg.entropy_scale,
             max_grad_norm=cfg.max_grad_norm,
         )
 
         return metrics
+
+    # -- Real-env policy learning ---------------------------------------------
+
+    def train_policy_on_replay(
+        self,
+        batch: dict[str, torch.Tensor],
+        optimizers: dict[str, torch.optim.Optimizer],
+    ) -> dict[str, float]:
+        """Train policy using PMPO on real environment transitions.
+
+        Runs the dynamics model on real replay data to obtain agent
+        embeddings, then computes TD(lambda) returns from real rewards
+        and trains the policy with PMPO using ground-truth advantages.
+        """
+        cfg = self.config
+        device = self.device
+
+        obs = batch["obs"].to(device)
+        actions = batch["actions"].to(device)
+        rewards = batch["rewards"].to(device)
+
+        B, T = obs.shape[:2]
+        if T < 3:
+            return {}
+
+        z_packed = self.encode_obs(obs)
+
+        dynamics_raw = _unwrap(self.dynamics)
+        step_idx = torch.zeros(B, T, dtype=torch.long, device=device)
+        signal_idx = torch.full((B, T), cfg.k_max, dtype=torch.long, device=device)
+
+        task_ids = torch.zeros(B, dtype=torch.long, device=device)
+        agent_tok = self.task_encoder(task_ids).expand(B, T, -1, -1)
+
+        with torch.no_grad():
+            _, agent_embed = dynamics_raw(
+                actions, step_idx, signal_idx, z_packed.detach(),
+                agent_tokens=agent_tok,
+            )
+
+        if agent_embed is None:
+            return {}
+
+        if agent_embed.dim() == 4:
+            agent_embed = agent_embed.mean(dim=-2)
+
+        with torch.no_grad():
+            values = self.value_head.predict(agent_embed)
+            continues = torch.ones(B, T, device=device)
+            lambda_returns = compute_lambda_returns(
+                rewards, values, gamma=cfg.gamma, lam=cfg.lam, continues=continues,
+            )
+            advantages = (lambda_returns - values)[:, :-1]
+
+        agent_embed_policy = agent_embed[:, :-1].detach()
+        actions_policy = actions[:, :-1]
+        params = self.policy(agent_embed_policy)
+        log_probs = self.policy.log_prob(params, actions_policy)
+
+        prior_log_probs = None
+        if self.prior_policy is not None:
+            with torch.no_grad():
+                prior_params = self.prior_policy(agent_embed_policy)
+                prior_log_probs = self.prior_policy.log_prob(prior_params, actions_policy)
+
+        loss, pmpo_info = pmpo_policy_loss(
+            log_probs, advantages,
+            prior_log_probs=prior_log_probs,
+            alpha=cfg.pmpo_alpha,
+            beta=cfg.pmpo_beta,
+        )
+
+        optimizers["policy"].zero_grad()
+        loss.backward()
+        grad_norm = _grad_norm(self.policy)
+        if cfg.max_grad_norm > 0:
+            nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
+        optimizers["policy"].step()
+
+        return {
+            "replay_policy_loss": loss.item(),
+            "replay_mean_advantage": advantages.mean().item(),
+            "replay_advantage_std": pmpo_info["advantage_std"],
+            "replay_advantage_pos_frac": pmpo_info["advantage_pos_frac"],
+            "replay_policy_grad_norm": grad_norm,
+        }
 
     # -- Policy action (for env interaction) ---------------------------------
 
@@ -435,7 +532,8 @@ class Dreamer4Agent(nn.Module):
         step_idx = torch.zeros(1, T, dtype=torch.long, device=device)
         signal_idx = torch.full((1, T), cfg.k_max, dtype=torch.long, device=device)
 
-        z_hat, agent_out = self.dynamics(
+        dynamics_raw = _unwrap(self.dynamics)
+        z_hat, agent_out = dynamics_raw(
             act_t, step_idx, signal_idx, z_packed,
             agent_tokens=agent_tok,
         )
@@ -450,11 +548,222 @@ class Dreamer4Agent(nn.Module):
         action, _ = self.policy.sample(params)
         return action.squeeze(0).cpu()
 
+    # -- WM comparison video --------------------------------------------------
+
+    @torch.no_grad()
+    def generate_wm_comparison_video(
+        self,
+        replay: "ReplayBuffer",
+        device: torch.device,
+        n_context: int = 4,
+        n_predict: int = 12,
+    ) -> list[np.ndarray]:
+        """Generate side-by-side real vs WM-predicted frames for logging.
+
+        Returns a list of (H, W*2, 3) uint8 frames: left=real, right=predicted.
+        """
+        cfg = self.config
+        seq_len = n_context + n_predict
+        batch = replay.sample_sequence(1, seq_len, device=device)
+        obs = batch["obs"].to(device)
+        actions = batch["actions"].to(device)
+
+        z_packed = self.encode_obs(obs)
+        context = z_packed[:, :n_context]
+
+        tok = _unwrap(self.tokenizer)
+        dynamics_raw = _unwrap(self.dynamics)
+
+        task_ids = torch.zeros(1, dtype=torch.long, device=device)
+        predicted_frames: list[torch.Tensor] = []
+        frames_list = list(context.unbind(dim=1))
+        all_actions = list(actions[:, :n_context].unbind(dim=1))
+
+        for h in range(n_predict):
+            t_act = n_context + h
+            if t_act < actions.shape[1]:
+                all_actions.append(actions[:, t_act])
+            else:
+                all_actions.append(torch.zeros(1, self._action_dim, device=device))
+
+            win = min(len(frames_list), cfg.policy_max_context)
+            past = torch.stack(frames_list[-win:], dim=1)
+            act_past = torch.stack(all_actions[-win:], dim=1)
+            T_cur = past.shape[1]
+            agent_tok = self.task_encoder(task_ids).expand(1, T_cur + 1, -1, -1)
+            act_pad = torch.zeros(1, 1, self._action_dim, device=device)
+            act_full = torch.cat([act_past, act_pad], dim=1)
+
+            z_next, _ = sample_one_timestep(
+                dynamics_raw, past_packed=past, k_max=cfg.k_max,
+                K=cfg.imagination_K, actions=act_full,
+                tau_ctx=cfg.imagination_tau_ctx, agent_tokens=agent_tok,
+            )
+            frames_list.append(z_next)
+            predicted_frames.append(z_next)
+
+        H = W = cfg.image_size
+        C = cfg.channels
+        ps = cfg.patch_size
+        result_frames: list[np.ndarray] = []
+
+        for t in range(n_predict):
+            real_obs = obs[0, n_context + t]
+            real_np = (real_obs.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+            z_pred = predicted_frames[t].unsqueeze(1)
+            bn = unpack_spatial_to_bottleneck(z_pred, k=cfg.packing_k).clamp(-1, 1)
+            patches = tok.decoder(bn)
+            img = unpatchify(patches, H, W, C, ps).clamp(0, 1)
+            pred_np = (img[0, 0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+            gap = np.ones((H, 2, 3), dtype=np.uint8) * 128
+            combined = np.concatenate([real_np, gap, pred_np], axis=1)
+            result_frames.append(combined)
+
+        return result_frames
+
+    # -- Tokenizer reconstruction grid ----------------------------------------
+
+    @torch.no_grad()
+    def generate_tokenizer_recon_grid(
+        self,
+        replay: "ReplayBuffer",
+        device: torch.device,
+        n_images: int = 8,
+    ) -> list[torch.Tensor]:
+        """Generate [input, reconstruction] image pairs for TensorBoard grid.
+
+        Returns list of (C, H, W) tensors alternating input/recon.
+        """
+        cfg = self.config
+        batch = replay.sample_sequence(n_images, 1, device=device)
+        obs = batch["obs"].to(device)
+
+        patches = patchify(obs, cfg.patch_size)
+        tok = _unwrap(self.tokenizer)
+        pred, _, _ = tok(patches)
+
+        H = W = cfg.image_size
+        C = cfg.channels
+        ps = cfg.patch_size
+
+        orig_imgs = unpatchify(patches, H, W, C, ps).clamp(0, 1)
+        recon_imgs = unpatchify(pred, H, W, C, ps).clamp(0, 1)
+
+        grid_images: list[torch.Tensor] = []
+        for i in range(min(n_images, orig_imgs.shape[0])):
+            grid_images.append(orig_imgs[i, 0].cpu())
+            grid_images.append(recon_imgs[i, 0].cpu())
+
+        return grid_images
+
     # -- Prior policy update -------------------------------------------------
 
     def update_prior_policy(self) -> None:
         """Refresh the frozen behavioral prior from the current policy."""
         self.prior_policy = make_prior_policy(self.policy)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate(
+    agent: Dreamer4Agent,
+    env_fn: Callable[[], Any],
+    n_episodes: int = 5,
+    max_steps: int = 1000,
+    record_video: bool = True,
+    render_size: int = 128,
+) -> dict[str, Any]:
+    """Run the learned policy for evaluation (no gradient, no exploration).
+
+    Args:
+        agent:        Trained :class:`Dreamer4Agent` (will be set to eval mode).
+        env_fn:       Factory callable returning an environment instance.
+        n_episodes:   Number of evaluation episodes.
+        max_steps:    Max steps per episode (safety cap).
+        record_video: Whether to record RGB frames for video logging.
+        render_size:  Resolution for recorded video frames.
+
+    Returns:
+        Dict with keys:
+            - ``eval_return_mean``, ``eval_return_std``
+            - ``eval_return_min``, ``eval_return_max``
+            - ``eval_episode_length``
+            - ``eval_frames``: list of lists of (H, W, 3) uint8 arrays
+              (one list per episode), only if *record_video* is True.
+    """
+    agent.eval()
+    env = env_fn()
+    returns: list[float] = []
+    lengths: list[int] = []
+    all_frames: list[list[np.ndarray]] = []
+
+    for _ in range(n_episodes):
+        obs = env.reset()
+        obs_history: list[torch.Tensor] = [obs]
+        act_history: list[torch.Tensor] = []
+        ep_return = 0.0
+        ep_frames: list[np.ndarray] = []
+
+        if record_video and hasattr(env, "render_rgb"):
+            ep_frames.append(env.render_rgb(size=render_size))
+        elif record_video:
+            frame = (obs.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            ep_frames.append(frame)
+
+        for t in range(max_steps):
+            action = agent.policy_action(obs_history, act_history)
+            obs, reward, done, truncated, info = env.step(action)
+            ep_return += reward
+            obs_history.append(obs)
+            act_history.append(action)
+
+            if record_video:
+                if hasattr(env, "render_rgb"):
+                    ep_frames.append(env.render_rgb(size=render_size))
+                else:
+                    frame = (obs.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    ep_frames.append(frame)
+
+            if done:
+                break
+
+        returns.append(ep_return)
+        lengths.append(t + 1)
+        if record_video:
+            all_frames.append(ep_frames)
+
+    agent.train()
+
+    result: dict[str, Any] = {
+        "eval_return_mean": float(np.mean(returns)),
+        "eval_return_std": float(np.std(returns)),
+        "eval_return_min": float(np.min(returns)),
+        "eval_return_max": float(np.max(returns)),
+        "eval_episode_length": float(np.mean(lengths)),
+    }
+    if record_video:
+        result["eval_frames"] = all_frames
+    return result
+
+
+def _unwrap(module: nn.Module) -> nn.Module:
+    """Unwrap DataParallel if present."""
+    if isinstance(module, nn.DataParallel):
+        return module.module
+    return module
+
+
+def _grad_norm(module: nn.Module) -> float:
+    """Total L2 norm of gradients across all parameters."""
+    params = [p for p in module.parameters() if p.grad is not None]
+    if not params:
+        return 0.0
+    return torch.nn.utils.clip_grad_norm_(params, float("inf")).item()
 
 
 # ---------------------------------------------------------------------------
@@ -467,10 +776,12 @@ def online_training_loop(
     config: Optional[TrainConfig] = None,
     *,
     tokenizer: Optional[Tokenizer] = None,
+    eval_env_fn: Optional[Callable[[], Any]] = None,
     log_fn: Optional[Callable[[int, dict[str, float]], None]] = None,
     log_dir: Optional[str] = None,
     checkpoint_dir: Optional[str] = None,
     resume_from: Optional[str] = None,
+    use_data_parallel: bool = False,
 ) -> dict[str, list[float]]:
     """Main Dreamer 4 online training loop.
 
@@ -483,14 +794,16 @@ def online_training_loop(
            c. Imagine rollouts, train policy + value
 
     Args:
-        agent:          :class:`Dreamer4Agent` instance.
-        env_fns:        Factory callables, each returning an environment.
-        config:         Override config (defaults to ``agent.config``).
-        tokenizer:      Optional pretrained tokenizer to attach.
-        log_fn:         Extra ``(step, metrics) -> None`` callback.
-        log_dir:        TensorBoard log directory.
-        checkpoint_dir: Directory for periodic checkpoints.
-        resume_from:    Path to a checkpoint to resume from.
+        agent:              :class:`Dreamer4Agent` instance.
+        env_fns:            Factory callables, each returning an environment.
+        config:             Override config (defaults to ``agent.config``).
+        tokenizer:          Optional pretrained tokenizer to attach.
+        eval_env_fn:        Factory for evaluation environments (separate from train).
+        log_fn:             Extra ``(step, metrics) -> None`` callback.
+        log_dir:            TensorBoard log directory.
+        checkpoint_dir:     Directory for periodic checkpoints.
+        resume_from:        Path to a checkpoint to resume from.
+        use_data_parallel:  Wrap dynamics & tokenizer with ``nn.DataParallel``.
 
     Returns:
         Dict mapping metric names to lists of values over training.
@@ -502,6 +815,14 @@ def online_training_loop(
     if tokenizer is not None:
         agent.set_tokenizer(tokenizer)
         agent.tokenizer = agent.tokenizer.to(device)
+
+    # -- Multi-GPU DataParallel --
+    n_gpus = torch.cuda.device_count()
+    if use_data_parallel and n_gpus > 1:
+        logger.info("Wrapping dynamics and tokenizer with DataParallel (%d GPUs)", n_gpus)
+        agent.dynamics = nn.DataParallel(agent.dynamics)
+        if agent.tokenizer is not None:
+            agent.tokenizer = nn.DataParallel(agent.tokenizer)
 
     optimizers = agent.build_optimizers()
 
@@ -549,12 +870,13 @@ def online_training_loop(
 
     # -- 1. Prefill with random actions --
     logger.info("Prefilling replay with %d random steps...", cfg.prefill_steps)
-    prefill_episodes = driver.collect_random(cfg.prefill_steps)
+    prefill_episodes, prefill_transitions = driver.collect_random(cfg.prefill_steps)
     for ep in prefill_episodes:
         replay.add_episode(ep.obs, ep.actions, ep.rewards)
+    total_env_steps += prefill_transitions
     logger.info(
-        "Prefill complete: %d episodes, %d transitions",
-        replay.total_episodes, replay.total_transitions,
+        "Prefill complete: %d episodes, %d transitions (env_steps=%d)",
+        replay.total_episodes, replay.total_transitions, total_env_steps,
     )
 
     # -- 2. Main training loop --
@@ -571,10 +893,10 @@ def online_training_loop(
         ) -> torch.Tensor:
             return agent.policy_action(obs_hist, act_hist)
 
-        episodes = driver.collect(cfg.train_every, policy_fn)
+        episodes, n_transitions = driver.collect(cfg.train_every, policy_fn)
+        total_env_steps += n_transitions
         for ep in episodes:
             replay.add_episode(ep.obs, ep.actions, ep.rewards)
-            total_env_steps += ep.length
 
         if not replay.is_ready:
             continue
@@ -593,6 +915,14 @@ def online_training_loop(
             )
             im_metrics = agent.imagine_and_train(batch, optimizers)
 
+        # -- 2d. Train policy on real environment data --
+        replay_policy_metrics: dict[str, float] = {}
+        if train_step % 2 == 0:
+            batch = replay.sample_sequence(
+                cfg.batch_size, cfg.seq_len, device=device,
+            )
+            replay_policy_metrics = agent.train_policy_on_replay(batch, optimizers)
+
         train_step += 1
 
         # -- Update prior policy periodically --
@@ -601,7 +931,7 @@ def online_training_loop(
 
         # -- Logging --
         if train_step % cfg.log_every == 0:
-            all_metrics = {**wm_metrics, **im_metrics}
+            all_metrics = {**wm_metrics, **im_metrics, **replay_policy_metrics}
             all_metrics["env_steps"] = float(total_env_steps)
             all_metrics["episodes_collected"] = float(len(episodes))
             if episodes:
@@ -609,6 +939,74 @@ def online_training_loop(
                     sum(ep.total_return for ep in episodes) / len(episodes)
                 )
             _log(train_step, all_metrics)
+
+        # -- Evaluation --
+        if (
+            eval_env_fn is not None
+            and cfg.eval_every > 0
+            and train_step % cfg.eval_every == 0
+        ):
+            logger.info("Running evaluation at step %d...", train_step)
+            eval_result = evaluate(
+                agent, eval_env_fn,
+                n_episodes=5,
+                max_steps=cfg.time_limit,
+                record_video=True,
+            )
+            eval_scalars = {
+                k: v for k, v in eval_result.items() if isinstance(v, float)
+            }
+            _log(train_step, eval_scalars)
+            logger.info(
+                "Eval: return=%.2f +/- %.2f (min=%.2f, max=%.2f, len=%.0f)",
+                eval_scalars["eval_return_mean"],
+                eval_scalars["eval_return_std"],
+                eval_scalars["eval_return_min"],
+                eval_scalars["eval_return_max"],
+                eval_scalars["eval_episode_length"],
+            )
+            if metrics_logger is not None and "eval_frames" in eval_result:
+                best_idx = int(np.argmax([
+                    sum(1 for _ in frames) for frames in eval_result["eval_frames"]
+                ]))
+                best_frames = eval_result["eval_frames"][best_idx]
+                if best_frames:
+                    metrics_logger.log_video(
+                        train_step, "eval/episode_video", best_frames, fps=15,
+                    )
+
+        # -- WM prediction video --
+        if (
+            metrics_logger is not None
+            and cfg.wm_video_every > 0
+            and total_env_steps % cfg.wm_video_every < cfg.train_every
+            and total_env_steps > cfg.prefill_steps + cfg.wm_video_every
+        ):
+            logger.info("Generating WM comparison video at step %d...", train_step)
+            try:
+                wm_frames = agent.generate_wm_comparison_video(replay, device)
+                if wm_frames:
+                    metrics_logger.log_video(
+                        train_step, "wm/prediction_vs_real", wm_frames, fps=5,
+                    )
+            except Exception as e:
+                logger.warning("WM video generation failed: %s", e)
+
+        # -- Tokenizer reconstruction grid --
+        if (
+            metrics_logger is not None
+            and cfg.eval_every > 0
+            and train_step % cfg.eval_every == 0
+            and agent.tokenizer is not None
+        ):
+            try:
+                grid_imgs = agent.generate_tokenizer_recon_grid(replay, device)
+                if grid_imgs:
+                    metrics_logger.log_images_grid(
+                        train_step, "wm/tokenizer_recon", grid_imgs, nrow=4,
+                    )
+            except Exception as e:
+                logger.warning("Tokenizer recon grid failed: %s", e)
 
         # -- Checkpointing --
         if auto_ckpt is not None:
@@ -619,6 +1017,40 @@ def online_training_loop(
             )
 
     driver.close()
+
+    # -- Unwrap DataParallel before saving --
+    if isinstance(agent.dynamics, nn.DataParallel):
+        agent.dynamics = agent.dynamics.module
+    if agent.tokenizer is not None and isinstance(agent.tokenizer, nn.DataParallel):
+        agent.tokenizer = agent.tokenizer.module
+
+    # -- Final evaluation --
+    if eval_env_fn is not None:
+        logger.info("Running final evaluation (10 episodes)...")
+        final_eval = evaluate(
+            agent, eval_env_fn,
+            n_episodes=10,
+            max_steps=cfg.time_limit,
+            record_video=True,
+        )
+        final_scalars = {k: v for k, v in final_eval.items() if isinstance(v, float)}
+        _log(train_step, {f"final_{k}": v for k, v in final_scalars.items()})
+        logger.info(
+            "Final eval: return=%.2f +/- %.2f",
+            final_scalars["eval_return_mean"],
+            final_scalars["eval_return_std"],
+        )
+        if metrics_logger is not None and "eval_frames" in final_eval:
+            returns = []
+            for i, frames in enumerate(final_eval["eval_frames"]):
+                returns.append(len(frames))
+            best_idx = int(np.argmax(returns))
+            metrics_logger.log_video(
+                train_step, "eval/final_video",
+                final_eval["eval_frames"][best_idx], fps=15,
+            )
+
+        history["final_eval"] = [final_scalars]
 
     # -- Save final checkpoint --
     if checkpoint_dir is not None:

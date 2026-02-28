@@ -1,0 +1,81 @@
+# Dreamer 4 — Cartpole-balance config
+# Increased capacity for sharper world model predictions.
+
+# -- Environment --
+domain: cartpole
+task: balance
+image_size: 64
+action_repeat: 2
+n_envs: 4
+time_limit: 250
+
+# -- Tokenizer --
+patch_size: 8
+channels: 3
+d_bottleneck: 32
+n_bottleneck: 64
+packing_k: 4
+tokenizer_lr: 3.0e-4
+
+# -- Dynamics --
+d_model: 256
+d_spatial: 128
+n_spatial: 16
+n_register: 2
+n_agent: 1
+n_heads: 4
+depth: 4
+k_max: 4
+dynamics_lr: 3.0e-4
+bootstrap_fraction: 0.25
+
+# -- Agent heads --
+mtp_length: 2
+policy_mlp_depth: 2
+policy_mlp_ratio: 2.0
+reward_num_bins: 63
+value_num_bins: 63
+bin_low: -5.0
+bin_high: 5.0
+agent_lr: 3.0e-4
+num_tasks: 1
+
+# -- Imagination --
+imagination_horizon: 12
+imagination_K: 4
+imagination_tau_ctx: 0.1
+imagination_ctx_len: 8
+gamma: 0.99
+lam: 0.95
+
+# -- PMPO --
+pmpo_alpha: 0.5
+pmpo_beta: 0.1
+entropy_scale: 1.0e-2
+
+# -- Policy inference --
+policy_max_context: 8
+inference_tau: 0.95
+
+# -- Training loop --
+total_steps: 2000000
+prefill_steps: 5000
+train_every: 8
+batch_size: 24
+seq_len: 16
+wm_train_steps: 2
+imagine_train_steps: 2
+replay_capacity: 500000
+max_grad_norm: 100.0
+prior_update_interval: 200
+
+# -- Checkpointing --
+checkpoint_every: 3000
+keep_last_n: 40
+
+# -- Logging --
+log_every: 25
+eval_every: 2000
+wm_video_every: 20000
+
+device: cuda

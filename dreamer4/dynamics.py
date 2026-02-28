@@ -208,7 +208,7 @@ class DynamicsModel(nn.Module):
         dropout: float = 0.0,
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
-        space_mode: str = "wm_agent_isolated",
+        space_mode: str = "wm_agent",
         max_T: int = 1024,
     ):
         super().__init__()

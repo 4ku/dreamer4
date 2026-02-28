@@ -358,29 +358,23 @@ def recon_loss_from_mae(
     mae_mask: torch.Tensor,
 ) -> torch.Tensor:
     """
-    MSE reconstruction loss on patches the encoder could see.
+    MSE reconstruction loss on ALL patches.
 
-    During MAE training, some input patches are replaced with a learned
-    mask token before entering the encoder (mae_mask=True for those).
-    This loss is computed only on the *visible* patches — those the
-    encoder received unmodified — by inverting the mask.  When the
-    masking probability p=0 (no patches hidden), every patch contributes
-    to the loss, which matches the inference regime.
+    The MAE masking is applied to the encoder input to force the latent
+    bottleneck to be informative, but the decoder must reconstruct every
+    patch from the latents. The loss is therefore computed over all
+    patches regardless of the mask.
 
     Args:
         pred:     (B, T, Np, Dp) predicted patches from the decoder.
         target:   (B, T, Np, Dp) ground-truth patches.
-        mae_mask: (B, T, Np, 1) bool — True where the patch was hidden
-                  from the encoder (replaced with the learned mask token).
+        mae_mask: (B, T, Np, 1) bool — unused, kept for API compat.
 
     Returns:
-        Scalar MSE averaged over visible (encoder-seen) patch elements.
+        Scalar MSE averaged over all patch elements.
     """
-    mask_f = (~mae_mask).to(dtype=torch.float32)  # 1.0 for visible, 0.0 for masked
     diff = pred.float() - target.float()
-    sq = diff.pow(2) * mask_f
-    denom = mask_f.sum().clamp_min(1.0) * diff.shape[-1]
-    return sq.sum() / denom
+    return diff.pow(2).mean()
 
 
 def lpips_on_mae_recon(
