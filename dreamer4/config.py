@@ -85,6 +85,10 @@ class TrainConfig:
     bin_low: float = -20.0
     bin_high: float = 20.0
     agent_lr: float = 3e-4
+    policy_lr: float = 1e-5
+    policy_min_std: float = 0.1
+    policy_max_std: float = 2.0
+    policy_mean_scale: float = 1.5
     num_tasks: int = 1
 
     # -- Imagination --
@@ -98,11 +102,12 @@ class TrainConfig:
     # -- PMPO --
     pmpo_alpha: float = 0.5
     pmpo_beta: float = 0.3
-    entropy_scale: float = 1e-2
+    entropy_scale: float = 3e-2
 
     # -- Policy inference --
     policy_max_context: int = 8
     inference_tau: float = 0.95
+    expl_noise: float = 0.3
 
     # -- Training loop --
     total_steps: int = 1_000_000
@@ -114,7 +119,9 @@ class TrainConfig:
     imagine_train_steps: int = 1
     replay_capacity: int = 1_000_000
     max_grad_norm: float = 100.0
+    policy_max_grad_norm: float = 1.0
     prior_update_interval: int = 100
+    prior_warmup_steps: int = 1000
 
     # -- Checkpointing --
     checkpoint_every: int = 10_000

@@ -36,6 +36,10 @@ logger = logging.getLogger("dreamer4")
 _PREFIX_MAP = {
     "dynamics_loss": "wm",
     "tokenizer_loss": "wm",
+    "action_encoder_grad_norm": "wm",
+    "action_inject_grad_norm": "wm",
+    "action_embed_norm": "wm",
+    "action_dep_norm": "wm",
     "reward_pred_loss": "agent",
     "replay_policy_loss": "agent",
     "replay_mean_advantage": "agent",

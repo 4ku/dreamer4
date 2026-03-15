@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from dreamer4.agent import (
     PolicyHead,
@@ -113,6 +114,9 @@ class Dreamer4Agent(nn.Module):
             mtp_length=config.mtp_length,
             mlp_depth=config.policy_mlp_depth,
             mlp_ratio=config.policy_mlp_ratio,
+            min_std=config.policy_min_std,
+            max_std=config.policy_max_std,
+            mean_scale=config.policy_mean_scale,
         )
         self.reward_head = RewardHead(
             d_model=config.d_model,
@@ -181,7 +185,7 @@ class Dreamer4Agent(nn.Module):
             self.value_head.parameters(), lr=cfg.agent_lr,
         )
         optimizers["policy"] = torch.optim.Adam(
-            self.policy.parameters(), lr=cfg.agent_lr,
+            self.policy.parameters(), lr=cfg.policy_lr,
         )
 
         return optimizers
@@ -290,12 +294,36 @@ class Dreamer4Agent(nn.Module):
 
         optimizers["dynamics"].zero_grad()
         dyn_loss.backward()
+
+        dyn_raw = _unwrap(self.dynamics)
+        ae = dyn_raw.action_encoder
+        ae_params = [p for p in list(ae.fc1.parameters()) + list(ae.fc2.parameters())
+                     if p.grad is not None]
+        if ae_params:
+            metrics["action_encoder_grad_norm"] = torch.sqrt(
+                sum(p.grad.detach().pow(2).sum() for p in ae_params)
+            ).item()
+
+        a2s = dyn_raw.action_to_spatial
+        a2s_params = [p for p in a2s.parameters() if p.grad is not None]
+        if a2s_params:
+            metrics["action_inject_grad_norm"] = torch.sqrt(
+                sum(p.grad.detach().pow(2).sum() for p in a2s_params)
+            ).item()
+
         if cfg.max_grad_norm > 0:
             nn.utils.clip_grad_norm_(
                 self.dynamics.parameters(), cfg.max_grad_norm,
             )
         optimizers["dynamics"].step()
         metrics["dynamics_loss"] = dyn_loss_raw.item()
+
+        with torch.no_grad():
+            act_clamped = actions.clamp(-1, 1)
+            fc2_out = ae.fc2(F.silu(ae.fc1(act_clamped)))
+            full_embed = fc2_out + ae.base.view(1, 1, -1)
+            metrics["action_embed_norm"] = full_embed.norm(dim=-1).mean().item()
+            metrics["action_dep_norm"] = fc2_out.norm(dim=-1).mean().item()
 
         # --- 4. Agent heads (reward prediction) ---
         # Forward pass with clean signal (tau=1) to get agent embeddings.
@@ -347,12 +375,15 @@ class Dreamer4Agent(nn.Module):
         self,
         batch: dict[str, torch.Tensor],
         optimizers: dict[str, torch.optim.Optimizer],
+        *,
+        train_step: int = 0,
     ) -> dict[str, float]:
         """Imagination rollout + policy/value gradient step.
 
         Args:
             batch:      Dict from ``ReplayBuffer.sample_sequence`` (for context).
             optimizers: Dict of optimizers.
+            train_step: Current training step (used for prior warmup).
 
         Returns:
             Dict of scalar loss metrics.
@@ -385,7 +416,8 @@ class Dreamer4Agent(nn.Module):
             max_context_window=cfg.policy_max_context,
         )
 
-        if self.prior_policy is None:
+        use_prior = train_step >= cfg.prior_warmup_steps
+        if use_prior and self.prior_policy is None:
             self.prior_policy = make_prior_policy(self.policy)
 
         metrics = imagination_training_step(
@@ -394,13 +426,13 @@ class Dreamer4Agent(nn.Module):
             self.value_head,
             optimizers["policy"],
             optimizers["value"],
-            prior_policy=self.prior_policy,
+            prior_policy=self.prior_policy if use_prior else None,
             gamma=cfg.gamma,
             lam=cfg.lam,
-            alpha=cfg.pmpo_alpha,
             beta=cfg.pmpo_beta,
             entropy_scale=cfg.entropy_scale,
             max_grad_norm=cfg.max_grad_norm,
+            policy_max_grad_norm=cfg.policy_max_grad_norm,
         )
 
         return metrics
@@ -472,15 +504,13 @@ class Dreamer4Agent(nn.Module):
         loss, pmpo_info = pmpo_policy_loss(
             log_probs, advantages,
             prior_log_probs=prior_log_probs,
-            alpha=cfg.pmpo_alpha,
             beta=cfg.pmpo_beta,
         )
 
         optimizers["policy"].zero_grad()
         loss.backward()
         grad_norm = _grad_norm(self.policy)
-        if cfg.max_grad_norm > 0:
-            nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
+        nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.policy_max_grad_norm)
         optimizers["policy"].step()
 
         return {
@@ -498,12 +528,16 @@ class Dreamer4Agent(nn.Module):
         self,
         obs_history: list[torch.Tensor],
         act_history: list[torch.Tensor],
+        *,
+        explore: bool = True,
     ) -> torch.Tensor:
         """Select an action from the current observation history.
 
         Args:
             obs_history: List of (C, H, W) observation tensors.
             act_history: List of (A,) action tensors.
+            explore:     If True, add Gaussian exploration noise (training).
+                         Set False for evaluation / inference.
 
         Returns:
             (A,) action tensor.
@@ -525,7 +559,7 @@ class Dreamer4Agent(nn.Module):
         if act_list:
             act_t = torch.stack(act_list).unsqueeze(0).to(device)
             pad = torch.zeros(1, T - act_t.shape[1], self._action_dim, device=device)
-            act_t = torch.cat([pad, act_t], dim=1)
+            act_t = torch.cat([act_t, pad], dim=1)
         else:
             act_t = torch.zeros(1, T, self._action_dim, device=device)
 
@@ -546,7 +580,13 @@ class Dreamer4Agent(nn.Module):
         embed = agent_embed.squeeze(0)  # (d_model,)
         params = self.policy.forward(embed.unsqueeze(0), head_idx=0)
         action, _ = self.policy.sample(params)
-        return action.squeeze(0).cpu()
+        action = action.squeeze(0).cpu()
+
+        if explore and cfg.expl_noise > 0:
+            action = action + cfg.expl_noise * torch.randn_like(action)
+            action = action.clamp(-1.0, 1.0)
+
+        return action
 
     # -- WM comparison video --------------------------------------------------
 
@@ -716,7 +756,7 @@ def evaluate(
             ep_frames.append(frame)
 
         for t in range(max_steps):
-            action = agent.policy_action(obs_history, act_history)
+            action = agent.policy_action(obs_history, act_history, explore=False)
             obs, reward, done, truncated, info = env.step(action)
             ep_return += reward
             obs_history.append(obs)
@@ -913,25 +953,22 @@ def online_training_loop(
             batch = replay.sample_sequence(
                 cfg.batch_size, cfg.seq_len, device=device,
             )
-            im_metrics = agent.imagine_and_train(batch, optimizers)
-
-        # -- 2d. Train policy on real environment data --
-        replay_policy_metrics: dict[str, float] = {}
-        if train_step % 2 == 0:
-            batch = replay.sample_sequence(
-                cfg.batch_size, cfg.seq_len, device=device,
+            im_metrics = agent.imagine_and_train(
+                batch, optimizers, train_step=train_step,
             )
-            replay_policy_metrics = agent.train_policy_on_replay(batch, optimizers)
 
         train_step += 1
 
-        # -- Update prior policy periodically --
-        if train_step % cfg.prior_update_interval == 0:
+        # -- Update prior policy periodically (only after warmup) --
+        if (
+            train_step >= cfg.prior_warmup_steps
+            and train_step % cfg.prior_update_interval == 0
+        ):
             agent.update_prior_policy()
 
         # -- Logging --
         if train_step % cfg.log_every == 0:
-            all_metrics = {**wm_metrics, **im_metrics, **replay_policy_metrics}
+            all_metrics = {**wm_metrics, **im_metrics}
             all_metrics["env_steps"] = float(total_env_steps)
             all_metrics["episodes_collected"] = float(len(episodes))
             if episodes:

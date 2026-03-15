@@ -21,51 +21,16 @@ back to agent tokens, preventing causal confusion of the world model.
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal, Categorical
+from torch.distributions import Normal, Categorical, TransformedDistribution
+from torch.distributions.transforms import TanhTransform
 
 from dreamer4.distributions import SymExpTwoHot
-
-_TANH_LOG_PROB_EPS = 1e-6
-
-
-class TanhNormal:
-    """Normal distribution followed by tanh squashing.
-
-    Produces actions in (-1, 1) with correct log-probability Jacobian
-    correction: log p(a) = log p_base(atanh(a)) - sum log(1 - a^2).
-    """
-
-    def __init__(self, base_dist: Normal):
-        self.base_dist = base_dist
-
-    @property
-    def mean(self) -> torch.Tensor:
-        return torch.tanh(self.base_dist.mean)
-
-    def rsample(self) -> torch.Tensor:
-        return torch.tanh(self.base_dist.rsample())
-
-    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        """Log prob of squashed actions (per action dimension)."""
-        raw = torch.atanh(actions.clamp(-1 + _TANH_LOG_PROB_EPS,
-                                        1 - _TANH_LOG_PROB_EPS))
-        log_p = self.base_dist.log_prob(raw)
-        log_p = log_p - torch.log(1 - actions.pow(2) + _TANH_LOG_PROB_EPS)
-        return log_p
-
-    def entropy(self) -> torch.Tensor:
-        """Approximate entropy (base entropy, ignoring Jacobian).
-
-        Exact entropy of TanhNormal has no closed form. The base Normal
-        entropy is an upper bound and tracks the true value well enough
-        for the entropy bonus.
-        """
-        return self.base_dist.entropy()
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +97,9 @@ class PolicyHead(nn.Module):
     """
     Maps agent embeddings to action distributions.
 
-    Supports continuous (Normal) and discrete (Categorical) action spaces.
+    Supports continuous (TanhNormal) and discrete (Categorical) action spaces.
+    For continuous actions, uses a Normal distribution squashed through tanh
+    to naturally produce actions in (-1, 1) with correct log_prob Jacobian.
     Implements multi-token prediction (MTP) with ``L`` output heads that
     share an MLP trunk but have separate final linear layers, one per
     prediction distance n=0..L-1 (paper Eq. 9).
@@ -145,7 +112,8 @@ class PolicyHead(nn.Module):
         mtp_length: Multi-token prediction horizon L (default 8).
         mlp_depth:  Number of hidden layers in the MLP trunk.
         mlp_ratio:  Hidden dimension multiplier.
-        min_std:    Minimum standard deviation for continuous actions.
+        min_std:    Minimum pre-tanh standard deviation for continuous actions.
+        max_std:    Maximum pre-tanh standard deviation for continuous actions.
     """
 
     def __init__(
@@ -158,7 +126,9 @@ class PolicyHead(nn.Module):
         mtp_length: int = 8,
         mlp_depth: int = 3,
         mlp_ratio: float = 4.0,
-        min_std: float = 0.1,
+        min_std: float = 0.01,
+        max_std: float = 2.0,
+        mean_scale: float = 1.5,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -166,6 +136,8 @@ class PolicyHead(nn.Module):
         self.num_categories = num_categories
         self.mtp_length = mtp_length
         self.min_std = min_std
+        self.max_std = max_std
+        self.mean_scale = mean_scale
 
         d_hidden = int(d_model * mlp_ratio)
 
@@ -220,25 +192,32 @@ class PolicyHead(nn.Module):
         h = self.trunk(agent_embed)
         return [head(h) for head in self.heads]
 
+    def _base_normal(self, params: torch.Tensor) -> Normal:
+        """Build the pre-tanh Normal from raw network output."""
+        mean_raw, std_raw = params.split(self.action_dim, dim=-1)
+        mean = self.mean_scale * torch.tanh(mean_raw / self.mean_scale)
+        std = self.min_std + (self.max_std - self.min_std) * torch.sigmoid(std_raw)
+        return Normal(mean, std)
+
     def dist(
         self, params: torch.Tensor
-    ) -> TanhNormal | Categorical:
+    ) -> TransformedDistribution | Categorical:
         """
         Build a distribution from raw parameters.
 
-        For continuous actions returns a TanhNormal that produces
-        actions in (-1, 1) with correct Jacobian correction.
+        For continuous actions returns a TanhNormal distribution
+        (Normal squashed through tanh), which naturally produces
+        actions in (-1, 1) with correct log_prob Jacobian correction.
 
         Args:
             params: Output of ``forward()``.
 
         Returns:
-            TanhNormal (continuous) or Categorical (discrete).
+            TransformedDistribution (continuous) or Categorical (discrete).
         """
         if self.action_type == "continuous":
-            mean, log_std = params.split(self.action_dim, dim=-1)
-            std = F.softplus(log_std) + self.min_std
-            return TanhNormal(Normal(mean, std))
+            base = self._base_normal(params)
+            return TransformedDistribution(base, [TanhTransform(cache_size=1)])
         else:
             logits = params.reshape(*params.shape[:-1],
                                     self.action_dim, self.num_categories)
@@ -250,6 +229,9 @@ class PolicyHead(nn.Module):
         """
         Log probability of actions under the distribution.
 
+        For continuous actions, clamps inputs to (-1+eps, 1-eps) to
+        avoid infinite log_prob at the tanh boundaries.
+
         Args:
             params:  Output of ``forward()``.
             actions: (*, action_dim) for continuous (in [-1,1]);
@@ -258,6 +240,8 @@ class PolicyHead(nn.Module):
         Returns:
             (*) total log probability (summed over action dimensions).
         """
+        if self.action_type == "continuous":
+            actions = actions.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
         d = self.dist(params)
         return d.log_prob(actions).sum(dim=-1)
 
@@ -267,32 +251,47 @@ class PolicyHead(nn.Module):
         """
         Sample actions and compute their log probabilities.
 
+        For continuous actions, uses TanhNormal so actions are
+        naturally in (-1, 1) with correct Jacobian-corrected log_prob.
+
         Args:
             params: Output of ``forward()``.
 
         Returns:
-            actions:   (*, action_dim) in [-1, 1] for continuous.
+            actions:   (*, action_dim) in (-1, 1) for continuous.
             log_probs: (*) total log probability.
         """
         d = self.dist(params)
         if self.action_type == "continuous":
             actions = d.rsample()
             lp = d.log_prob(actions).sum(dim=-1)
+            return actions, lp
         else:
             actions = d.sample()
             lp = d.log_prob(actions).sum(dim=-1)
-        return actions, lp
+            return actions, lp
 
     def entropy(self, params: torch.Tensor) -> torch.Tensor:
         """
         Entropy of the distribution (summed over action dims).
 
+        For continuous (TanhNormal) actions, uses a sample-based estimate:
+        H(TanhNormal) = H(Normal) - E[sum(log(1 - tanh(x)^2))]
+        where x ~ Normal(mean, std). This correctly accounts for the
+        tanh squashing, which saturates the entropy as std grows large.
+
         Args:
             params: Output of ``forward()``.
 
         Returns:
-            (*) entropy.
+            (*) entropy estimate.
         """
+        if self.action_type == "continuous":
+            base = self._base_normal(params)
+            base_entropy = base.entropy().sum(dim=-1)
+            x = base.rsample()
+            log_det = torch.log1p(-x.tanh().pow(2) + 1e-6).sum(dim=-1)
+            return base_entropy + log_det
         d = self.dist(params)
         return d.entropy().sum(dim=-1)
 
@@ -500,24 +499,19 @@ def pmpo_policy_loss(
     advantages: torch.Tensor,
     *,
     prior_log_probs: Optional[torch.Tensor] = None,
-    alpha: float = 0.5,
     beta: float = 0.3,
 ) -> Tuple[torch.Tensor, dict[str, float]]:
     """
-    PMPO policy loss with normalized advantage weighting (paper Eq. 11).
+    REINFORCE policy loss with percentile + unit-variance advantage normalization.
 
-    Splits imagined states into positive-advantage (D+) and
-    negative-advantage (D-) sets. Weights log-probs by normalized
-    advantage magnitude within each set, balanced by alpha.
-
-    A reverse-KL term KL[pi_theta || pi_prior] regularizes toward the
-    behavioral prior.
+    First applies percentile normalization (5th-95th range) to remove outliers,
+    then normalizes to unit variance so the policy gradient has consistent
+    magnitude regardless of the absolute advantage scale.
 
     Args:
         log_probs:       (B, T) log pi_theta(a|s) under the current policy.
         advantages:      (B, T) A_t = R_t^lambda - v_t.
         prior_log_probs: (B, T) log pi_prior(a|s) from behavioral prior.
-        alpha:           Balance between D+ and D- (0.5 = equal weight).
         beta:            KL regularization strength.
 
     Returns:
@@ -525,29 +519,26 @@ def pmpo_policy_loss(
     """
     adv = advantages.detach()
 
-    adv_std = adv.std().clamp_min(1e-8)
-    adv_norm = adv / adv_std
+    pct_5 = torch.quantile(adv, 0.05)
+    pct_95 = torch.quantile(adv, 0.95)
+    scale = (pct_95 - pct_5).clamp_min(1e-8)
+    adv = adv / scale
 
-    pos_mask = adv_norm >= 0  # D+
-    neg_mask = ~pos_mask      # D-
+    adv = adv / adv.std().clamp_min(1e-5)
 
-    n_pos = pos_mask.sum().clamp_min(1)
-    n_neg = neg_mask.sum().clamp_min(1)
-
-    loss_pos = -(log_probs * adv_norm.abs() * pos_mask.float()).sum() / n_pos
-    loss_neg = (log_probs * adv_norm.abs() * neg_mask.float()).sum() / n_neg
-
-    loss = alpha * loss_pos + (1.0 - alpha) * loss_neg
+    loss = -(log_probs * adv).mean()
 
     kl_val = 0.0
     if prior_log_probs is not None and beta > 0:
-        kl = (log_probs - prior_log_probs).mean()
+        kl = (log_probs - prior_log_probs).clamp(-5.0, 5.0).mean()
         kl_val = kl.item()
         loss = loss + beta * kl
 
+    pos_frac = (adv >= 0).float().sum() / max(adv.numel(), 1)
+
     info = {
-        "advantage_std": adv_std.item(),
-        "advantage_pos_frac": (pos_mask.sum().float() / max(adv.numel(), 1)).item(),
+        "advantage_std": adv.std().item(),
+        "advantage_pos_frac": pos_frac.item(),
         "kl_to_prior": kl_val,
         "log_prob_mean": log_probs.mean().item(),
     }

@@ -62,11 +62,11 @@ class ActionEncoder(nn.Module):
 
         hidden = int(d_model * hidden_mult)
         self.base = nn.Parameter(torch.empty(d_model))
-        nn.init.normal_(self.base, std=0.02)
+        nn.init.normal_(self.base, std=0.001)
 
         self.fc1 = nn.Linear(action_dim, hidden)
         self.fc2 = nn.Linear(hidden, d_model)
-        nn.init.normal_(self.fc2.weight, std=1e-3)
+        nn.init.normal_(self.fc2.weight, std=0.02)
         nn.init.zeros_(self.fc2.bias)
 
     def forward(
@@ -265,6 +265,10 @@ class DynamicsModel(nn.Module):
         nn.init.zeros_(self.flow_head.weight)
         nn.init.zeros_(self.flow_head.bias)
 
+        self.action_to_spatial = nn.Linear(d_model, d_model)
+        nn.init.zeros_(self.action_to_spatial.weight)
+        nn.init.zeros_(self.action_to_spatial.bias)
+
     def forward(
         self,
         actions: Optional[torch.Tensor],
@@ -297,6 +301,11 @@ class DynamicsModel(nn.Module):
         )  # (B, T, 1, D)
 
         spatial_tok = self.spatial_proj(z_noisy)  # (B, T, n_spatial, D)
+
+        shifted_act = torch.zeros_like(act_tok)
+        shifted_act[:, 1:] = act_tok[:, :-1]
+        act_inject = self.action_to_spatial(shifted_act[:, :, 0, :])  # (B, T, D)
+        spatial_tok = spatial_tok + act_inject.unsqueeze(2)
 
         reg = self.register_tokens.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
 

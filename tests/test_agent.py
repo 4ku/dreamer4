@@ -236,7 +236,7 @@ class TestPolicyHeadContinuous:
         assert lp.shape == (2, 8)
 
     def test_sample_bounded(self, head):
-        """Continuous actions should be in (-1, 1) due to tanh squashing."""
+        """Continuous actions should be in (-1, 1) via TanhNormal."""
         x = torch.randn(4, 16, 64)
         params = head(x)
         actions, _ = head.sample(params)
@@ -248,11 +248,11 @@ class TestPolicyHeadContinuous:
         ent = head.entropy(params)
         assert ent.shape == (2, 8)
 
-    def test_entropy_positive(self, head):
+    def test_entropy_finite(self, head):
         x = torch.randn(2, 8, 64)
         params = head(x)
         ent = head.entropy(params)
-        assert (ent > 0).all()
+        assert torch.isfinite(ent).all()
 
     def test_gradient_flows(self, head):
         x = torch.randn(2, 4, 64, requires_grad=True)
@@ -461,8 +461,8 @@ class TestPMPO:
         adv = torch.tensor([1.0, 1.0, 1.0, 1.0])
         lp_low = torch.tensor([-2.0, -2.0, -2.0, -2.0])
         lp_high = torch.tensor([-0.5, -0.5, -0.5, -0.5])
-        loss_low, _ = pmpo_policy_loss(lp_low, adv, alpha=0.5, beta=0.0)
-        loss_high, _ = pmpo_policy_loss(lp_high, adv, alpha=0.5, beta=0.0)
+        loss_low, _ = pmpo_policy_loss(lp_low, adv, beta=0.0)
+        loss_high, _ = pmpo_policy_loss(lp_high, adv, beta=0.0)
         assert loss_high < loss_low
 
     def test_negative_advantages_increase_loss(self):
@@ -470,8 +470,8 @@ class TestPMPO:
         adv = torch.tensor([-1.0, -1.0, -1.0, -1.0])
         lp_low = torch.tensor([-2.0, -2.0, -2.0, -2.0])
         lp_high = torch.tensor([-0.5, -0.5, -0.5, -0.5])
-        loss_low, _ = pmpo_policy_loss(lp_low, adv, alpha=0.5, beta=0.0)
-        loss_high, _ = pmpo_policy_loss(lp_high, adv, alpha=0.5, beta=0.0)
+        loss_low, _ = pmpo_policy_loss(lp_low, adv, beta=0.0)
+        loss_high, _ = pmpo_policy_loss(lp_high, adv, beta=0.0)
         assert loss_high > loss_low
 
     def test_kl_regularization(self):
@@ -504,7 +504,7 @@ class TestPMPO:
         """Gradient should push log_prob up for positive advantages."""
         lp = torch.tensor([-1.0, -1.0], requires_grad=True)
         adv = torch.tensor([1.0, 1.0])
-        loss, _ = pmpo_policy_loss(lp, adv, alpha=0.5, beta=0.0)
+        loss, _ = pmpo_policy_loss(lp, adv, beta=0.0)
         loss.backward()
         assert (lp.grad < 0).all()
 

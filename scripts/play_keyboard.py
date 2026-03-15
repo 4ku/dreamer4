@@ -114,7 +114,7 @@ def predict_next_frame(
     """
     max_ctx = cfg.policy_max_context
     obs_list = obs_history[-max_ctx:]
-    act_list = act_history[-(max_ctx):]
+    act_list = act_history[-(max_ctx - 1):]
 
     obs_t = torch.stack(obs_list).unsqueeze(0).to(device)  # (1, T, C, H, W)
     z_packed = agent.encode_obs(obs_t)
@@ -126,7 +126,7 @@ def predict_next_frame(
     if act_list:
         act_t = torch.stack(act_list).unsqueeze(0).to(device)
         pad = torch.zeros(1, T_cur + 1 - act_t.shape[1], agent.action_dim, device=device)
-        act_t = torch.cat([pad, act_t], dim=1)
+        act_t = torch.cat([act_t, pad], dim=1)
     else:
         act_t = torch.zeros(1, T_cur + 1, agent.action_dim, device=device)
 

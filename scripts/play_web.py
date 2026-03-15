@@ -131,7 +131,7 @@ def dream_step(
         pad = torch.zeros(
             1, T_cur + 1 - act_t.shape[1], agent.action_dim, device=device,
         )
-        act_t = torch.cat([pad, act_t], dim=1)
+        act_t = torch.cat([act_t, pad], dim=1)
 
     z_next, a_out = sample_one_timestep(
         agent.dynamics, past_packed=past, k_max=cfg.k_max,

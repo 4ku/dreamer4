@@ -49,7 +49,7 @@ class ImaginedTrajectory:
     """
 
     latents: torch.Tensor        # (B, H, n_spatial, d_spatial)
-    actions: torch.Tensor        # (B, H, action_dim)
+    actions: torch.Tensor        # (B, H, action_dim)  — in (-1, 1) via TanhNormal
     log_probs: torch.Tensor      # (B, H)
     rewards: torch.Tensor        # (B, H)
     values: torch.Tensor         # (B, H)
@@ -155,7 +155,7 @@ def imagine_rollout(
         value_t = value_head.predict(agent_embed)    # (B,)
 
         policy_params = policy.forward(agent_embed, head_idx=0)
-        action_t, lp_t = policy.sample(policy_params)  # (B, A), (B,)
+        action_t, lp_t = policy.sample(policy_params)
 
         frames.append(z_next)
         all_actions_list.append(action_t)
@@ -188,10 +188,10 @@ def imagination_training_step(
     prior_policy: Optional[PolicyHead] = None,
     gamma: float = 0.997,
     lam: float = 0.95,
-    alpha: float = 0.5,
     beta: float = 0.3,
-    entropy_scale: float = 3e-3,
+    entropy_scale: float = 3e-2,
     max_grad_norm: float = 100.0,
+    policy_max_grad_norm: float = 10.0,
 ) -> dict[str, float]:
     """One gradient step of imagination training (Phase 3).
 
@@ -208,10 +208,10 @@ def imagination_training_step(
         prior_policy:   Frozen behavioral prior (for KL in PMPO).
         gamma:          Discount factor for lambda-returns.
         lam:            Lambda for TD(lambda).
-        alpha:          PMPO alpha (positive/negative balance).
-        beta:           PMPO KL regularization weight.
+        beta:           KL regularization weight.
         entropy_scale:  Weight on entropy bonus to prevent policy collapse.
-        max_grad_norm:  Gradient clipping norm.
+        max_grad_norm:  Gradient clipping norm for value head.
+        policy_max_grad_norm: Gradient clipping norm for policy head.
 
     Returns:
         Dict with scalar loss values for logging.
@@ -257,7 +257,7 @@ def imagination_training_step(
     pol_loss, pmpo_info = pmpo_policy_loss(
         log_probs, advantages,
         prior_log_probs=prior_lp,
-        alpha=alpha, beta=beta,
+        beta=beta,
     )
 
     entropy = policy.entropy(policy_params).mean()
@@ -267,8 +267,8 @@ def imagination_training_step(
     pol_loss.backward()
 
     policy_grad_norm = _grad_norm(policy)
-    if max_grad_norm > 0:
-        nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+    if policy_max_grad_norm > 0:
+        nn.utils.clip_grad_norm_(policy.parameters(), policy_max_grad_norm)
     policy_optim.step()
 
     return {

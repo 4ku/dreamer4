@@ -24,6 +24,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import imageio
@@ -227,7 +228,12 @@ def main():
 
     cfg = load_config(args.config, overrides=overrides)
 
-    logdir = Path(args.logdir)
+    base_logdir = Path(args.logdir)
+    if args.resume:
+        logdir = base_logdir
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        logdir = base_logdir / stamp
     log_dir = str(logdir / "logs")
     ckpt_dir = str(logdir / "checkpoints")
     video_dir = logdir / "videos"
