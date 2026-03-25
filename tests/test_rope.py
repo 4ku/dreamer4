@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from dreamer4.transformer.rope import build_rope_cache, apply_rope, build_rope_2d
+from dreamer4.transformer.rope import build_rope_cache, apply_rope
 
 
 # ===== Shape tests =====
@@ -23,15 +23,6 @@ def test_apply_rope_preserves_shape():
     x = torch.randn(B, H, L, D)
     y = apply_rope(x, cos, sin)
     assert y.shape == x.shape
-
-
-def test_build_rope_2d_shape():
-    """2D RoPE cache has the right (T, S, head_dim) shape."""
-    T, S, D = 16, 64, 64
-    cos, sin = build_rope_2d(T, S, D)
-    assert cos.shape == (T, S, D)
-    assert sin.shape == (T, S, D)
-
 
 # ===== Identity at position 0 =====
 
@@ -118,58 +109,3 @@ def test_rope_preserves_norm():
     y_norms = y.norm(dim=-1)
     torch.testing.assert_close(x_norms, y_norms, atol=1e-5, rtol=1e-5)
 
-
-# ===== 2D RoPE tests =====
-
-def test_2d_rope_spatial_independence():
-    """
-    In 2D axial RoPE, two tokens at the same spatial position but different
-    time steps should have the same spatial-part rotation.
-    """
-    T, S, D = 8, 16, 32
-    cos, sin = build_rope_2d(T, S, D)
-    half = D // 2
-
-    # Same spatial position (s=5), different time steps (t=2 and t=6)
-    # The spatial part (first half) should be the same
-    torch.testing.assert_close(cos[2, 5, :half], cos[6, 5, :half])
-    torch.testing.assert_close(sin[2, 5, :half], sin[6, 5, :half])
-
-
-def test_2d_rope_temporal_independence():
-    """
-    In 2D axial RoPE, two tokens at the same time step but different
-    spatial positions should have the same temporal-part rotation.
-    """
-    T, S, D = 8, 16, 32
-    cos, sin = build_rope_2d(T, S, D)
-    half = D // 2
-
-    # Same time step (t=3), different spatial positions (s=1 and s=10)
-    # The temporal part (second half) should be the same
-    torch.testing.assert_close(cos[3, 1, half:], cos[3, 10, half:])
-    torch.testing.assert_close(sin[3, 1, half:], sin[3, 10, half:])
-
-
-def test_2d_rope_requires_divisible_by_4():
-    """head_dim must be divisible by 4 for 2D axial RoPE."""
-    with pytest.raises(AssertionError):
-        build_rope_2d(T=4, S=4, head_dim=30)
-
-
-def test_2d_rope_gradient_flows():
-    """Gradients should flow through RoPE (it's a differentiable operation)."""
-    T, S, D = 4, 8, 16
-    cos, sin = build_rope_2d(T, S, D)
-
-    x = torch.randn(2, 4, T * S, D, requires_grad=True)
-
-    # Flatten 2D cache for 1D apply
-    cos_flat = cos.reshape(T * S, D)
-    sin_flat = sin.reshape(T * S, D)
-    y = apply_rope(x, cos_flat, sin_flat)
-
-    loss = y.sum()
-    loss.backward()
-    assert x.grad is not None
-    assert x.grad.shape == x.shape

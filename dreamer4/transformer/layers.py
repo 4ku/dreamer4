@@ -119,7 +119,7 @@ class SpaceAttention(nn.Module):
         # Apply attention with modality mask and spatial RoPE
         y_flat = self.attn(
             x_flat,
-            attn_mask=self.attn_mask.expand(B * T, -1, -1, -1),
+            attn_mask=self.attn_mask.expand(B * T, -1, -1, -1), # (B*T, 1, S, S)
             rope_cos=self.rope_cos,
             rope_sin=self.rope_sin,
         )
@@ -136,10 +136,6 @@ class TimeAttention(nn.Module):
 
     Applies 1D RoPE over temporal positions.
 
-    Optionally, only the first `n_latents` spatial positions receive temporal
-    attention (latents_only=True). This saves compute in the tokenizer where
-    only the latent tokens need temporal context.
-
     Args:
         d_model:     Model dimension.
         n_heads:     Number of query heads.
@@ -147,9 +143,6 @@ class TimeAttention(nn.Module):
         dropout:     Attention dropout.
         use_qk_norm: Use QKNorm.
         logit_cap:   Logit soft capping value.
-        latents_only: If True, only apply time attention to the first
-                      n_latents positions (for tokenizer efficiency).
-        n_latents:   Number of latent positions (used if latents_only=True).
         max_T:       Maximum number of time steps to precompute RoPE for.
 
     Shape:
@@ -165,13 +158,9 @@ class TimeAttention(nn.Module):
         dropout: float = 0.0,
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
-        latents_only: bool = False,
-        n_latents: int = 0,
         max_T: int = 1024,
     ):
         super().__init__()
-        self.latents_only = latents_only
-        self.n_latents = n_latents
 
         self.attn = MultiheadAttention(
             d_model=d_model,
@@ -197,40 +186,18 @@ class TimeAttention(nn.Module):
         """
         B, T, S, D = x.shape
 
-        if self.latents_only and self.n_latents > 0:
-            # Only the first n_latents spatial positions get time attention
-            L = self.n_latents
-            lat = x[:, :, :L, :]  # (B, T, L, D)
+        # All spatial positions get time attention
+        # Reshape: (B, T, S, D) -> (B, S, T, D) -> (B*S, T, D)
+        x_t = x.permute(0, 2, 1, 3).contiguous().reshape(B * S, T, D)
 
-            # Reshape: (B, T, L, D) -> (B, L, T, D) -> (B*L, T, D)
-            lat = lat.permute(0, 2, 1, 3).contiguous().reshape(B * L, T, D)
+        y_t = self.attn(
+            x_t,
+            is_causal=True,
+            rope_cos=self.rope_cos[:T],
+            rope_sin=self.rope_sin[:T],
+        )
 
-            # Causal attention with temporal RoPE
-            lat_out = self.attn(
-                lat,
-                is_causal=True,
-                rope_cos=self.rope_cos[:T],
-                rope_sin=self.rope_sin[:T],
-            )
-
-            # Reshape back and write into output
-            lat_out = lat_out.reshape(B, L, T, D).permute(0, 2, 1, 3).contiguous()
-            out = x.clone()
-            out[:, :, :L, :] = lat_out
-            return out
-        else:
-            # All spatial positions get time attention
-            # Reshape: (B, T, S, D) -> (B, S, T, D) -> (B*S, T, D)
-            x_t = x.permute(0, 2, 1, 3).contiguous().reshape(B * S, T, D)
-
-            y_t = self.attn(
-                x_t,
-                is_causal=True,
-                rope_cos=self.rope_cos[:T],
-                rope_sin=self.rope_sin[:T],
-            )
-
-            return y_t.reshape(B, S, T, D).permute(0, 2, 1, 3).contiguous()
+        return y_t.reshape(B, S, T, D).permute(0, 2, 1, 3).contiguous()
 
 
 class BlockCausalLayer(nn.Module):
@@ -264,8 +231,6 @@ class BlockCausalLayer(nn.Module):
         time_every:       Include time attention every N layers.
         use_qk_norm:      Use QKNorm in attention.
         logit_cap:        Logit soft capping value.
-        latents_only_time: Only apply time attention to latent tokens.
-        n_latents:        Number of latent tokens (for latents_only_time).
         max_T:            Max time steps for RoPE.
 
     Shape:
@@ -281,13 +246,11 @@ class BlockCausalLayer(nn.Module):
         layout: TokenLayout,
         space_mode: str,
         dropout: float = 0.0,
-        mlp_ratio: float = 4.0,
+        mlp_ratio: float = 8/3,
         layer_index: int = 0,
         time_every: int = 4,
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
-        latents_only_time: bool = False,
-        n_latents: int = 0,
         max_T: int = 1024,
     ):
         super().__init__()
@@ -316,8 +279,6 @@ class BlockCausalLayer(nn.Module):
                 dropout=dropout,
                 use_qk_norm=use_qk_norm,
                 logit_cap=logit_cap,
-                latents_only=latents_only_time,
-                n_latents=n_latents,
                 max_T=max_T,
             )
 

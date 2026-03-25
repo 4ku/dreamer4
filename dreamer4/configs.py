@@ -34,7 +34,7 @@ class TransformerConfig:
     n_heads: int
     depth: int
     n_kv_heads: int | None = None
-    mlp_ratio: float = 4.0
+    mlp_ratio: float = 8/3
     time_every: int = 4
     dropout: float = 0.0
     use_qk_norm: bool = True

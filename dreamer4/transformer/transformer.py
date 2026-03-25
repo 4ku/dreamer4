@@ -76,9 +76,9 @@ class BlockCausalTransformer(nn.Module):
         depth:            Number of transformer layers.
         layout:           TokenLayout describing the spatial dimension.
         space_mode:       Modality mask mode ("encoder", "decoder",
-                          "wm_agent_isolated", "wm_agent").
-        n_kv_heads:       Number of KV heads for GQA. Default = n_heads.
-        mlp_ratio:        MLP hidden = d_model * mlp_ratio (default 4.0).
+                         nt_isolated", "wm_agent").
+        n_kv_heads:       Number  "wm_ageof KV heads for GQA. Default = n_heads.
+        mlp_ratio:        MLP hidden = d_model * mlp_ratio (default 8/3).
         time_every:       Apply time attention every N layers (default 4).
         dropout:          Dropout rate (default 0.0).
         use_qk_norm:      Use QKNorm in attention (default True).
@@ -88,8 +88,12 @@ class BlockCausalTransformer(nn.Module):
         max_T:            Max time steps for RoPE cache (default 1024).
 
     Shape:
-        Input:  (B, T, S, D)
-        Output: (B, T, S, D)
+        Input:  (B, T, S, D) where
+                B = batch size,
+                T = number of time steps,
+                S = number of spatial tokens per time step,
+                D = model dimension (d_model).
+        Output: (B, T, S, D) same shape as input.
 
     Example:
         >>> from dreamer4.modality import Modality, TokenLayout
@@ -112,7 +116,7 @@ class BlockCausalTransformer(nn.Module):
         layout: TokenLayout,
         space_mode: str,
         n_kv_heads: int | None = None,
-        mlp_ratio: float = 4.0,
+        mlp_ratio: float = 8/3,
         time_every: int = 4,
         dropout: float = 0.0,
         use_qk_norm: bool = True,

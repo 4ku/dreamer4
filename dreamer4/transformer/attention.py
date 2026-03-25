@@ -112,7 +112,10 @@ class MultiheadAttention(nn.Module):
         Forward pass.
 
         Args:
-            x: (N, L, D) input tensor.
+            x: (N, L, D) input tensor where
+               N = batch size (number of sequences processed in parallel),
+               L = sequence length (number of tokens),
+               D = model dimension (d_model, total embedding size per token).
             attn_mask: (N, 1, L, L) or (1, 1, L, L) boolean mask where True
                        means "allowed to attend" (PyTorch SDPA convention).
                        Mutually exclusive with is_causal.
@@ -121,7 +124,7 @@ class MultiheadAttention(nn.Module):
             rope_sin: (L, head_dim) sine cache for RoPE. Optional.
 
         Returns:
-            (N, L, D) output tensor.
+            (N, L, D) output tensor, same shape as input.
         """
         N, L, D = x.shape
 
@@ -170,7 +173,7 @@ class MultiheadAttention(nn.Module):
             elif attn_mask is not None:
                 logits = logits.masked_fill(~attn_mask, float("-inf"))
 
-            weights = F.softmax(logits, dim=-1)
+            weights = F.softmax(logits, dim=-1) # (N, n_heads, L, L)
             drop = self.dropout_p if self.training else 0.0
             if drop > 0:
                 weights = F.dropout(weights, p=drop)
