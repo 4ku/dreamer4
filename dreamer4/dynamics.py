@@ -257,7 +257,6 @@ class DynamicsModel(nn.Module):
             dropout=dropout,
             use_qk_norm=use_qk_norm,
             logit_cap=logit_cap,
-            latents_only_time=False,
             max_T=max_T,
         )
 

@@ -146,7 +146,7 @@ def test_block_causal_layer_output_shape():
         d_model=64, n_heads=4, n_kv_heads=None,
         layout=layout, space_mode="encoder",
         layer_index=3, time_every=4,  # layer 3 HAS time attention
-        n_latents=4, latents_only_time=True,
+        n_latents=4,
     )
     x = torch.randn(2, 8, S, 64)
     y = layer(x)
@@ -198,7 +198,7 @@ def test_block_causal_layer_gradient():
         d_model=32, n_heads=2, n_kv_heads=None,
         layout=layout, space_mode="encoder",
         layer_index=3, time_every=4,
-        n_latents=2, latents_only_time=True,
+        n_latents=2,
     )
     x = torch.randn(2, 4, S, 32, requires_grad=True)
     y = layer(x)

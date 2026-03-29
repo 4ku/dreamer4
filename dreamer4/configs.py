@@ -39,7 +39,6 @@ class TransformerConfig:
     dropout: float = 0.0
     use_qk_norm: bool = True
     logit_cap: float | None = 50.0
-    latents_only_time: bool = False
     max_T: int = 1024
 
 
@@ -67,15 +66,15 @@ CONFIGS: dict[str, TransformerConfig] = {
 
     "tok-small": TransformerConfig(
         d_model=128, n_heads=4, depth=4,
-        time_every=1, latents_only_time=True,
+        time_every=1,
     ),
     "tok-base": TransformerConfig(
         d_model=256, n_heads=4, depth=8,
-        time_every=1, latents_only_time=True,
+        time_every=1,
     ),
     "tok-large": TransformerConfig(
         d_model=512, n_heads=8, depth=12,
-        time_every=1, latents_only_time=True,
+        time_every=1,
     ),
 
     # ── Dynamics sizes ────────────────────────────────────────────────────────
@@ -140,7 +139,6 @@ def make_transformer(
         dropout=cfg.dropout,
         use_qk_norm=cfg.use_qk_norm,
         logit_cap=cfg.logit_cap,
-        latents_only_time=cfg.latents_only_time,
         max_T=cfg.max_T,
     )
 

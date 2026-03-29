@@ -42,7 +42,7 @@ USAGE:
         transformer = BlockCausalTransformer(
             d_model=256, n_heads=4, depth=8,
             layout=layout, space_mode="encoder",
-            latents_only_time=True, ...
+            ...
         )
 
     For the dynamics model:
@@ -83,8 +83,6 @@ class BlockCausalTransformer(nn.Module):
         dropout:          Dropout rate (default 0.0).
         use_qk_norm:      Use QKNorm in attention (default True).
         logit_cap:        Attention logit soft capping (default 50.0).
-        latents_only_time: Apply time attention only to latent positions
-                           (saves compute in tokenizer). Default False.
         max_T:            Max time steps for RoPE cache (default 1024).
 
     Shape:
@@ -121,7 +119,6 @@ class BlockCausalTransformer(nn.Module):
         dropout: float = 0.0,
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
-        latents_only_time: bool = False,
         max_T: int = 1024,
     ):
         super().__init__()
@@ -144,7 +141,6 @@ class BlockCausalTransformer(nn.Module):
                 time_every=time_every,
                 use_qk_norm=use_qk_norm,
                 logit_cap=logit_cap,
-                latents_only_time=latents_only_time,
                 n_latents=n_latents,
                 max_T=max_T,
             )

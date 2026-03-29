@@ -59,7 +59,7 @@ def test_output_shape_realistic():
     model = BlockCausalTransformer(
         d_model=256, n_heads=4, depth=4,
         layout=layout, space_mode="encoder",
-        time_every=4, latents_only_time=True,
+        time_every=4,
     )
     x = torch.randn(2, 16, S, 256)
     y = model(x)
@@ -124,7 +124,7 @@ def test_gradient_flows_to_all_params():
     model = BlockCausalTransformer(
         d_model=32, n_heads=2, depth=4,
         layout=layout, space_mode="encoder",
-        time_every=4, latents_only_time=True,
+        time_every=4,
     )
     x = torch.randn(1, 4, S, 32, requires_grad=True)
     y = model(x)
@@ -181,7 +181,7 @@ def test_causal_property_end_to_end():
     model = BlockCausalTransformer(
         d_model=32, n_heads=2, depth=4,
         layout=layout, space_mode="encoder",
-        time_every=4, latents_only_time=True,
+        time_every=4,
         logit_cap=None, use_qk_norm=False,
     )
     model.eval()
@@ -214,7 +214,6 @@ def test_smoke_overfit():
         d_model=d_model, n_heads=2, depth=2,
         layout=layout, space_mode="encoder",
         time_every=2,
-        latents_only_time=True,
         use_qk_norm=False,
         logit_cap=None,
         dropout=0.0,

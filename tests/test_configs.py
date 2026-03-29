@@ -70,7 +70,7 @@ def test_instantiate_encoder_mode(name):
 
 @pytest.mark.parametrize("name", ["tiny", "small", "dyn-small"])
 def test_instantiate_wm_mode(name):
-    """Configs without latents_only_time should work in wm_agent_isolated mode."""
+    """Configs should work in wm_agent_isolated mode."""
     layout = _wm_layout()
     model = make_transformer(name, layout, "wm_agent_isolated")
     S = layout.total_tokens()
@@ -170,5 +170,4 @@ def test_config_defaults():
     assert cfg.dropout == 0.0
     assert cfg.use_qk_norm is True
     assert cfg.logit_cap == 50.0
-    assert cfg.latents_only_time is False
     assert cfg.max_T == 1024

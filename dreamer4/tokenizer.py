@@ -183,7 +183,6 @@ class Encoder(nn.Module):
             dropout=dropout,
             use_qk_norm=use_qk_norm,
             logit_cap=logit_cap,
-            latents_only_time=True,
             max_T=max_T,
         )
 
@@ -284,7 +283,6 @@ class Decoder(nn.Module):
             dropout=dropout,
             use_qk_norm=use_qk_norm,
             logit_cap=logit_cap,
-            latents_only_time=True,
             max_T=max_T,
         )
 
