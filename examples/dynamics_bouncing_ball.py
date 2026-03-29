@@ -157,7 +157,7 @@ def main() -> None:
     train_patches = patchify(train_frames, PATCH_SIZE)
     eval_patches = patchify(eval_frames, PATCH_SIZE)
 
-    lpips_fn = lpips_lib.LPIPS(net="alex").to(device).eval()
+    lpips_fn = lpips_lib.LPIPS(net="vgg16").to(device).eval()
     loss_norm_tok = RMSLossNormalizer(n_losses=2).to(device)
     tok_optimizer = torch.optim.Adam(tok.parameters(), lr=3e-4)
     tok_steps = 3000

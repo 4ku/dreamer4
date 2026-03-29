@@ -149,7 +149,7 @@ def phase_1a_tokenizer(device, buf):
     tok = Tokenizer(enc, dec).to(device)
     print(f"  Tokenizer params: {sum(p.numel() for p in tok.parameters()):,}")
 
-    lpips_fn = lpips_lib.LPIPS(net="alex").to(device).eval()
+    lpips_fn = lpips_lib.LPIPS(net="vgg16").to(device).eval()
     loss_norm = RMSLossNormalizer(n_losses=2).to(device)
     optimizer = torch.optim.Adam(tok.parameters(), lr=3e-4)
 

@@ -155,7 +155,7 @@ def main() -> None:
     eval_patches = patchify(eval_frames, PATCH_SIZE)
 
     # ── Loss setup (paper Eq. 5) ────────────────────────────────────────────
-    lpips_fn = lpips_lib.LPIPS(net="alex").to(device).eval()
+    lpips_fn = lpips_lib.LPIPS(net="vgg16").to(device).eval()
     loss_norm = RMSLossNormalizer(n_losses=2).to(device)
 
     # ── Training loop ────────────────────────────────────────────────────────

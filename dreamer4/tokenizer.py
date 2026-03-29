@@ -353,7 +353,6 @@ class Tokenizer(nn.Module):
 def recon_loss_from_mae(
     pred: torch.Tensor,
     target: torch.Tensor,
-    mae_mask: torch.Tensor,
 ) -> torch.Tensor:
     """
     MSE reconstruction loss on ALL patches.
@@ -366,7 +365,6 @@ def recon_loss_from_mae(
     Args:
         pred:     (B, T, Np, Dp) predicted patches from the decoder.
         target:   (B, T, Np, Dp) ground-truth patches.
-        mae_mask: (B, T, Np, 1) bool — unused, kept for API compat.
 
     Returns:
         Scalar MSE averaged over all patch elements.
@@ -385,16 +383,14 @@ def lpips_on_mae_recon(
     W: int,
     C: int,
     patch_size: int,
-    subsample_frac: float = 1.0,
 ) -> torch.Tensor:
     """
     LPIPS perceptual loss on patches the encoder could see.
 
     LPIPS operates on full images, so we composite before measuring:
     visible patches (encoder-seen) use the decoder prediction, while
-    hidden patches (mae_mask=True) are filled with ground truth.  This
-    isolates the perceptual error to the patches the encoder actually
-    processed.  When p=0 (no masking), every patch comes from the
+    hidden patches (mae_mask=True) are filled with ground truth.  
+    When p=0 (no masking), every patch comes from the
     decoder prediction, matching the inference regime.
 
     Args:
@@ -406,19 +402,13 @@ def lpips_on_mae_recon(
                          learned mask token).
         H, W, C:         Image dimensions.
         patch_size:      Patch side length.
-        subsample_frac:  Fraction of time steps to use (saves memory).
 
     Returns:
         Scalar mean LPIPS loss.
     """
     recon_patches = torch.where(mae_mask, target, pred)
-    recon_img = unpatchify(recon_patches.float(), H, W, C, patch_size)
-    tgt_img = unpatchify(target.float(), H, W, C, patch_size)
-
-    if subsample_frac < 1.0:
-        step = max(1, int(1.0 / subsample_frac))
-        recon_img = recon_img[:, ::step]
-        tgt_img = tgt_img[:, ::step]
+    recon_img = unpatchify(recon_patches.float(), H, W, C, patch_size) # (B, T, C, H, W)
+    tgt_img = unpatchify(target.float(), H, W, C, patch_size) # (B, T, C, H, W)
 
     # LPIPS expects input in [-1, 1]
     recon_img = recon_img.clamp(0, 1) * 2.0 - 1.0
@@ -431,39 +421,3 @@ def lpips_on_mae_recon(
     with torch.autocast(device_type="cuda", enabled=False):
         lp = lpips_fn(recon_flat.float(), tgt_flat.float())
     return lp.mean()
-
-
-class RMSLossNormalizer(nn.Module):
-    """
-    Running RMS loss normalization.
-
-    Maintains an exponential moving average of each loss term's RMS.
-    Divides each loss by its running RMS estimate, so fixed coefficients
-    control relative importance independent of raw loss magnitudes.
-
-    Args:
-        n_losses:  Number of loss terms to track.
-        decay:     EMA decay factor (default 0.99).
-        eps:       Floor for the RMS estimate (default 1e-8).
-    """
-
-    def __init__(self, n_losses: int = 2, decay: float = 0.99, eps: float = 1e-8):
-        super().__init__()
-        self.decay = decay
-        self.eps = eps
-        self.register_buffer("rms_ema", torch.ones(n_losses))
-        self.register_buffer("initialized", torch.zeros(n_losses, dtype=torch.bool))
-
-    @torch.no_grad()
-    def update(self, idx: int, loss_val: torch.Tensor) -> None:
-        """Update the running RMS estimate for loss at index `idx`."""
-        val = loss_val.detach().float().abs().clamp_min(self.eps)
-        if not self.initialized[idx]:
-            self.rms_ema[idx] = val
-            self.initialized[idx] = True
-        else:
-            self.rms_ema[idx] = self.decay * self.rms_ema[idx] + (1 - self.decay) * val
-
-    def normalize(self, idx: int, loss: torch.Tensor) -> torch.Tensor:
-        """Divide loss by its running RMS estimate."""
-        return loss / self.rms_ema[idx].clamp_min(self.eps)

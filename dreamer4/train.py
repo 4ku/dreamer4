@@ -54,12 +54,12 @@ from dreamer4.imagination import (
 )
 from dreamer4.logging import MetricsLogger, setup_logging
 from dreamer4.replay import ReplayBuffer
-from dreamer4.tokenizer import RMSLossNormalizer, Tokenizer, recon_loss_from_mae
+from dreamer4.tokenizer import Tokenizer, recon_loss_from_mae
+from dreamer4.transformer.transformer import patchify, unpatchify
 from dreamer4.utils import (
     pack_bottleneck_to_spatial,
-    patchify,
     unpack_spatial_to_bottleneck,
-    unpatchify,
+    RMSLossNormalizer,
 )
 
 logger = logging.getLogger(__name__)
@@ -258,7 +258,7 @@ class Dreamer4Agent(nn.Module):
         if self.tokenizer is not None and "tokenizer" in optimizers:
             patches = patchify(obs, cfg.patch_size)
             pred, mae_mask, keep_prob = self.tokenizer(patches)
-            tok_loss_raw = recon_loss_from_mae(pred, patches, mae_mask)
+            tok_loss_raw = recon_loss_from_mae(pred, patches)
 
             self.loss_normalizer.update(0, tok_loss_raw)
             tok_loss = self.loss_normalizer.normalize(0, tok_loss_raw)
