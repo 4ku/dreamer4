@@ -1,12 +1,18 @@
 """
-Structured logging for Dreamer 4 training.
+Structured logging for Dreamer 4 training (repo-level helper).
+
+Lives next to ``train.py``, not under the ``dreamer4/`` package, so installs
+that only ship the library do not bundle it. The filename is **not**
+``logging.py`` so the repository root can stay on ``sys.path`` without
+shadowing Python's standard-library ``logging`` module (which breaks pytest,
+PyTorch, etc.).
 
 All training metrics are written to **TensorBoard** as the primary
-backend.  A periodic console summary is printed via Python ``logging``.
+backend. A periodic console summary is printed via Python ``logging``.
 
 Usage::
 
-    from dreamer4.logging import setup_logging, MetricsLogger
+    from metrics_logging import setup_logging, MetricsLogger
 
     setup_logging("runs/exp01/logs")
     ml = MetricsLogger("runs/exp01/tb")

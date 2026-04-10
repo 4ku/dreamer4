@@ -437,7 +437,7 @@ online_training_loop(
 |------|-------------|
 | `dreamer4/config.py` | YAML config loading/saving, validation, `TrainConfig` dataclass. |
 | `dreamer4/checkpoint.py` | `save_checkpoint`, `load_checkpoint`, `AutoCheckpoint`. |
-| `dreamer4/logging.py` | `MetricsLogger` (TensorBoard backend), `setup_logging`. |
+| `metrics_logging.py` (repo root) | `MetricsLogger` (TensorBoard), `setup_logging`. Not named `logging.py` to avoid shadowing the stdlib. |
 | `config/defaults.yaml` | Default config preset. |
 | `config/dmcontrol.yaml` | DMControl preset. |
 | `config/debug.yaml` | Debug preset (tiny model). |

@@ -52,7 +52,7 @@ from dreamer4.imagination import (
     imagine_rollout,
     make_prior_policy,
 )
-from dreamer4.logging import MetricsLogger, setup_logging
+from metrics_logging import MetricsLogger, setup_logging
 from dreamer4.replay import ReplayBuffer
 from dreamer4.tokenizer import Tokenizer, recon_loss_from_mae
 from dreamer4.transformer.transformer import patchify, unpatchify
