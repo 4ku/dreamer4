@@ -40,10 +40,11 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import lpips
 
-from dreamer4.modality import Modality, TokenLayout
+from dreamer4.transformer.modality import Modality, TokenLayout
 from dreamer4.transformer import BlockCausalTransformer
-from dreamer4.utils import unpatchify
+from dreamer4.transformer.transformer import unpatchify
 
 
 # ---------------------------------------------------------------------------
@@ -191,22 +192,22 @@ class Encoder(nn.Module):
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
-            patch_tokens: (B, T, Np, patch_dim) raw patch vectors.
+            patch_tokens: (B, T, n_patches, patch_dim) raw patch vectors.
 
         Returns:
             z: (B, T, N_latents, d_bottleneck) in [-1, 1].
             aux: (mae_mask, keep_prob) for loss computation.
         """
-        B, T, Np, _ = patch_tokens.shape
-        assert Np == self.n_patches
+        B, T, n_patches, _ = patch_tokens.shape
+        assert n_patches == self.n_patches
 
-        proj = self.patch_proj(patch_tokens)  # (B, T, Np, D)
+        proj = self.patch_proj(patch_tokens)  # (B, T, n_patches, d_model)
         proj_masked, mae_mask, keep_prob = self.mae(proj)
 
         lat = self.latents.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
-        tokens = torch.cat([lat, proj_masked], dim=2)  # (B, T, S, D)
+        tokens = torch.cat([lat, proj_masked], dim=2)  # (B, T, n_latents + n_patches, d_model)
 
-        enc = self.transformer(tokens)
+        enc = self.transformer(tokens) # (B, T, n_latents + n_patches, d_model)
 
         z = torch.tanh(self.bottleneck_proj(enc[:, :, : self.n_latents, :]))
         return z, (mae_mask, keep_prob)
@@ -297,12 +298,12 @@ class Decoder(nn.Module):
         B, T, L, _ = z.shape
         assert L == self.n_latents
 
-        lat = self.up_proj(z)  # (B, T, L, D)
-        qry = self.patch_queries.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
-        tokens = torch.cat([lat, qry], dim=2)  # (B, T, S, D)
+        lat = self.up_proj(z)  # (B, T, n_latents, d_model)
+        qry = self.patch_queries.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1) # (B, T, n_patches, d_model)
+        tokens = torch.cat([lat, qry], dim=2)  # (B, T, n_patches + n_latents, d_model)
 
-        x = self.transformer(tokens)
-        patches_out = x[:, :, self.n_latents :, :]
+        x = self.transformer(tokens) # (B, T, n_patches + n_latents, d_model)
+        patches_out = x[:, :, self.n_latents :, :] # (B, T, n_patches, d_model)
         return torch.sigmoid(self.patch_head(patches_out))
 
 
@@ -350,74 +351,84 @@ class Tokenizer(nn.Module):
 # Loss utilities
 # ---------------------------------------------------------------------------
 
-def recon_loss_from_mae(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-) -> torch.Tensor:
-    """
-    MSE reconstruction loss on ALL patches.
 
-    The MAE masking is applied to the encoder input to force the latent
-    bottleneck to be informative, but the decoder must reconstruct every
-    patch from the latents. The loss is therefore computed over all
-    patches regardless of the mask.
+class MAECompositedLPIPS(nn.Module):
+    """
+    Official LPIPS (``lpips`` package) on MAE-composited full frames.
+
+    LPIPS is defined on full images. We composite: visible patches use the
+    decoder prediction; masked patches (``mae_mask`` True) use ground truth,
+    then measure LPIPS against the full target image. Patch tensors are in
+    ``[0, 1]``; the underlying metric uses ``normalize=True`` (``[0, 1]`` RGB).
 
     Args:
-        pred:     (B, T, Np, Dp) predicted patches from the decoder.
-        target:   (B, T, Np, Dp) ground-truth patches.
-
-    Returns:
-        Scalar MSE averaged over all patch elements.
+        net: Trunk for ``lpips.LPIPS`` (e.g. ``"alex"``, ``"vgg"``, ``"vgg16"``).
+        H, W, C: Image shape fed to ``unpatchify``.
+        patch_size: Patch side length.
+        verbose: Passed through to ``lpips.LPIPS``.
     """
-    diff = pred.float() - target.float()
-    return diff.pow(2).mean()
 
+    def __init__(
+        self,
+        *,
+        net: str,
+        H: int,
+        W: int,
+        C: int,
+        patch_size: int,
+        verbose: bool = False,
+    ):
+        super().__init__()
+        self.H = int(H)
+        self.W = int(W)
+        self.C = int(C)
+        self.patch_size = int(patch_size)
+        self.lpips_metric = lpips.LPIPS(net=net, verbose=verbose)
 
-def lpips_on_mae_recon(
-    lpips_fn: nn.Module,
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mae_mask: torch.Tensor,
-    *,
-    H: int,
-    W: int,
-    C: int,
-    patch_size: int,
-) -> torch.Tensor:
-    """
-    LPIPS perceptual loss on patches the encoder could see.
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mae_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            pred:       (B, T, n_patches, patch_dim) decoder predictions.
+            target:     (B, T, n_patches, patch_dim) ground-truth patches.
+            mae_mask:   (B, T, n_patches, 1) bool — True where encoder mask replaced the patch.
 
-    LPIPS operates on full images, so we composite before measuring:
-    visible patches (encoder-seen) use the decoder prediction, while
-    hidden patches (mae_mask=True) are filled with ground truth.  
-    When p=0 (no masking), every patch comes from the
-    decoder prediction, matching the inference regime.
+        Returns:
+            Scalar mean LPIPS over batch*time.
+        """
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"pred and target must match, got {tuple(pred.shape)} vs {tuple(target.shape)}"
+            )
+        H, W, C, patch_size = self.H, self.W, self.C, self.patch_size
 
-    Args:
-        lpips_fn:        LPIPS network (e.g., lpips.LPIPS(net='alex')).
-        pred:            (B, T, Np, Dp) predicted patches from the decoder.
-        target:          (B, T, Np, Dp) ground-truth patches.
-        mae_mask:        (B, T, Np, 1) bool — True where the patch was
-                         hidden from the encoder (replaced with the
-                         learned mask token).
-        H, W, C:         Image dimensions.
-        patch_size:      Patch side length.
+        recon_patches = torch.where(mae_mask, target, pred)
+        recon_img = unpatchify(recon_patches.float(), H, W, C, patch_size) # (B, T, C, H, W)
+        tgt_img = unpatchify(target.float(), H, W, C, patch_size) # (B, T, C, H, W)
 
-    Returns:
-        Scalar mean LPIPS loss.
-    """
-    recon_patches = torch.where(mae_mask, target, pred)
-    recon_img = unpatchify(recon_patches.float(), H, W, C, patch_size) # (B, T, C, H, W)
-    tgt_img = unpatchify(target.float(), H, W, C, patch_size) # (B, T, C, H, W)
+        # Images are already in [0, 1], so no need to clamp.
+        # recon_img = recon_img.clamp(0.0, 1.0)
+        # tgt_img = tgt_img.clamp(0.0, 1.0)
 
-    # LPIPS expects input in [-1, 1]
-    recon_img = recon_img.clamp(0, 1) * 2.0 - 1.0
-    tgt_img = tgt_img.clamp(0, 1) * 2.0 - 1.0
+        if C == 1:
+            recon_img = recon_img.repeat(1, 1, 3, 1, 1) 
+            tgt_img = tgt_img.repeat(1, 1, 3, 1, 1)
+            c_lpips = 3
+        elif C == 3:
+            c_lpips = 3
+        else:
+            raise ValueError(f"LPIPS expects C in {{1, 3}}, got {C}")
 
-    B, T = recon_img.shape[:2]
-    recon_flat = recon_img.reshape(B * T, C, H, W)
-    tgt_flat = tgt_img.reshape(B * T, C, H, W)
+        B, T = recon_img.shape[:2]
+        recon_flat = recon_img.reshape(B * T, c_lpips, H, W)
+        tgt_flat = tgt_img.reshape(B * T, c_lpips, H, W)
 
-    with torch.autocast(device_type="cuda", enabled=False):
-        lp = lpips_fn(recon_flat.float(), tgt_flat.float())
-    return lp.mean()
+        with torch.autocast(device_type=recon_flat.device.type, enabled=False):
+            lp = self.lpips_metric(
+                recon_flat.float(), tgt_flat.float(), normalize=True
+            )
+        return lp.mean()

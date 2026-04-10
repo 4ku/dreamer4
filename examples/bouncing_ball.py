@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
-from dreamer4.modality import Modality, TokenLayout
+from dreamer4.transformer.modality import Modality, TokenLayout
 from dreamer4.configs import make_transformer
 from dreamer4.utils import patchify, unpatchify
 

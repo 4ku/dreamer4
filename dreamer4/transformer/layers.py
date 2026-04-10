@@ -39,7 +39,7 @@ import torch
 import torch.nn as nn
 
 from dreamer4.transformer.attention import MultiheadAttention
-from dreamer4.modality import TokenLayout, build_space_attn_mask
+from dreamer4.transformer.modality import TokenLayout, build_space_attn_mask
 from dreamer4.transformer.mlp import SwiGLU
 from dreamer4.transformer.norms import RMSNorm
 from dreamer4.transformer.rope import build_rope_cache

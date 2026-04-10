@@ -25,12 +25,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
-import lpips as lpips_lib
 
 from dreamer4.dynamics import DynamicsModel, shortcut_forcing_loss, sample_sequence
 from dreamer4.tokenizer import (
-    Encoder, Decoder, Tokenizer,
-    recon_loss_from_mae, lpips_on_mae_recon, RMSLossNormalizer,
+    Decoder,
+    Encoder,
+    MAECompositedLPIPS,
+    RMSLossNormalizer,
+    Tokenizer,
+    recon_loss_from_mae,
 )
 from dreamer4.utils import (
     patchify, unpatchify,
@@ -157,7 +160,14 @@ def main() -> None:
     train_patches = patchify(train_frames, PATCH_SIZE)
     eval_patches = patchify(eval_frames, PATCH_SIZE)
 
-    lpips_fn = lpips_lib.LPIPS(net="vgg16").to(device).eval()
+    lpips_fn = MAECompositedLPIPS(
+        net="vgg16",
+        H=IMG_H,
+        W=IMG_W,
+        C=IMG_C,
+        patch_size=PATCH_SIZE,
+        verbose=False,
+    ).to(device).eval()
     loss_norm_tok = RMSLossNormalizer(n_losses=2).to(device)
     tok_optimizer = torch.optim.Adam(tok.parameters(), lr=3e-4)
     tok_steps = 3000
@@ -176,10 +186,7 @@ def main() -> None:
 
         pred, mae_mask, _ = tok(batch)
         mse = recon_loss_from_mae(pred, batch, mae_mask)
-        lp = lpips_on_mae_recon(
-            lpips_fn, pred, batch, mae_mask,
-            H=IMG_H, W=IMG_W, C=IMG_C, patch_size=PATCH_SIZE,
-        )
+        lp = lpips_fn(pred, batch, mae_mask)
         loss_norm_tok.update(0, mse)
         loss_norm_tok.update(1, lp)
         loss = loss_norm_tok.normalize(0, mse) + 0.2 * loss_norm_tok.normalize(1, lp)

@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dreamer4.modality import Modality, TokenLayout
+from dreamer4.transformer.modality import Modality, TokenLayout
 from dreamer4.configs import make_transformer
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"

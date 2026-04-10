@@ -28,11 +28,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
-import lpips as lpips_lib
 
 from dreamer4.tokenizer import (
-    Encoder, Decoder, Tokenizer,
-    recon_loss_from_mae, lpips_on_mae_recon, RMSLossNormalizer,
+    Decoder,
+    Encoder,
+    MAECompositedLPIPS,
+    RMSLossNormalizer,
+    Tokenizer,
+    recon_loss_from_mae,
 )
 from dreamer4.utils import patchify, unpatchify
 
@@ -155,7 +158,14 @@ def main() -> None:
     eval_patches = patchify(eval_frames, PATCH_SIZE)
 
     # ── Loss setup (paper Eq. 5) ────────────────────────────────────────────
-    lpips_fn = lpips_lib.LPIPS(net="vgg16").to(device).eval()
+    lpips_fn = MAECompositedLPIPS(
+        net="vgg16",
+        H=IMG_H,
+        W=IMG_W,
+        C=IMG_C,
+        patch_size=PATCH_SIZE,
+        verbose=False,
+    ).to(device).eval()
     loss_norm = RMSLossNormalizer(n_losses=2).to(device)
 
     # ── Training loop ────────────────────────────────────────────────────────
@@ -180,10 +190,7 @@ def main() -> None:
         pred, mae_mask, keep_prob = tok(batch)
 
         mse_loss = recon_loss_from_mae(pred, batch, mae_mask)
-        perceptual_loss = lpips_on_mae_recon(
-            lpips_fn, pred, batch, mae_mask,
-            H=IMG_H, W=IMG_W, C=IMG_C, patch_size=PATCH_SIZE,
-        )
+        perceptual_loss = lpips_fn(pred, batch, mae_mask)
 
         loss_norm.update(0, mse_loss)
         loss_norm.update(1, perceptual_loss)

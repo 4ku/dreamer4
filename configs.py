@@ -5,7 +5,7 @@ Provides named presets so you can quickly instantiate transformers of
 different sizes without remembering all the hyperparameters:
 
     from dreamer4.configs import make_transformer, print_config_table
-    from dreamer4.modality import Modality, TokenLayout
+    from dreamer4.transformer.modality import Modality, TokenLayout
 
     layout = TokenLayout(n_latents=4, segments=((Modality.IMAGE, 16),))
     model = make_transformer("small", layout, space_mode="encoder")
@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict, replace
 from typing import Any
 
-from dreamer4.modality import TokenLayout
+from dreamer4.transformer.modality import TokenLayout
 from dreamer4.transformer import BlockCausalTransformer
 
 

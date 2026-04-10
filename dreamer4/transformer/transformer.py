@@ -62,7 +62,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dreamer4.modality import TokenLayout
+from dreamer4.transformer.modality import TokenLayout
 from dreamer4.transformer.norms import RMSNorm
 from dreamer4.transformer.layers import BlockCausalLayer
 
@@ -187,7 +187,7 @@ class BlockCausalTransformer(nn.Module):
         Output: (B, T, S, D) same shape as input.
 
     Example:
-        >>> from dreamer4.modality import Modality, TokenLayout
+        >>> from dreamer4.transformer.modality import Modality, TokenLayout
         >>> layout = TokenLayout(n_latents=4, segments=((Modality.IMAGE, 16),))
         >>> model = BlockCausalTransformer(
         ...     d_model=64, n_heads=4, depth=4,

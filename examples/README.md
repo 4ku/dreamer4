@@ -138,7 +138,8 @@ objective (Section 3.1, Eq. 5):
 
 MAE masking with `p ~ U(0, 0.9)` drops random encoder input patches.
 MSE is computed on masked patches only (`recon_loss_from_mae`), while
-LPIPS is computed on composited full images (`lpips_on_mae_recon`).
+LPIPS is computed on composited full images via `MAECompositedLPIPS`
+(the official `lpips` package with MAE-aware patch compositing).
 Both loss terms are RMS-normalized before combining (`RMSLossNormalizer`).
 
 **Plots saved:**

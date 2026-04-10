@@ -41,9 +41,9 @@ from dreamer4.replay import ReplayBuffer
 from dreamer4.tokenizer import (
     Decoder,
     Encoder,
+    MAECompositedLPIPS,
     RMSLossNormalizer,
     Tokenizer,
-    lpips_on_mae_recon,
     recon_loss_from_mae,
 )
 from dreamer4.train import Dreamer4Agent, evaluate, online_training_loop
@@ -129,12 +129,18 @@ def pretrain_tokenizer(
 
     tok = tok.to(device)
     try:
-        import lpips as lpips_lib
-        lpips_fn = lpips_lib.LPIPS(net="alex").to(device).eval()
+        lpips_mod = MAECompositedLPIPS(
+            net="alex",
+            H=cfg.image_size,
+            W=cfg.image_size,
+            C=cfg.channels,
+            patch_size=cfg.patch_size,
+            verbose=False,
+        ).to(device).eval()
         use_lpips = True
-    except ImportError:
-        logger.warning("lpips not available, using MSE only")
-        lpips_fn = None
+    except Exception as exc:
+        logger.warning("failed to initialize LPIPS loss (%s), using MSE only", exc)
+        lpips_mod = None
         use_lpips = False
 
     loss_norm = RMSLossNormalizer(n_losses=2).to(device)
@@ -157,11 +163,7 @@ def pretrain_tokenizer(
         loss = loss_norm.normalize(0, mse)
 
         if use_lpips:
-            lp = lpips_on_mae_recon(
-                lpips_fn, pred, patches, mae_mask,
-                H=cfg.image_size, W=cfg.image_size,
-                C=cfg.channels, patch_size=cfg.patch_size,
-            )
+            lp = lpips_mod(pred, patches, mae_mask)
             loss_norm.update(1, lp)
             loss = loss + 0.2 * loss_norm.normalize(1, lp)
 

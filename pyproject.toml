@@ -7,8 +7,6 @@ requires-python = ">=3.10"
 dependencies = [
     # Core
     "torch>=2.2",
-    # Perceptual loss for tokenizer training
-    "lpips",
     # Config
     "pyyaml",
     # Utilities
@@ -17,6 +15,7 @@ dependencies = [
     # Visualization
     "matplotlib",
     "torchvision",
+    "lpips",
     # TensorBoard logging
     "tensorboard",
     # Video writing

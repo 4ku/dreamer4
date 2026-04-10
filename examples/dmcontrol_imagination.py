@@ -40,8 +40,12 @@ from dreamer4.dynamics import (
     ramp_weight,
 )
 from dreamer4.tokenizer import (
-    Encoder, Decoder, Tokenizer,
-    recon_loss_from_mae, lpips_on_mae_recon, RMSLossNormalizer,
+    Decoder,
+    Encoder,
+    MAECompositedLPIPS,
+    RMSLossNormalizer,
+    Tokenizer,
+    recon_loss_from_mae,
 )
 from dreamer4.utils import (
     patchify, unpatchify,
@@ -149,7 +153,14 @@ def phase_1a_tokenizer(device, buf):
     tok = Tokenizer(enc, dec).to(device)
     print(f"  Tokenizer params: {sum(p.numel() for p in tok.parameters()):,}")
 
-    lpips_fn = lpips_lib.LPIPS(net="vgg16").to(device).eval()
+    lpips_fn = MAECompositedLPIPS(
+        net="vgg16",
+        H=IMG_SIZE,
+        W=IMG_SIZE,
+        C=IMG_C,
+        patch_size=PATCH_SIZE,
+        verbose=False,
+    ).to(device).eval()
     loss_norm = RMSLossNormalizer(n_losses=2).to(device)
     optimizer = torch.optim.Adam(tok.parameters(), lr=3e-4)
 
@@ -165,10 +176,7 @@ def phase_1a_tokenizer(device, buf):
 
         pred, mae_mask, _ = tok(patches)
         mse = recon_loss_from_mae(pred, patches, mae_mask)
-        lp = lpips_on_mae_recon(
-            lpips_fn, pred, patches, mae_mask,
-            H=IMG_SIZE, W=IMG_SIZE, C=IMG_C, patch_size=PATCH_SIZE,
-        )
+        lp = lpips_fn(pred, patches, mae_mask)
         loss_norm.update(0, mse)
         loss_norm.update(1, lp)
         loss = loss_norm.normalize(0, mse) + 0.2 * loss_norm.normalize(1, lp)
