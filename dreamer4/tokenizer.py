@@ -83,7 +83,6 @@ class MAEReplacer(nn.Module):
         Returns:
             replaced:  (B, T, Np, D) patches with masked positions replaced.
             mae_mask:  (B, T, Np, 1) bool — True where masked (must reconstruct).
-            keep_prob: (B, T, 1) float — fraction of patches kept per image.
         """
         B, T, Np, D = patches.shape
         device = patches.device
@@ -104,7 +103,7 @@ class MAEReplacer(nn.Module):
         mask_tok = self.mask_token.to(dtype=patches.dtype)
         replaced = torch.where(keep.unsqueeze(-1), patches, mask_tok)
 
-        return replaced, mae_mask, keep_prob
+        return replaced, mae_mask
 
 
 # ---------------------------------------------------------------------------
@@ -189,20 +188,20 @@ class Encoder(nn.Module):
 
     def forward(
         self, patch_tokens: torch.Tensor
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             patch_tokens: (B, T, n_patches, patch_dim) raw patch vectors.
 
         Returns:
             z: (B, T, N_latents, d_bottleneck) in [-1, 1].
-            aux: (mae_mask, keep_prob) for loss computation.
+            aux: mae_mask for loss computation.
         """
         B, T, n_patches, _ = patch_tokens.shape
         assert n_patches == self.n_patches
 
         proj = self.patch_proj(patch_tokens)  # (B, T, n_patches, d_model)
-        proj_masked, mae_mask, keep_prob = self.mae(proj)
+        proj_masked, mae_mask = self.mae(proj)
 
         lat = self.latents.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
         tokens = torch.cat([lat, proj_masked], dim=2)  # (B, T, n_latents + n_patches, d_model)
@@ -210,7 +209,7 @@ class Encoder(nn.Module):
         enc = self.transformer(tokens) # (B, T, n_latents + n_patches, d_model)
 
         z = torch.tanh(self.bottleneck_proj(enc[:, :, : self.n_latents, :]))
-        return z, (mae_mask, keep_prob)
+        return z, mae_mask
 
 
 # ---------------------------------------------------------------------------
@@ -335,11 +334,10 @@ class Tokenizer(nn.Module):
         Returns:
             pred:      (B, T, Np, patch_dim) reconstructed patches in [0, 1].
             mae_mask:  (B, T, Np, 1) bool mask (True = masked).
-            keep_prob: (B, T, 1) per-image keep probability.
         """
-        z, (mae_mask, keep_prob) = self.encoder(patch_tokens)
+        z, mae_mask = self.encoder(patch_tokens)
         pred = self.decoder(z)
-        return pred, mae_mask, keep_prob
+        return pred, mae_mask
 
     def encode(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         """Encode patches to bottleneck latents (no MAE masking at eval)."""
