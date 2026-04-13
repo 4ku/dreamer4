@@ -88,9 +88,8 @@ class MAEReplacer(nn.Module):
         device = patches.device
 
         if not self.training or (self.p_min == 0.0 and self.p_max == 0.0):
-            keep_prob = torch.ones(B, T, 1, device=device, dtype=patches.dtype)
             mae_mask = torch.zeros(B, T, Np, 1, device=device, dtype=torch.bool)
-            return patches, mae_mask, keep_prob
+            return patches, mae_mask
 
         # Sample per-image masking probability p ~ U(p_min, p_max)
         p = torch.empty(B, T, device=device).uniform_(self.p_min, self.p_max)

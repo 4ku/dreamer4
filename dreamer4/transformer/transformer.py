@@ -219,7 +219,6 @@ class BlockCausalTransformer(nn.Module):
         self.d_model = d_model
         self.depth = depth
         self.layout = layout
-        n_latents = layout.n_latents
 
         self.layers = nn.ModuleList(
             [
@@ -235,7 +234,6 @@ class BlockCausalTransformer(nn.Module):
                     time_every=time_every,
                     use_qk_norm=use_qk_norm,
                     logit_cap=logit_cap,
-                    n_latents=n_latents,
                     max_T=max_T,
                 )
                 for i in range(depth)
