@@ -65,6 +65,8 @@ import torch.nn.functional as F
 from dreamer4.transformer.modality import TokenLayout
 from dreamer4.transformer.norms import RMSNorm
 from dreamer4.transformer.layers import BlockCausalLayer
+from dreamer4.transformer.kv_cache import KVCache
+from dreamer4.transformer.rope import shift_rope
 
 
 def patchify(images: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -212,13 +214,14 @@ class BlockCausalTransformer(nn.Module):
         dropout: float = 0.0,
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
-        max_T: int = 1024,
+        max_T: int = 256,
     ):
         super().__init__()
 
         self.d_model = d_model
         self.depth = depth
         self.layout = layout
+        self.max_T = max_T
 
         self.layers = nn.ModuleList(
             [
@@ -243,17 +246,91 @@ class BlockCausalTransformer(nn.Module):
         # Final normalization after all layers
         self.final_norm = RMSNorm(d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        cache: KVCache | None = None,
+        commit: bool = False,
+    ) -> torch.Tensor:
         """
         Args:
-            x: (B, T, S, D) input tensor.
+            x: ``(B, T, S, D)`` input tensor.
+            cache: optional ``KVCache`` for incremental decoding.
+                   - ``cache is None``: plain full forward (training / non-cached).
+                   - ``cache`` non-None: ``x`` contains the timesteps to
+                     process (the full past on the first call, or only the new
+                     tokens on subsequent calls). Each time-attention layer
+                     reads past K/V from the cache; non-time-attention layers
+                     never touch the cache. With ``commit=True`` the newly
+                     projected K/V for the timesteps in ``x`` are appended to
+                     the cache along the time axis — oldest frames are
+                     evicted (and cached K is re-rotated by :func:`shift_rope`)
+                     to keep ``t_cached`` bounded by ``cache.max_T``.
+            commit: see ``cache``. Ignored when ``cache is None``.
 
         Returns:
-            (B, T, S, D) output tensor.
+            ``(B, T_processed, S, D)`` output for the timesteps in ``x``.
         """
-        for layer in self.layers:
-            x = layer(x)
+        if cache is None:
+            for layer in self.layers:
+                x = layer(x)
+            return self.final_norm(x)
+
+        if commit:
+            T_new = x.shape[1]
+            if T_new > cache.max_T:
+                # Single commit bigger than the whole window — keep the tail,
+                # drop anything currently cached (it'd be overwritten anyway).
+                x = x[:, -cache.max_T:]
+                T_new = cache.max_T
+                cache.reset()
+
+            excess = cache.t_cached + T_new - cache.max_T
+            if excess > 0:
+                self._slide_window(cache, excess)
+
+        for L, layer in enumerate(self.layers):
+            if layer.has_time:
+                past_kv = cache.get(L)
+                x, kv_new = layer.forward_incremental(x, past_kv=past_kv)
+                if commit and kv_new is not None:
+                    cache.append(L, *kv_new)
+            else:
+                # Non-time layer: no cross-time state, no cache interaction.
+                x, _ = layer.forward_incremental(x, past_kv=None)
         return self.final_norm(x)
+
+    def _slide_window(self, cache: KVCache, excess: int) -> None:
+        """
+        Evict ``excess`` oldest cached entries from every time-attn layer and
+        rotate the remaining K tensors backward by that many RoPE positions so
+        their effective positions stay contiguous at ``[0, T_cached - excess)``.
+        """
+        for L in cache.time_layers:
+            k = cache.k[L]
+            v = cache.v[L]
+            if k is None:
+                continue
+            k_kept = k[..., excess:, :]
+            v_kept = v[..., excess:, :]
+            rope_cos = self.layers[L].time_attn.rope_cos
+            rope_sin = self.layers[L].time_attn.rope_sin
+            cache.k[L] = shift_rope(k_kept, rope_cos, rope_sin, excess)
+            cache.v[L] = v_kept
+
+    def make_kv_cache(self) -> KVCache:
+        """
+        Build an empty ``KVCache`` sized to this transformer's time-attn
+        layers. Cache capacity (``max_T``) is one less than the transformer's
+        RoPE cache size — the extra slot is reserved for the new-query token's
+        RoPE position during denoising, so the cache can safely be read with
+        one additional token without overflowing.
+        """
+        return KVCache(
+            time_layer_indices=[L for L, layer in enumerate(self.layers) if layer.has_time],
+            max_T=self.max_T - 1,
+        )
 
     def count_parameters(self) -> int:
         """Total number of trainable parameters."""

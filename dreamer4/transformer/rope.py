@@ -128,3 +128,43 @@ def apply_rope(
     x_rot = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
     return x * cos + x_rot * sin
+
+
+def shift_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    shift: int,
+) -> torch.Tensor:
+    """
+    Rotate ``x`` **backward** by a constant ``shift`` positions in RoPE space.
+
+    If ``x`` currently carries RoPE for absolute positions ``[p, p+L)`` then
+    after ``shift_rope(x, cos, sin, shift=s)`` it carries RoPE for positions
+    ``[p - s, p - s + L)``. The operation is the inverse rotation by ``s``
+    positions — i.e. apply RoPE with angle ``-s * freq``, using the identities
+    ``cos(-a) = cos(a)`` and ``sin(-a) = -sin(a)``.
+
+    Used by the KV cache sliding window: after evicting the oldest ``s``
+    cached frames, the remaining cached K's effective positions shift from
+    ``[s, T_cached)`` back to ``[0, T_cached - s)`` — that's a single rotation
+    by ``-s``, applied uniformly across all cached positions.
+
+    Args:
+        x: ``(..., seq_len, head_dim)`` — e.g. cached K tensors of shape
+           ``(N, n_kv_heads, T_cached, head_dim)``.
+        cos, sin: RoPE caches of shape ``(max_T, head_dim)`` built via
+           :func:`build_rope_cache`.
+        shift: non-negative shift amount (in positions). ``shift=0`` is a
+           no-op; must satisfy ``0 <= shift < max_T``.
+
+    Returns:
+        Tensor of the same shape as ``x``, with RoPE rotated back by ``shift``.
+    """
+    if shift == 0:
+        return x
+    # Pick the cos/sin at position `shift` (shape (1, head_dim)) — broadcasting
+    # across seq_len applies the same rotation to every time position.
+    cos_s = cos[shift:shift + 1]
+    sin_s = sin[shift:shift + 1]
+    return apply_rope(x, cos_s, -sin_s)

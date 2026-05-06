@@ -62,8 +62,7 @@ class Modality(IntEnum):
     PROPRIO = 2           # Proprioceptive state tokens (for robotics)
     REGISTER = 3          # Register tokens (learnable, for temporal consistency)
     SPATIAL = 4           # Packed spatial tokens (tokenizer output in dynamics)
-    SHORTCUT_SIGNAL = 5   # Shortcut signal level token (tau)
-    SHORTCUT_STEP = 6     # Shortcut step size token (d)
+    SHORTCUT_SIGNAL = 5   # Shortcut signal token carrying both tau and d (concat along channels)
     AGENT = 7             # Agent tokens (for policy/reward/value heads)
 
 
@@ -92,13 +91,12 @@ class TokenLayout:
             segments=(
                 (Modality.ACTION, 1),
                 (Modality.SHORTCUT_SIGNAL, 1),
-                (Modality.SHORTCUT_STEP, 1),
                 (Modality.SPATIAL, 128),
                 (Modality.REGISTER, 4),
                 (Modality.AGENT, 1),
             )
         )
-        Total S = 0 + 1 + 1 + 1 + 128 + 4 + 1 = 136
+        Total S = 0 + 1 + 1 + 128 + 4 + 1 = 135
     """
     n_latents: int
     segments: Tuple[Tuple[Modality, int], ...]

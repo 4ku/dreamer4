@@ -150,7 +150,7 @@ class Encoder(nn.Module):
         logit_cap: float | None = 50.0,
         mae_p_min: float = 0.0,
         mae_p_max: float = 0.9,
-        max_T: int = 1024,
+        max_T: int = 256,
     ):
         super().__init__()
         self.d_model = d_model
@@ -252,7 +252,7 @@ class Decoder(nn.Module):
         dropout: float = 0.0,
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
-        max_T: int = 1024,
+        max_T: int = 256,
     ):
         super().__init__()
         self.n_latents = n_latents

@@ -158,7 +158,7 @@ class TimeAttention(nn.Module):
         dropout: float = 0.0,
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
-        max_T: int = 1024,
+        max_T: int = 256,
     ):
         super().__init__()
 
@@ -198,6 +198,42 @@ class TimeAttention(nn.Module):
         )
 
         return y_t.reshape(B, S, T, D).permute(0, 2, 1, 3).contiguous()
+
+    def forward_incremental(
+        self,
+        new_x: torch.Tensor,
+        *,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Incremental time attention that projects Q, K, V only for new tokens
+        and pulls past K, V directly from the cache.
+
+        Args:
+            new_x:   (B, T_new, S, D) — already ``norm_time``-normalised.
+            past_kv: Optional (K_past, V_past), each
+                     (B*S, n_kv_heads, T_past, head_dim), post-QKNorm and
+                     post-RoPE at positions ``[0, T_past)``.
+
+        Returns:
+            output: (B, T_new, S, D) time-attention output for new timesteps.
+            k_new:  (B*S, n_kv_heads, T_new, head_dim) — K for the new tokens,
+                    post-QKNorm/post-RoPE at positions ``[T_past, T_total)``.
+                    Ready to be appended to a ``KVCache``.
+            v_new:  (B*S, n_kv_heads, T_new, head_dim).
+        """
+        B, T_new, S, D = new_x.shape
+        x_t = new_x.permute(0, 2, 1, 3).contiguous().reshape(B * S, T_new, D)
+
+        y_t, k_new, v_new = self.attn.forward_kv_cached(
+            x_t,
+            past_kv=past_kv,
+            rope_cos=self.rope_cos,
+            rope_sin=self.rope_sin,
+        )  # y_t: (B*S, T_new, D)
+
+        out = y_t.reshape(B, S, T_new, D).permute(0, 2, 1, 3).contiguous()
+        return out, k_new, v_new
 
 
 class BlockCausalLayer(nn.Module):
@@ -251,7 +287,7 @@ class BlockCausalLayer(nn.Module):
         time_every: int = 4,
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
-        max_T: int = 1024,
+        max_T: int = 256,
     ):
         super().__init__()
         self.has_time = (layer_index + 1) % time_every == 0
@@ -288,19 +324,57 @@ class BlockCausalLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            x: (B, T, S, D)
-        Returns:
-            (B, T, S, D)
-        """
-        # Space attention with residual
-        x = x + self.space_attn(self.norm_space(x))
+        Standard (training / non-cached inference) forward.
 
-        # Time attention with residual (if this layer has it)
+        Args:
+            x: (B, T, S, D).
+
+        Returns:
+            (B, T, S, D).
+        """
+        x = x + self.space_attn(self.norm_space(x))
         if self.has_time:
             x = x + self.time_attn(self.norm_time(x))
-
-        # MLP with residual
         x = x + self.mlp(self.norm_mlp(x))
-
         return x
+
+    def forward_incremental(
+        self,
+        x: torch.Tensor,
+        *,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """
+        Cache-aware forward used during autoregressive rollout.
+
+        Space attention and MLP operate only on ``x`` (the new tokens). If
+        this layer has time attention, past K/V are pulled from ``past_kv``
+        (or freshly projected when ``past_kv is None``) and the newly
+        projected K/V for ``x`` are returned for caching.
+
+        Args:
+            x: ``(B, T_new, S, D)`` — new tokens only.
+            past_kv: Optional ``(K, V)`` from the cache, each
+                     ``(B*S, n_kv_heads, T_past, head_dim)``.
+
+        Returns:
+            output: ``(B, T_new, S, D)`` — layer output for new tokens.
+            kv_new: ``(K_new, V_new)`` at positions ``[T_past, T_total)`` —
+                    ready to be appended to a ``KVCache`` — or ``None`` when
+                    this layer has no time attention.
+        """
+        post_space = x + self.space_attn(self.norm_space(x))
+
+        if self.has_time:
+            normed = self.norm_time(post_space)
+            attn_out, k_new, v_new = self.time_attn.forward_incremental(
+                normed, past_kv=past_kv,
+            )
+            x_out = post_space + attn_out
+            kv_new: tuple[torch.Tensor, torch.Tensor] | None = (k_new, v_new)
+        else:
+            x_out = post_space
+            kv_new = None
+
+        x_out = x_out + self.mlp(self.norm_mlp(x_out))
+        return x_out, kv_new

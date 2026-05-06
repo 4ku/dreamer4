@@ -191,3 +191,87 @@ class MultiheadAttention(nn.Module):
         # Concat heads and project out: (N, n_heads, L, head_dim) -> (N, L, D)
         y = y.transpose(1, 2).contiguous().view(N, L, D)
         return self.out_proj(y)
+
+    def forward_kv_cached(
+        self,
+        x_new: torch.Tensor,
+        *,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Incremental attention that projects Q, K, V only for new tokens and
+        optionally concatenates K, V with a cache of past K, V.
+
+        Past K, V are expected **post-QKNorm and post-RoPE** at positions
+        ``[0, T_past)``. Newly projected K_new is QKNorm'd and RoPE'd at
+        positions ``[T_past, T_total)`` before being concatenated. Q_new gets
+        the same positional rotation as K_new.
+
+        Args:
+            x_new:   (N, T_new, D) — new tokens only.
+            past_kv: Optional (K_past, V_past); each (N, n_kv_heads, T_past,
+                     head_dim). Absent → fresh attention over ``x_new`` alone.
+            rope_cos, rope_sin: RoPE caches of length ≥ ``T_past + T_new``.
+
+        Returns:
+            output:   (N, T_new, D) — attention output for new tokens only.
+            k_new:    (N, n_kv_heads, T_new, head_dim) — post-QKNorm/post-RoPE
+                     K for ``x_new`` at positions ``[T_past, T_total)``.
+                     Ready to be ``append``ed to a ``KVCache``.
+            v_new:    (N, n_kv_heads, T_new, head_dim).
+        """
+        N, T_new, D = x_new.shape
+        T_past = 0 if past_kv is None else past_kv[0].shape[-2]
+        T_total = T_past + T_new
+
+        q = self.q_proj(x_new).view(N, T_new, self.n_heads, self.head_dim).transpose(1, 2)
+        k_new = self.k_proj(x_new).view(N, T_new, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v_new = self.v_proj(x_new).view(N, T_new, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        if self.qk_norm is not None:
+            q, k_new = self.qk_norm(q, k_new)
+
+        if rope_cos is not None and rope_sin is not None:
+            q = apply_rope(q, rope_cos[T_past:T_total], rope_sin[T_past:T_total])
+            k_new = apply_rope(k_new, rope_cos[T_past:T_total], rope_sin[T_past:T_total])
+
+        if past_kv is not None:
+            k_past, v_past = past_kv
+            k_full = torch.cat([k_past, k_new], dim=-2)
+            v_full = torch.cat([v_past, v_new], dim=-2)
+        else:
+            k_full, v_full = k_new, v_new
+
+        if self.n_rep > 1:
+            k_attn = k_full.repeat_interleave(self.n_rep, dim=1)
+            v_attn = v_full.repeat_interleave(self.n_rep, dim=1)
+        else:
+            k_attn, v_attn = k_full, v_full
+
+        # Causal mask: Q at offset i (absolute T_past + i) attends to K at j ≤ T_past + i.
+        device = x_new.device
+        i = torch.arange(T_new, device=device).unsqueeze(1) # (T_new, 1)
+        j = torch.arange(T_total, device=device).unsqueeze(0) # (1, T_total)
+        causal = j <= (i + T_past)
+        mask = causal.view(1, 1, T_new, T_total) # (1, 1, T_new, T_total)
+
+        if self.logit_cap is not None:
+            scale = self.head_dim ** -0.5
+            logits = torch.matmul(q, k_attn.transpose(-2, -1)) * scale
+            logits = self.logit_cap * torch.tanh(logits / self.logit_cap)
+            logits = logits.masked_fill(~mask, float("-inf"))
+            weights = F.softmax(logits, dim=-1)
+            drop = self.dropout_p if self.training else 0.0
+            if drop > 0:
+                weights = F.dropout(weights, p=drop)
+            y = torch.matmul(weights, v_attn)
+        else:
+            drop = self.dropout_p if self.training else 0.0
+            y = F.scaled_dot_product_attention(
+                q, k_attn, v_attn, attn_mask=mask, dropout_p=drop, is_causal=False,
+            )
+
+        y = y.transpose(1, 2).contiguous().view(N, T_new, D)
+        return self.out_proj(y), k_new, v_new
