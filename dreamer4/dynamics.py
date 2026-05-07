@@ -20,78 +20,193 @@ Architecture (Paper Figure 2b):
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from dreamer4.transformer.modality import Modality, TokenLayout
 from dreamer4.transformer import BlockCausalTransformer
+from dreamer4.transformer.kv_cache import KVCache
+
+
+ActionInput = Union[torch.Tensor, Dict[str, torch.Tensor], None]
 
 
 # ---------------------------------------------------------------------------
 # Action Encoder
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class ActionComponent:
+    """
+    One component of a composite action (paper Section 3.2).
+
+    Fields:
+        name: Identifier (key in the dict passed to ActionEncoder.forward).
+        kind: "continuous" | "categorical" | "binary".
+        dim:  For "continuous" and "binary", the vector length;
+              for "categorical", the number of classes.
+    """
+    name: str
+    kind: str
+    dim: int
+
+
 class ActionEncoder(nn.Module):
     """
-    Encodes continuous actions into a single token per time step.
+    Encodes actions into a single action token per time step.
 
-    When actions are None (unlabeled video pretraining), emits a learned
-    base embedding. Otherwise projects actions through an MLP and adds
-    the base embedding.
+    Two input modes are supported:
 
-    Paper Section 3.2: "Continuous action components are linearly projected
-    and categorical or binary components use an embedding lookup."
+    1. **Flat continuous vector** — pass ``action_dim`` at construction and
+       feed ``(B, T, action_dim)`` float tensors. Intended for toy envs and
+       simple robotic setups (e.g. 14-D joint + gripper commands).
+
+    2. **Dict of components** — pass ``action_components`` and feed a
+       ``{name: tensor}`` dict. Each component is encoded separately per
+       its ``kind`` (paper Section 3.2):
+         - ``continuous``:  linear projection ``(B, T, dim) -> (B, T, d_model)``.
+         - ``categorical``: embedding lookup on ``(B, T)`` long class ids.
+         - ``binary``:      linear projection (no bias) on a ``(B, T, dim)``
+                            0/1 vector. Algebraically equivalent to summing
+                            learned per-bit embeddings for the active bits.
+
+    Component tokens are summed and a learned base embedding is added. When
+    ``actions is None`` (unlabeled video), only the base embedding is emitted
+    — this is the fallback path that enables mixed labeled/unlabeled training.
 
     Args:
-        d_model:     Model dimension for the output token.
-        action_dim:  Dimensionality of the continuous action vector.
-        hidden_mult: Hidden layer multiplier for the MLP.
+        d_model:           Model dimension for the output token.
+        action_dim:        Dim of a single flat continuous vector. Mutually
+                           exclusive with ``action_components``.
+        action_components: Sequence of ``ActionComponent`` specs for the
+                           multi-component path. Mutually exclusive with
+                           ``action_dim``.
 
     Shape:
-        Input:  (B, T, action_dim) or None
-        Output: (B, T, 1, d_model)
+        Input:
+            None                          — emit base embedding; (B, T) from kwarg.
+            Tensor (B, T, action_dim)     — flat continuous path.
+            dict {name: Tensor}           — multi-component path.
+        Output:
+            (B, T, 1, d_model) action token.
     """
 
-    def __init__(self, d_model: int, action_dim: int, hidden_mult: float = 2.0):
-        super().__init__()
-        self.d_model = d_model
-        self.action_dim = action_dim
+    _FLAT_NAME = "__flat__"
 
-        hidden = int(d_model * hidden_mult)
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        action_dim: Optional[int] = None,
+        action_components: Optional[Sequence[ActionComponent]] = None,
+    ):
+        super().__init__()
+        if (action_dim is None) == (action_components is None):
+            raise ValueError(
+                "Specify exactly one of action_dim or action_components"
+            )
+
+        self.d_model = d_model
         self.base = nn.Parameter(torch.empty(d_model))
         nn.init.normal_(self.base, std=0.001)
 
-        self.fc1 = nn.Linear(action_dim, hidden)
-        self.fc2 = nn.Linear(hidden, d_model)
-        nn.init.normal_(self.fc2.weight, std=0.02)
-        nn.init.zeros_(self.fc2.bias)
+        if action_dim is not None:
+            self.components: Tuple[ActionComponent, ...] = (
+                ActionComponent(name=self._FLAT_NAME, kind="continuous", dim=action_dim),
+            )
+        else:
+            self.components = tuple(action_components)
+
+        self.encoders = nn.ModuleDict()
+        for comp in self.components:
+            self.encoders[comp.name] = self._make_encoder(comp)
+
+    def _make_encoder(self, comp: ActionComponent) -> nn.Module:
+        if comp.kind == "continuous":
+            # Linear: (B, T, comp.dim) -> (B, T, d_model)
+            enc = nn.Linear(comp.dim, self.d_model, bias=True)
+            nn.init.normal_(enc.weight, std=0.02)
+            nn.init.zeros_(enc.bias)
+            return enc
+        if comp.kind == "categorical":
+            # Embedding: (B, T) long -> (B, T, d_model)
+            enc = nn.Embedding(comp.dim, self.d_model)
+            nn.init.normal_(enc.weight, std=0.02)
+            return enc
+        if comp.kind == "binary":
+            # Linear no-bias: (B, T, comp.dim) of 0/1 -> (B, T, d_model)
+            enc = nn.Linear(comp.dim, self.d_model, bias=False)
+            nn.init.normal_(enc.weight, std=0.02)
+            return enc
+        raise ValueError(
+            f"Unknown component kind '{comp.kind}' for '{comp.name}'. "
+            "Expected 'continuous', 'categorical', or 'binary'."
+        )
+
+    def _encode(self, comp: ActionComponent, value: torch.Tensor) -> torch.Tensor:
+        # value: (B, T) long  for categorical
+        #        (B, T, comp.dim) float/0-1  for continuous / binary
+        # returns: (B, T, d_model)
+        enc = self.encoders[comp.name]
+        if comp.kind == "categorical":
+            return enc(value.long())
+        return enc(value.to(torch.float32) if value.dtype not in (torch.float32, torch.float16, torch.bfloat16) else value)
 
     def forward(
         self,
-        actions: Optional[torch.Tensor] = None,
+        actions: ActionInput = None,
         *,
         batch_time_shape: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            actions: (B, T, action_dim) or None for unlabeled data.
-            batch_time_shape: Required when actions is None to infer (B, T).
-
-        Returns:
-            (B, T, 1, d_model) action token.
-        """
+        # actions: None | Tensor (B, T, action_dim) | dict {name: Tensor}
+        # returns: (B, T, 1, d_model)
         if actions is None:
-            assert batch_time_shape is not None, "batch_time_shape required when actions is None"
+            if batch_time_shape is None:
+                raise ValueError("batch_time_shape required when actions is None")
             B, T = batch_time_shape
+            # self.base:                  (d_model,)
+            # self.base.view(1, 1, -1):   (1, 1, d_model)
+            # expand(B, T, -1):           (B, T, d_model)
             out = self.base.view(1, 1, -1).expand(B, T, -1)
-        else:
-            x = actions.clamp(-1, 1)
-            out = self.fc2(F.silu(self.fc1(x))) + self.base.view(1, 1, -1)
+            return out.unsqueeze(2)  # (B, T, 1, d_model)
 
-        return out.unsqueeze(2)  # (B, T, 1, D)
+        if isinstance(actions, torch.Tensor):
+            # Flat continuous path:
+            # actions:   (B, T, action_dim)
+            if len(self.components) != 1 or self.components[0].name != self._FLAT_NAME:
+                raise TypeError(
+                    "ActionEncoder was built with action_components; expected "
+                    "a dict input keyed by component names."
+                )
+            # comp_tok:  (B, T, d_model)
+            comp_tok = self._encode(self.components[0], actions)
+        else:
+            # Multi-component path:
+            # actions:   {name: Tensor}, each (B, T) or (B, T, dim)
+            if not isinstance(actions, dict):
+                raise TypeError(
+                    f"actions must be None, Tensor, or dict; got {type(actions).__name__}"
+                )
+            if len(self.components) == 1 and self.components[0].name == self._FLAT_NAME:
+                raise TypeError(
+                    "ActionEncoder was built with action_dim; expected a Tensor input."
+                )
+            comp_tok = None  # accumulator: (B, T, d_model) once any component is added
+            for comp in self.components:
+                if comp.name not in actions:
+                    raise KeyError(f"missing action component '{comp.name}'")
+                # t: (B, T, d_model)
+                t = self._encode(comp, actions[comp.name])
+                comp_tok = t if comp_tok is None else comp_tok + t
+
+        # comp_tok:                 (B, T, d_model)
+        # self.base.view(1, 1, -1): (1, 1, d_model)  — broadcasts
+        # out:                      (B, T, d_model)
+        out = comp_tok + self.base.view(1, 1, -1)
+        return out.unsqueeze(2)  # (B, T, 1, d_model)
 
 
 # ---------------------------------------------------------------------------
@@ -171,23 +286,26 @@ class DynamicsModel(nn.Module):
     autoregressive rollouts.
 
     Args:
-        d_model:     Transformer hidden dimension.
-        d_spatial:   Dimension of packed spatial tokens (d_bottleneck * k).
-        n_spatial:   Number of spatial tokens per time step.
-        n_register:  Number of learnable register tokens.
-        n_agent:     Number of agent tokens (0 during pretraining).
-        n_heads:     Number of query attention heads.
-        depth:       Number of transformer layers.
-        k_max:       Maximum number of sampling steps (power of 2).
-        action_dim:  Dimensionality of the action space.
-        n_kv_heads:  KV heads for GQA (default = n_heads).
-        mlp_ratio:   MLP hidden size multiplier.
-        time_every:  Apply time attention every N layers.
-        dropout:     Dropout rate.
-        use_qk_norm: Use QKNorm in attention.
-        logit_cap:   Attention logit soft capping.
-        space_mode:  Attention mode ("wm_agent_isolated" or "wm_agent").
-        max_T:       Maximum time steps for RoPE cache.
+        d_model:            Transformer hidden dimension.
+        d_spatial:          Dimension of packed spatial tokens (d_bottleneck * k).
+        n_spatial:          Number of spatial tokens per time step.
+        n_register:         Number of learnable register tokens.
+        n_agent:            Number of agent tokens (0 during pretraining).
+        n_heads:            Number of query attention heads.
+        depth:              Number of transformer layers.
+        k_max:              Maximum number of sampling steps (power of 2).
+        action_dim:         Flat continuous action vector dim (toy / simple
+                            robotics). Mutually exclusive with ``action_components``.
+        action_components:  Multi-component action spec (e.g. Minecraft keyboard +
+                            mouse). Mutually exclusive with ``action_dim``.
+        n_kv_heads:         KV heads for GQA (default = n_heads).
+        mlp_ratio:          MLP hidden size multiplier.
+        time_every:         Apply time attention every N layers.
+        dropout:            Dropout rate.
+        use_qk_norm:        Use QKNorm in attention.
+        logit_cap:          Attention logit soft capping.
+        space_mode:         Attention mode ("wm_agent_isolated" or "wm_agent").
+        max_T:              Maximum time steps for RoPE cache.
     """
 
     def __init__(
@@ -201,7 +319,8 @@ class DynamicsModel(nn.Module):
         n_heads: int = 4,
         depth: int = 8,
         k_max: int = 8,
-        action_dim: int = 16,
+        action_dim: Optional[int] = None,
+        action_components: Optional[Sequence[ActionComponent]] = None,
         n_kv_heads: int | None = None,
         mlp_ratio: float = 8/3,
         time_every: int = 4,
@@ -209,7 +328,7 @@ class DynamicsModel(nn.Module):
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
         space_mode: str = "wm_agent",
-        max_T: int = 1024,
+        max_T: int = 256,
     ):
         super().__init__()
         self.d_model = d_model
@@ -220,7 +339,9 @@ class DynamicsModel(nn.Module):
         self.k_max = k_max
 
         self.action_encoder = ActionEncoder(
-            d_model=d_model, action_dim=action_dim,
+            d_model=d_model,
+            action_dim=action_dim,
+            action_components=action_components,
         )
         self.shortcut_encoder = ShortcutSignalEncoder(
             d_model=d_model, k_max=k_max,
@@ -264,52 +385,22 @@ class DynamicsModel(nn.Module):
         nn.init.zeros_(self.flow_head.weight)
         nn.init.zeros_(self.flow_head.bias)
 
-        self.action_to_spatial = nn.Linear(d_model, d_model)
-        nn.init.zeros_(self.action_to_spatial.weight)
-        nn.init.zeros_(self.action_to_spatial.bias)
-
-    def forward(
+    def _build_tokens(
         self,
-        actions: Optional[torch.Tensor],
+        actions: ActionInput,
         step_idx: torch.Tensor,
         signal_idx: torch.Tensor,
         z_noisy: torch.Tensor,
-        *,
-        agent_tokens: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Args:
-            actions:      (B, T, action_dim) or None for unlabeled data.
-            step_idx:     (B, T) long — step size index.
-            signal_idx:   (B, T) long — signal level index.
-            z_noisy:      (B, T, n_spatial, d_spatial) corrupted representations.
-            agent_tokens: (B, T, n_agent, d_model) or None.
-
-        Returns:
-            z1_hat:        (B, T, n_spatial, d_spatial) predicted clean representations.
-            agent_out:     (B, T, n_agent, d_model) or None if n_agent == 0.
-        """
+        agent_tokens: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         B, T = z_noisy.shape[:2]
 
-        act_tok = self.action_encoder(
-            actions, batch_time_shape=(B, T),
-        )  # (B, T, 1, D)
-
-        sc_tok = self.shortcut_encoder(
-            step_idx, signal_idx,
-        )  # (B, T, 1, D)
-
-        spatial_tok = self.spatial_proj(z_noisy)  # (B, T, n_spatial, D)
-
-        shifted_act = torch.zeros_like(act_tok)
-        shifted_act[:, 1:] = act_tok[:, :-1]
-        act_inject = self.action_to_spatial(shifted_act[:, :, 0, :])  # (B, T, D)
-        spatial_tok = spatial_tok + act_inject.unsqueeze(2)
-
+        act_tok = self.action_encoder(actions, batch_time_shape=(B, T))  # (B,T,1,D)
+        sc_tok = self.shortcut_encoder(step_idx, signal_idx)              # (B,T,1,D)
+        spatial_tok = self.spatial_proj(z_noisy)                          # (B,T,Nz,D)
         reg = self.register_tokens.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
 
         parts = [act_tok, sc_tok, spatial_tok, reg]
-
         if self.n_agent > 0:
             if agent_tokens is None:
                 agent_tokens = torch.zeros(
@@ -317,18 +408,51 @@ class DynamicsModel(nn.Module):
                     device=z_noisy.device, dtype=z_noisy.dtype,
                 )
             parts.append(agent_tokens)
+        return torch.cat(parts, dim=2)  # (B, T, S, D)
 
-        tokens = torch.cat(parts, dim=2)  # (B, T, S, D)
-        x = self.transformer(tokens)
-
+    def _read_heads(
+        self, x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         spatial_out = x[:, :, self.spatial_slice, :]
-        z1_hat = self.flow_head(spatial_out)  # (B, T, n_spatial, d_spatial)
-
-        agent_out = None
-        if self.n_agent > 0:
-            agent_out = x[:, :, self.agent_slice, :]
-
+        z1_hat = self.flow_head(spatial_out)
+        agent_out = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None
         return z1_hat, agent_out
+
+    def forward(
+        self,
+        actions: ActionInput,
+        step_idx: torch.Tensor,
+        signal_idx: torch.Tensor,
+        z_noisy: torch.Tensor,
+        *,
+        agent_tokens: Optional[torch.Tensor] = None,
+        cache: Optional[KVCache] = None,
+        commit: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            actions:      None, Tensor ``(B, T, action_dim)``, or dict of components.
+            step_idx:     ``(B, T)`` long — step size index.
+            signal_idx:   ``(B, T)`` long — signal level index.
+            z_noisy:      ``(B, T, n_spatial, d_spatial)`` corrupted representations.
+            agent_tokens: ``(B, T, n_agent, d_model)`` or None.
+            cache:        Optional ``KVCache`` for incremental decoding. When given:
+                          - if empty, runs standard forward; with ``commit=True``
+                            fills the cache from ``z_noisy``'s timesteps.
+                          - if non-empty, ``z_noisy`` and siblings must contain
+                            only the *new* timesteps beyond ``cache.t_cached``;
+                            ``commit`` controls whether those timesteps are
+                            appended to the cache.
+            commit:       See ``cache``. Ignored when ``cache is None``.
+
+        Returns:
+            z1_hat:        predictions for the processed timesteps.
+            agent_out:     agent-token outputs for the processed timesteps,
+                           or None if n_agent == 0.
+        """
+        tokens = self._build_tokens(actions, step_idx, signal_idx, z_noisy, agent_tokens)
+        x = self.transformer(tokens, cache=cache, commit=commit)
+        return self._read_heads(x)
 
 
 # ---------------------------------------------------------------------------
@@ -492,19 +616,18 @@ def shortcut_forcing_loss(
     """
     device = z1.device
     B, T = z1.shape[:2]
-    emax = _log2_int(k_max)
 
     B_boot = max(0, min(B - 1, int(round(bootstrap_fraction * B))))
     B_flow = B - B_boot
 
     # --- Flow (empirical) portion ---
     d_f, step_f, tau_f, sig_f = sample_flow_schedule(B_flow, T, k_max, device)
-    z_tilde_f, _ = corrupt_representations(z1[:B_flow], tau_f)
+    z_tilde_f = corrupt_representations(z1[:B_flow], tau_f)
 
     # --- Bootstrap portion ---
     if B_boot > 0:
         d_b, step_b, tau_b, sig_b = sample_bootstrap_schedule(B_boot, T, k_max, device)
-        z_tilde_b, _ = corrupt_representations(z1[B_flow:], tau_b)
+        z_tilde_b = corrupt_representations(z1[B_flow:], tau_b)
     else:
         d_b = torch.zeros(0, T, device=device)
         step_b = torch.zeros(0, T, device=device, dtype=torch.long)
@@ -513,7 +636,6 @@ def shortcut_forcing_loss(
         z_tilde_b = torch.zeros(0, T, *z1.shape[2:], device=device, dtype=z1.dtype)
 
     # Concatenate full batch for one forward pass
-    d_full = torch.cat([d_f, d_b], dim=0)
     step_full = torch.cat([step_f, step_b], dim=0)
     tau_full = torch.cat([tau_f, tau_b], dim=0)
     sig_full = torch.cat([sig_f, sig_b], dim=0)
@@ -589,6 +711,27 @@ def shortcut_forcing_loss(
 # Sampling / Generation
 # ---------------------------------------------------------------------------
 
+def _slice_actions(
+    actions: ActionInput, start: int, stop: int,
+) -> ActionInput:
+    """Slice flat-tensor or dict-of-tensors actions along the time axis."""
+    if actions is None:
+        return None
+    if isinstance(actions, torch.Tensor):
+        return actions[:, start:stop]
+    return {name: t[:, start:stop] for name, t in actions.items()}
+
+
+def _corrupt_past(
+    past: torch.Tensor, tau_ctx: float,
+) -> torch.Tensor:
+    """Mix clean past with standard-normal noise at magnitude ``tau_ctx``."""
+    if tau_ctx <= 0 or past.shape[1] == 0:
+        return past
+    noise = torch.randn_like(past)
+    return tau_ctx * noise + (1.0 - tau_ctx) * past
+
+
 @torch.no_grad()
 def sample_one_timestep(
     dynamics: DynamicsModel,
@@ -596,9 +739,10 @@ def sample_one_timestep(
     past_packed: torch.Tensor,
     k_max: int,
     K: int = 4,
-    actions: Optional[torch.Tensor] = None,
+    actions: ActionInput = None,
     tau_ctx: float = 0.1,
     agent_tokens: Optional[torch.Tensor] = None,
+    cache: Optional[KVCache] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Generate one new frame by K-step shortcut denoising.
@@ -609,21 +753,25 @@ def sample_one_timestep(
 
     Args:
         dynamics:     The DynamicsModel (should be in eval mode).
-        past_packed:  (B, t, n_spatial, d_spatial) context frames.
+        past_packed:  (B, t_ctx, n_spatial, d_spatial) context frames.
         k_max:        Maximum sampling steps.
         K:            Number of denoising steps for the new frame.
-        actions:      (B, t+1, action_dim) or None. Must include the action
-                      for the frame being generated.
-        tau_ctx:      Signal level for corrupting context (default 0.1).
-        agent_tokens: (B, t+1, n_agent, d_model) or None.  When provided,
-                      passed to the dynamics forward call and the agent_out
-                      for the *last* timestep of the final denoising step
-                      is returned.
+        actions:      None, Tensor ``(B, t_ctx+1, action_dim)``, or a dict of
+                      components each with leading shape ``(B, t_ctx+1, ...)``.
+                      Must cover the frame being generated.
+        tau_ctx:      Noise magnitude for past inputs (default 0.1).
+        agent_tokens: (B, t_ctx+1, n_agent, d_model) or None.
+        cache:        Optional ``KVCache``. When provided, any uncached past
+                      frames are committed first (with the same ``tau_ctx``
+                      corruption), then the K denoising iterations run
+                      incrementally against the cache. The newly generated
+                      frame is **not** committed here — the caller
+                      (``sample_sequence``) commits it after selecting it as
+                      the output.
 
     Returns:
         z_new:     (B, n_spatial, d_spatial) generated frame.
-        agent_out: (B, n_agent, d_model) or None.  Agent embeddings for the
-                   newly generated timestep (from the last denoising step).
+        agent_out: (B, n_agent, d_model) or None.
     """
     device = past_packed.device
     dtype = past_packed.dtype
@@ -632,28 +780,67 @@ def sample_one_timestep(
     emax = _log2_int(k_max)
 
     signal_level = 1.0 - tau_ctx
-    if tau_ctx > 0 and t_ctx > 0:
-        noise = torch.randn_like(past_packed)
-        past_corrupted = tau_ctx * noise + signal_level * past_packed
-    else:
-        past_corrupted = past_packed
+    ctx_signal_val = min(int(round(signal_level * k_max)), k_max)
 
-    d = 1.0 / K
+    d_new = 1.0 / K
     step_e = int(round(math.log2(K)))
 
+    # --- Cache-based path --------------------------------------------------
+    if cache is not None:
+        t_missing = t_ctx - cache.t_cached
+        if t_missing > 0:
+            past_tail = past_packed[:, -t_missing:]
+            past_tail_corrupt = _corrupt_past(past_tail, tau_ctx)
+
+            step_ctx = torch.full((B, t_missing), emax, device=device, dtype=torch.long)
+            sig_ctx = torch.full((B, t_missing), ctx_signal_val, device=device, dtype=torch.long)
+            act_ctx = _slice_actions(actions, cache.t_cached, t_ctx)
+            agent_ctx = (
+                agent_tokens[:, cache.t_cached:t_ctx] if agent_tokens is not None else None
+            )
+
+            _ = dynamics(
+                act_ctx, step_ctx, sig_ctx, past_tail_corrupt,
+                agent_tokens=agent_ctx, cache=cache, commit=True,
+            )
+
+        z = torch.randn(B, 1, n_spatial, d_spatial, device=device, dtype=dtype)
+        last_agent_out: Optional[torch.Tensor] = None
+
+        act_new = _slice_actions(actions, t_ctx, t_ctx + 1)
+        agent_new = agent_tokens[:, t_ctx:t_ctx + 1] if agent_tokens is not None else None
+
+        for i in range(K):
+            tau_i = i * d_new
+            sig_i = min(int(round(tau_i * k_max)), k_max)
+
+            step_new = torch.full((B, 1), step_e, device=device, dtype=torch.long)
+            signal_new = torch.full((B, 1), sig_i, device=device, dtype=torch.long)
+
+            z1_hat, a_out = dynamics(
+                act_new, step_new, signal_new, z,
+                agent_tokens=agent_new, cache=cache, commit=False,
+            )  # (B, 1, Nz, Dz)
+
+            if a_out is not None:
+                last_agent_out = a_out[:, -1]
+
+            denom = max(1e-4, 1.0 - tau_i)
+            velocity = (z1_hat.float() - z.float()) / denom
+            z = (z.float() + velocity * d_new).to(dtype)
+
+        return z[:, 0], last_agent_out
+
+    # --- Non-cache path ---------------------------------------------------
+    past_corrupted = _corrupt_past(past_packed, tau_ctx) 
     z = torch.randn(B, 1, n_spatial, d_spatial, device=device, dtype=dtype)
-
-    ctx_signal_val = int(round(signal_level * k_max))
-    ctx_signal_val = min(ctx_signal_val, k_max)
-
-    last_agent_out: Optional[torch.Tensor] = None
+    last_agent_out = None
 
     for i in range(K):
-        tau_i = i * d
-        sig_i = int(round(tau_i * k_max))
-        sig_i = min(sig_i, k_max)
+        tau_i = i * d_new
+        sig_i = min(int(round(tau_i * k_max)), k_max)
 
-        packed_seq = torch.cat([past_corrupted, z], dim=1)  # (B, t+1, Nz, Dz)
+        packed_seq = torch.cat([past_corrupted, z], dim=1)
         T_total = packed_seq.shape[1]
 
         step_idxs = torch.full((B, T_total), emax, device=device, dtype=torch.long)
@@ -662,21 +849,21 @@ def sample_one_timestep(
         signal_idxs = torch.full((B, T_total), ctx_signal_val, device=device, dtype=torch.long)
         signal_idxs[:, -1] = sig_i
 
-        actions_in = actions[:, :T_total] if actions is not None else None
+        actions_in = _slice_actions(actions, 0, T_total)
         agent_in = agent_tokens[:, :T_total] if agent_tokens is not None else None
 
         z1_hat, a_out = dynamics(
             actions_in, step_idxs, signal_idxs, packed_seq,
             agent_tokens=agent_in,
         )
-        z1_hat_new = z1_hat[:, -1:, :, :]  # (B, 1, Nz, Dz)
+        z1_hat_new = z1_hat[:, -1:, :, :]
 
         if a_out is not None:
-            last_agent_out = a_out[:, -1]  # (B, n_agent, d_model)
+            last_agent_out = a_out[:, -1]
 
         denom = max(1e-4, 1.0 - tau_i)
         velocity = (z1_hat_new.float() - z.float()) / denom
-        z = (z.float() + velocity * d).to(dtype)
+        z = (z.float() + velocity * d_new).to(dtype)
 
     return z[:, 0], last_agent_out
 
@@ -689,12 +876,17 @@ def sample_sequence(
     horizon: int,
     k_max: int,
     K: int = 4,
-    actions: Optional[torch.Tensor] = None,
+    actions: ActionInput = None,
     tau_ctx: float = 0.1,
     agent_tokens: Optional[torch.Tensor] = None,
+    use_cache: bool = True,
 ) -> Tuple[torch.Tensor, Optional[list[torch.Tensor]]]:
     """
     Autoregressively generate a sequence of frames.
+
+    With ``use_cache=True`` (default) a single ``KVCache`` is kept across
+    frames so each denoising step only runs the transformer over the new
+    timestep, pulling K/V for the growing past from the cache.
 
     Args:
         dynamics:     The DynamicsModel (should be in eval mode).
@@ -702,27 +894,35 @@ def sample_sequence(
         horizon:      Number of frames to generate.
         k_max:        Maximum sampling steps.
         K:            Denoising steps per frame.
-        actions:      (B, t_ctx + horizon, action_dim) or None.
-        tau_ctx:      Context corruption level.
+        actions:      None, Tensor ``(B, t_ctx + horizon, action_dim)``, or a
+                      dict of components keyed by name.
+        tau_ctx:      Context noise magnitude.
         agent_tokens: (B, t_ctx + horizon, n_agent, d_model) or None.
-                      When provided, agent embeddings from each generated
-                      timestep are collected and returned.
+        use_cache:    Toggle KV-cache (default True). Set False to recover
+                      the plain rollout — useful for equivalence tests.
 
     Returns:
-        frames:     (B, t_ctx + horizon, n_spatial, d_spatial) full sequence
-                    (context + generated).
-        agent_outs: List of ``horizon`` tensors each (B, n_agent, d_model),
-                    one per generated timestep.  None when agent_tokens is
-                    not provided.
+        frames:     (B, t_ctx + horizon, n_spatial, d_spatial).
+        agent_outs: list of ``horizon`` tensors each (B, n_agent, d_model),
+                    or None when agent_tokens is not provided.
     """
     B = context.shape[0]
     t_ctx = context.shape[1]
+    device = context.device
 
     frames = [context[:, t] for t in range(t_ctx)]
     agent_outs: list[torch.Tensor] = []
 
+    cache: Optional[KVCache] = None
+    if use_cache:
+        cache = dynamics.transformer.make_kv_cache()
+
+    signal_level = 1.0 - tau_ctx
+    ctx_signal_val = min(int(round(signal_level * k_max)), k_max)
+    emax = _log2_int(k_max)
+
     for h in range(horizon):
-        past = torch.stack(frames, dim=1)  # (B, t, Nz, Dz)
+        past = torch.stack(frames, dim=1)
 
         z_next, a_out = sample_one_timestep(
             dynamics,
@@ -732,10 +932,32 @@ def sample_sequence(
             actions=actions,
             tau_ctx=tau_ctx,
             agent_tokens=agent_tokens,
+            cache=cache,
         )
         frames.append(z_next)
         if a_out is not None:
             agent_outs.append(a_out)
+
+        if cache is not None:
+            # Commit the newly generated frame so it becomes cached past for
+            # subsequent frames' incremental forwards.
+            new_z = z_next.unsqueeze(1)
+            new_z_corrupt = _corrupt_past(new_z, tau_ctx)
+
+            step_idx = torch.full((B, 1), emax, device=device, dtype=torch.long)
+            signal_idx = torch.full((B, 1), ctx_signal_val, device=device, dtype=torch.long)
+
+            act_in = _slice_actions(actions, t_ctx + h, t_ctx + h + 1)
+            agent_in = (
+                agent_tokens[:, t_ctx + h:t_ctx + h + 1]
+                if agent_tokens is not None
+                else None
+            )
+
+            _ = dynamics(
+                act_in, step_idx, signal_idx, new_z_corrupt,
+                agent_tokens=agent_in, cache=cache, commit=True,
+            )
 
     seq = torch.stack(frames, dim=1)
     return seq, agent_outs if agent_outs else None
