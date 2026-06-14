@@ -554,12 +554,11 @@ def corrupt_representations(
 
     Returns:
         z_tilde: (B, T, Nz, Dz) corrupted representations.
-        z0:      (B, T, Nz, Dz) the noise sample used.
     """
     z0 = torch.randn_like(z1)
     tau_4d = tau[..., None, None]  # (B, T, 1, 1)
     z_tilde = (1.0 - tau_4d) * z0 + tau_4d * z1
-    return z_tilde, z0
+    return z_tilde
 
 
 def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
