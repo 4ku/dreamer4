@@ -130,6 +130,13 @@ class Encoder(nn.Module):
         mae_p_min:     Minimum MAE masking probability.
         mae_p_max:     Maximum MAE masking probability.
         max_T:         Maximum time steps for RoPE cache.
+        d_proprio:     Optional proprioceptive input dimension (e.g. robot joint
+                       state, or player position on the gridworld). When set, one
+                       PROPRIO token per timestep is appended after the patches.
+                       Per the paper's multi-modality rule, latent tokens attend to
+                       all modalities while each modality attends only within
+                       itself — the existing "encoder" mask already implements
+                       this, so no masking changes are needed.
     """
 
     def __init__(
@@ -151,11 +158,13 @@ class Encoder(nn.Module):
         mae_p_min: float = 0.0,
         mae_p_max: float = 0.9,
         max_T: int = 256,
+        d_proprio: int | None = None,
     ):
         super().__init__()
         self.d_model = d_model
         self.n_latents = n_latents
         self.n_patches = n_patches
+        self.d_proprio = d_proprio
 
         self.patch_proj = nn.Linear(patch_dim, d_model)
         self.bottleneck_proj = nn.Linear(d_model, d_bottleneck)
@@ -165,9 +174,14 @@ class Encoder(nn.Module):
         self.latents = nn.Parameter(torch.empty(n_latents, d_model))
         nn.init.normal_(self.latents, std=0.02)
 
+        segments = [(Modality.IMAGE, n_patches)]
+        if d_proprio is not None:
+            self.proprio_proj = nn.Linear(d_proprio, d_model)
+            segments.append((Modality.PROPRIO, 1))
+
         layout = TokenLayout(
             n_latents=n_latents,
-            segments=((Modality.IMAGE, n_patches),),
+            segments=tuple(segments),
         )
 
         self.transformer = BlockCausalTransformer(
@@ -186,11 +200,13 @@ class Encoder(nn.Module):
         )
 
     def forward(
-        self, patch_tokens: torch.Tensor
+        self, patch_tokens: torch.Tensor, proprio: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             patch_tokens: (B, T, n_patches, patch_dim) raw patch vectors.
+            proprio:      (B, T, d_proprio) proprioceptive state; required iff the
+                          encoder was built with ``d_proprio``.
 
         Returns:
             z: (B, T, N_latents, d_bottleneck) in [-1, 1].
@@ -198,14 +214,19 @@ class Encoder(nn.Module):
         """
         B, T, n_patches, _ = patch_tokens.shape
         assert n_patches == self.n_patches
+        assert (proprio is not None) == (self.d_proprio is not None), \
+            "pass `proprio` iff the encoder was built with d_proprio"
 
         proj = self.patch_proj(patch_tokens)  # (B, T, n_patches, d_model)
         proj_masked, mae_mask = self.mae(proj)
 
         lat = self.latents.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
-        tokens = torch.cat([lat, proj_masked], dim=2)  # (B, T, n_latents + n_patches, d_model)
+        parts = [lat, proj_masked]
+        if proprio is not None:
+            parts.append(self.proprio_proj(proprio).unsqueeze(2))  # (B, T, 1, d_model)
+        tokens = torch.cat(parts, dim=2)  # (B, T, n_latents + n_patches (+1), d_model)
 
-        enc = self.transformer(tokens) # (B, T, n_latents + n_patches, d_model)
+        enc = self.transformer(tokens)
 
         z = torch.tanh(self.bottleneck_proj(enc[:, :, : self.n_latents, :]))
         return z, mae_mask
@@ -252,11 +273,14 @@ class Decoder(nn.Module):
         dropout: float = 0.0,
         use_qk_norm: bool = True,
         logit_cap: float | None = 50.0,
+        space_mode: str = "decoder",
         max_T: int = 256,
+        d_proprio: int | None = None,
     ):
         super().__init__()
         self.n_latents = n_latents
         self.n_patches = n_patches
+        self.d_proprio = d_proprio
 
         self.up_proj = nn.Linear(d_bottleneck, d_model)
 
@@ -265,9 +289,20 @@ class Decoder(nn.Module):
 
         self.patch_head = nn.Linear(d_model, patch_dim)
 
+        segments = [(Modality.IMAGE, n_patches)]
+        if d_proprio is not None:
+            # one learned PROPRIO query decoded back to the proprio vector; per the
+            # paper each decoder modality attends within itself and to the latents
+            # ("decoder" mode) or, under "decoder_cross", to the latents only —
+            # both existing masks handle the extra segment unchanged.
+            self.proprio_query = nn.Parameter(torch.empty(1, d_model))
+            nn.init.normal_(self.proprio_query, std=0.02)
+            self.proprio_head = nn.Linear(d_model, d_proprio)
+            segments.append((Modality.PROPRIO, 1))
+
         layout = TokenLayout(
             n_latents=n_latents,
-            segments=((Modality.IMAGE, n_patches),),
+            segments=tuple(segments),
         )
 
         self.transformer = BlockCausalTransformer(
@@ -275,7 +310,7 @@ class Decoder(nn.Module):
             n_heads=n_heads,
             depth=depth,
             layout=layout,
-            space_mode="decoder",
+            space_mode=space_mode,
             n_kv_heads=n_kv_heads,
             mlp_ratio=mlp_ratio,
             time_every=time_every,
@@ -285,24 +320,33 @@ class Decoder(nn.Module):
             max_T=max_T,
         )
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor):
         """
         Args:
             z: (B, T, N_latents, d_bottleneck) bottleneck representations.
 
         Returns:
-            (B, T, Np, patch_dim) reconstructed patches in [0, 1].
+            (B, T, Np, patch_dim) reconstructed patches in [0, 1]; when the decoder
+            was built with ``d_proprio``, a tuple ``(patches, proprio_pred)`` with
+            proprio_pred (B, T, d_proprio) (linear, no activation).
         """
         B, T, L, _ = z.shape
         assert L == self.n_latents
 
         lat = self.up_proj(z)  # (B, T, n_latents, d_model)
         qry = self.patch_queries.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1) # (B, T, n_patches, d_model)
-        tokens = torch.cat([lat, qry], dim=2)  # (B, T, n_patches + n_latents, d_model)
+        parts = [lat, qry]
+        if self.d_proprio is not None:
+            parts.append(self.proprio_query.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1))
+        tokens = torch.cat(parts, dim=2)
 
-        x = self.transformer(tokens) # (B, T, n_patches + n_latents, d_model)
-        patches_out = x[:, :, self.n_latents :, :] # (B, T, n_patches, d_model)
-        return torch.sigmoid(self.patch_head(patches_out))
+        x = self.transformer(tokens)
+        patches_out = x[:, :, self.n_latents : self.n_latents + self.n_patches, :]
+        patches = torch.sigmoid(self.patch_head(patches_out))
+        if self.d_proprio is None:
+            return patches
+        proprio_pred = self.proprio_head(x[:, :, -1, :])       # (B, T, d_proprio)
+        return patches, proprio_pred
 
 
 # ---------------------------------------------------------------------------
@@ -324,23 +368,25 @@ class Tokenizer(nn.Module):
         self.decoder = decoder
 
     def forward(
-        self, patch_tokens: torch.Tensor
+        self, patch_tokens: torch.Tensor, proprio: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             patch_tokens: (B, T, Np, patch_dim) raw patch vectors.
+            proprio:      (B, T, d_proprio), iff built with proprio support.
 
         Returns:
-            pred:      (B, T, Np, patch_dim) reconstructed patches in [0, 1].
+            pred:      (B, T, Np, patch_dim) reconstructed patches in [0, 1]
+                       (or ``(patches, proprio_pred)`` when the decoder decodes proprio).
             mae_mask:  (B, T, Np, 1) bool mask (True = masked).
         """
-        z, mae_mask = self.encoder(patch_tokens)
+        z, mae_mask = self.encoder(patch_tokens, proprio=proprio)
         pred = self.decoder(z)
         return pred, mae_mask
 
-    def encode(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+    def encode(self, patch_tokens: torch.Tensor, proprio: torch.Tensor | None = None) -> torch.Tensor:
         """Encode patches to bottleneck latents (no MAE masking at eval)."""
-        z, _ = self.encoder(patch_tokens)
+        z, _ = self.encoder(patch_tokens, proprio=proprio)
         return z
 
 

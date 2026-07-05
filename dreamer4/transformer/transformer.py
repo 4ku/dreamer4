@@ -279,12 +279,13 @@ class BlockCausalTransformer(nn.Module):
 
         if commit:
             T_new = x.shape[1]
+            cache.committed += T_new   # caller-frame counter; monotone across eviction
             if T_new > cache.max_T:
                 # Single commit bigger than the whole window — keep the tail,
                 # drop anything currently cached (it'd be overwritten anyway).
                 x = x[:, -cache.max_T:]
                 T_new = cache.max_T
-                cache.reset()
+                cache.clear_kv()
 
             excess = cache.t_cached + T_new - cache.max_T
             if excess > 0:

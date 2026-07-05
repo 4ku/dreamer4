@@ -192,6 +192,13 @@ def build_space_attn_mask(layout: TokenLayout, mode: str) -> torch.Tensor:
         nonlat_row = same_mod | is_k_lat
         mask = torch.where(is_q_lat, lat_to_lat, nonlat_row)
 
+    elif mode == "decoder_cross":
+        # Perceiver-IO style decode: patches attend ONLY to latents (no
+        # patch<->patch mixing), latents attend only to latents. This removes
+        # the constant-output escape hatch that collapses the naive decoder —
+        # every spatial output is forced to be a function of the latents.
+        mask = is_k_lat.expand(S, S).clone()
+
     elif mode == "wm_agent_isolated":
         # Agent tokens only see agent tokens
         # Non-agent tokens see everything EXCEPT agent tokens

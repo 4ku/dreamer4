@@ -329,6 +329,7 @@ class DynamicsModel(nn.Module):
         logit_cap: float | None = 50.0,
         space_mode: str = "wm_agent",
         max_T: int = 256,
+        d_proprio: int | None = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -337,6 +338,7 @@ class DynamicsModel(nn.Module):
         self.n_register = n_register
         self.n_agent = n_agent
         self.k_max = k_max
+        self.d_proprio = d_proprio
 
         self.action_encoder = ActionEncoder(
             d_model=d_model,
@@ -356,14 +358,24 @@ class DynamicsModel(nn.Module):
             (Modality.ACTION, 1),
             (Modality.SHORTCUT_SIGNAL, 1),
             (Modality.SPATIAL, n_spatial),
-            (Modality.REGISTER, n_register),
         ]
+        if d_proprio is not None:
+            # proprioceptive stream (robot joint state): ONE token per timestep,
+            # noised and denoised JOINTLY with the spatial latents (paper's design;
+            # the wm_* masks treat PROPRIO as a world modality — no mask changes).
+            self.proprio_proj = nn.Linear(d_proprio, d_model)
+            self.proprio_head = nn.Linear(d_model, d_proprio)
+            nn.init.zeros_(self.proprio_head.weight)
+            nn.init.zeros_(self.proprio_head.bias)
+            segments.append((Modality.PROPRIO, 1))
+        segments.append((Modality.REGISTER, n_register))
         if n_agent > 0:
             segments.append((Modality.AGENT, n_agent))
 
         self.layout = TokenLayout(n_latents=0, segments=tuple(segments))
         sl = self.layout.slices()
         self.spatial_slice = sl[Modality.SPATIAL]
+        self.proprio_slice = sl.get(Modality.PROPRIO, slice(0, 0))
         self.agent_slice = sl.get(Modality.AGENT, slice(0, 0))
 
         self.transformer = BlockCausalTransformer(
@@ -392,15 +404,21 @@ class DynamicsModel(nn.Module):
         signal_idx: torch.Tensor,
         z_noisy: torch.Tensor,
         agent_tokens: Optional[torch.Tensor],
+        proprio_noisy: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, T = z_noisy.shape[:2]
+        assert (proprio_noisy is not None) == (self.d_proprio is not None), \
+            "pass `proprio_noisy` iff the model was built with d_proprio"
 
         act_tok = self.action_encoder(actions, batch_time_shape=(B, T))  # (B,T,1,D)
         sc_tok = self.shortcut_encoder(step_idx, signal_idx)              # (B,T,1,D)
         spatial_tok = self.spatial_proj(z_noisy)                          # (B,T,Nz,D)
         reg = self.register_tokens.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
 
-        parts = [act_tok, sc_tok, spatial_tok, reg]
+        parts = [act_tok, sc_tok, spatial_tok]
+        if proprio_noisy is not None:
+            parts.append(self.proprio_proj(proprio_noisy).unsqueeze(2))   # (B,T,1,D)
+        parts.append(reg)
         if self.n_agent > 0:
             if agent_tokens is None:
                 agent_tokens = torch.zeros(
@@ -410,13 +428,14 @@ class DynamicsModel(nn.Module):
             parts.append(agent_tokens)
         return torch.cat(parts, dim=2)  # (B, T, S, D)
 
-    def _read_heads(
-        self, x: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _read_heads(self, x: torch.Tensor):
         spatial_out = x[:, :, self.spatial_slice, :]
         z1_hat = self.flow_head(spatial_out)
         agent_out = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None
-        return z1_hat, agent_out
+        if self.d_proprio is None:
+            return z1_hat, agent_out
+        proprio_hat = self.proprio_head(x[:, :, self.proprio_slice, :][:, :, 0])
+        return z1_hat, proprio_hat, agent_out
 
     def forward(
         self,
@@ -426,31 +445,36 @@ class DynamicsModel(nn.Module):
         z_noisy: torch.Tensor,
         *,
         agent_tokens: Optional[torch.Tensor] = None,
+        proprio_noisy: Optional[torch.Tensor] = None,
         cache: Optional[KVCache] = None,
         commit: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ):
         """
         Args:
             actions:      None, Tensor ``(B, T, action_dim)``, or dict of components.
             step_idx:     ``(B, T)`` long — step size index.
             signal_idx:   ``(B, T)`` long — signal level index.
             z_noisy:      ``(B, T, n_spatial, d_spatial)`` corrupted representations.
+            proprio_noisy: ``(B, T, d_proprio)`` corrupted proprio stream (iff built
+                          with ``d_proprio``; denoised jointly, x-prediction).
             agent_tokens: ``(B, T, n_agent, d_model)`` or None.
             cache:        Optional ``KVCache`` for incremental decoding. When given:
                           - if empty, runs standard forward; with ``commit=True``
                             fills the cache from ``z_noisy``'s timesteps.
                           - if non-empty, ``z_noisy`` and siblings must contain
-                            only the *new* timesteps beyond ``cache.t_cached``;
+                            only the *new* timesteps beyond ``cache.committed``;
                             ``commit`` controls whether those timesteps are
                             appended to the cache.
             commit:       See ``cache``. Ignored when ``cache is None``.
 
         Returns:
             z1_hat:        predictions for the processed timesteps.
+            (proprio_hat:  ``(B, T, d_proprio)`` — only when built with d_proprio.)
             agent_out:     agent-token outputs for the processed timesteps,
                            or None if n_agent == 0.
         """
-        tokens = self._build_tokens(actions, step_idx, signal_idx, z_noisy, agent_tokens)
+        tokens = self._build_tokens(actions, step_idx, signal_idx, z_noisy, agent_tokens,
+                                    proprio_noisy=proprio_noisy)
         x = self.transformer(tokens, cache=cache, commit=commit)
         return self._read_heads(x)
 
@@ -741,10 +765,19 @@ def sample_one_timestep(
     actions: ActionInput = None,
     tau_ctx: float = 0.1,
     agent_tokens: Optional[torch.Tensor] = None,
+    past_proprio: Optional[torch.Tensor] = None,
     cache: Optional[KVCache] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+):
     """
     Generate one new frame by K-step shortcut denoising.
+
+    When the model was built with ``d_proprio``, pass ``past_proprio``
+    ``(B, t_ctx, d_proprio)``; the proprio stream is denoised jointly and the
+    return becomes ``(z_new, proprio_new, agent_out)``. Works with and without
+    a ``cache`` — the PROPRIO token is one more S position, so its K/V ride
+    the same cache; uncached past frames are committed with their (corrupted)
+    proprio, and the new frame's noisy proprio is threaded through each
+    incremental denoising call.
 
     Paper Section 3.2: "We sample autoregressively in time and generate the
     representations of each frame using the shortcut model with K=4 sample
@@ -786,24 +819,37 @@ def sample_one_timestep(
 
     # --- Cache-based path --------------------------------------------------
     if cache is not None:
-        t_missing = t_ctx - cache.t_cached
+        has_proprio = dynamics.d_proprio is not None
+        assert not (has_proprio and past_proprio is None), \
+            "model has d_proprio: pass past_proprio (B, t_ctx, d_proprio)"
+        # ``cache.committed`` counts caller frames monotonically — ``t_cached``
+        # shrinks when the sliding window evicts, so it would over-count
+        # t_missing (and re-commit tail frames) on horizons beyond max_T.
+        t_missing = t_ctx - cache.committed
         if t_missing > 0:
             past_tail = past_packed[:, -t_missing:]
             past_tail_corrupt = _corrupt_past(past_tail, tau_ctx)
+            prop_tail_corrupt = (
+                _corrupt_past(past_proprio[:, -t_missing:], tau_ctx)
+                if has_proprio else None
+            )
 
             step_ctx = torch.full((B, t_missing), emax, device=device, dtype=torch.long)
             sig_ctx = torch.full((B, t_missing), ctx_signal_val, device=device, dtype=torch.long)
-            act_ctx = _slice_actions(actions, cache.t_cached, t_ctx)
+            act_ctx = _slice_actions(actions, t_ctx - t_missing, t_ctx)
             agent_ctx = (
-                agent_tokens[:, cache.t_cached:t_ctx] if agent_tokens is not None else None
+                agent_tokens[:, t_ctx - t_missing:t_ctx] if agent_tokens is not None else None
             )
 
             _ = dynamics(
                 act_ctx, step_ctx, sig_ctx, past_tail_corrupt,
-                agent_tokens=agent_ctx, cache=cache, commit=True,
+                agent_tokens=agent_ctx, proprio_noisy=prop_tail_corrupt,
+                cache=cache, commit=True,
             )
 
         z = torch.randn(B, 1, n_spatial, d_spatial, device=device, dtype=dtype)
+        prop = (torch.randn(B, 1, dynamics.d_proprio, device=device, dtype=dtype)
+                if has_proprio else None)
         last_agent_out: Optional[torch.Tensor] = None
 
         act_new = _slice_actions(actions, t_ctx, t_ctx + 1)
@@ -816,23 +862,42 @@ def sample_one_timestep(
             step_new = torch.full((B, 1), step_e, device=device, dtype=torch.long)
             signal_new = torch.full((B, 1), sig_i, device=device, dtype=torch.long)
 
-            z1_hat, a_out = dynamics(
-                act_new, step_new, signal_new, z,
-                agent_tokens=agent_new, cache=cache, commit=False,
-            )  # (B, 1, Nz, Dz)
+            denom = max(1e-4, 1.0 - tau_i)
+            if has_proprio:
+                z1_hat, prop_hat, a_out = dynamics(
+                    act_new, step_new, signal_new, z,
+                    agent_tokens=agent_new, proprio_noisy=prop,
+                    cache=cache, commit=False,
+                )  # (B, 1, Nz, Dz), (B, 1, d_p)
+                prop_vel = (prop_hat.float() - prop.float()) / denom
+                prop = (prop.float() + prop_vel * d_new).to(dtype)
+            else:
+                z1_hat, a_out = dynamics(
+                    act_new, step_new, signal_new, z,
+                    agent_tokens=agent_new, cache=cache, commit=False,
+                )  # (B, 1, Nz, Dz)
 
             if a_out is not None:
                 last_agent_out = a_out[:, -1]
 
-            denom = max(1e-4, 1.0 - tau_i)
             velocity = (z1_hat.float() - z.float()) / denom
             z = (z.float() + velocity * d_new).to(dtype)
 
+        if has_proprio:
+            return z[:, 0], prop[:, 0], last_agent_out
         return z[:, 0], last_agent_out
 
     # --- Non-cache path ---------------------------------------------------
-    past_corrupted = _corrupt_past(past_packed, tau_ctx) 
+    has_proprio = dynamics.d_proprio is not None
+    assert not (has_proprio and past_proprio is None), \
+        "model has d_proprio: pass past_proprio (B, t_ctx, d_proprio)"
+
+    past_corrupted = _corrupt_past(past_packed, tau_ctx)
     z = torch.randn(B, 1, n_spatial, d_spatial, device=device, dtype=dtype)
+    prop_past_corrupted = prop = None
+    if has_proprio:
+        prop_past_corrupted = _corrupt_past(past_proprio, tau_ctx)
+        prop = torch.randn(B, 1, dynamics.d_proprio, device=device, dtype=dtype)
     last_agent_out = None
 
     for i in range(K):
@@ -851,19 +916,30 @@ def sample_one_timestep(
         actions_in = _slice_actions(actions, 0, T_total)
         agent_in = agent_tokens[:, :T_total] if agent_tokens is not None else None
 
-        z1_hat, a_out = dynamics(
-            actions_in, step_idxs, signal_idxs, packed_seq,
-            agent_tokens=agent_in,
-        )
+        denom = max(1e-4, 1.0 - tau_i)
+        if has_proprio:
+            prop_seq = torch.cat([prop_past_corrupted, prop], dim=1)
+            z1_hat, prop_hat, a_out = dynamics(
+                actions_in, step_idxs, signal_idxs, packed_seq,
+                agent_tokens=agent_in, proprio_noisy=prop_seq,
+            )
+            prop_vel = (prop_hat[:, -1:].float() - prop.float()) / denom
+            prop = (prop.float() + prop_vel * d_new).to(dtype)
+        else:
+            z1_hat, a_out = dynamics(
+                actions_in, step_idxs, signal_idxs, packed_seq,
+                agent_tokens=agent_in,
+            )
         z1_hat_new = z1_hat[:, -1:, :, :]
 
         if a_out is not None:
             last_agent_out = a_out[:, -1]
 
-        denom = max(1e-4, 1.0 - tau_i)
         velocity = (z1_hat_new.float() - z.float()) / denom
         z = (z.float() + velocity * d_new).to(dtype)
 
+    if has_proprio:
+        return z[:, 0], prop[:, 0], last_agent_out
     return z[:, 0], last_agent_out
 
 
@@ -878,8 +954,9 @@ def sample_sequence(
     actions: ActionInput = None,
     tau_ctx: float = 0.1,
     agent_tokens: Optional[torch.Tensor] = None,
+    proprio_context: Optional[torch.Tensor] = None,
     use_cache: bool = True,
-) -> Tuple[torch.Tensor, Optional[list[torch.Tensor]]]:
+) -> Tuple[torch.Tensor, ...]:
     """
     Autoregressively generate a sequence of frames.
 
@@ -897,19 +974,28 @@ def sample_sequence(
                       dict of components keyed by name.
         tau_ctx:      Context noise magnitude.
         agent_tokens: (B, t_ctx + horizon, n_agent, d_model) or None.
+        proprio_context: (B, t_ctx, d_proprio) — required iff the model was
+                      built with ``d_proprio``. The proprio stream is denoised
+                      jointly with the frames and rolled forward alongside them
+                      (cached and uncached alike).
         use_cache:    Toggle KV-cache (default True). Set False to recover
                       the plain rollout — useful for equivalence tests.
 
     Returns:
         frames:     (B, t_ctx + horizon, n_spatial, d_spatial).
+        (proprio:   (B, t_ctx + horizon, d_proprio) — only for proprio models.)
         agent_outs: list of ``horizon`` tensors each (B, n_agent, d_model),
                     or None when agent_tokens is not provided.
     """
     B = context.shape[0]
     t_ctx = context.shape[1]
     device = context.device
+    has_proprio = dynamics.d_proprio is not None
+    assert (proprio_context is not None) == has_proprio, \
+        "pass `proprio_context` iff the model was built with d_proprio"
 
     frames = [context[:, t] for t in range(t_ctx)]
+    props = [proprio_context[:, t] for t in range(t_ctx)] if has_proprio else None
     agent_outs: list[torch.Tensor] = []
 
     cache: Optional[KVCache] = None
@@ -922,8 +1008,9 @@ def sample_sequence(
 
     for h in range(horizon):
         past = torch.stack(frames, dim=1)
+        past_prop = torch.stack(props, dim=1) if has_proprio else None
 
-        z_next, a_out = sample_one_timestep(
+        out = sample_one_timestep(
             dynamics,
             past_packed=past,
             k_max=k_max,
@@ -931,8 +1018,14 @@ def sample_sequence(
             actions=actions,
             tau_ctx=tau_ctx,
             agent_tokens=agent_tokens,
+            past_proprio=past_prop,
             cache=cache,
         )
+        if has_proprio:
+            z_next, prop_next, a_out = out
+            props.append(prop_next)
+        else:
+            z_next, a_out = out
         frames.append(z_next)
         if a_out is not None:
             agent_outs.append(a_out)
@@ -942,6 +1035,9 @@ def sample_sequence(
             # subsequent frames' incremental forwards.
             new_z = z_next.unsqueeze(1)
             new_z_corrupt = _corrupt_past(new_z, tau_ctx)
+            new_prop_corrupt = (
+                _corrupt_past(prop_next.unsqueeze(1), tau_ctx) if has_proprio else None
+            )
 
             step_idx = torch.full((B, 1), emax, device=device, dtype=torch.long)
             signal_idx = torch.full((B, 1), ctx_signal_val, device=device, dtype=torch.long)
@@ -955,8 +1051,11 @@ def sample_sequence(
 
             _ = dynamics(
                 act_in, step_idx, signal_idx, new_z_corrupt,
-                agent_tokens=agent_in, cache=cache, commit=True,
+                agent_tokens=agent_in, proprio_noisy=new_prop_corrupt,
+                cache=cache, commit=True,
             )
 
     seq = torch.stack(frames, dim=1)
+    if has_proprio:
+        return seq, torch.stack(props, dim=1), agent_outs if agent_outs else None
     return seq, agent_outs if agent_outs else None

@@ -56,6 +56,11 @@ class KVCache:
         self.k: Dict[int, Optional[torch.Tensor]] = {L: None for L in self._time_layers}
         self.v: Dict[int, Optional[torch.Tensor]] = {L: None for L in self._time_layers}
         self.max_T: int = int(max_T)
+        # Total timesteps EVER committed (monotone; unlike ``t_cached`` it does not
+        # shrink when the sliding window evicts old frames). Callers that track
+        # "which of my frames are already in the cache" must use this, not
+        # ``t_cached`` — after the first eviction the two diverge.
+        self.committed: int = 0
 
     @property
     def time_layers(self) -> Tuple[int, ...]:
@@ -83,11 +88,17 @@ class KVCache:
             return None
         return k, v
 
-    def reset(self) -> None:
-        """Clear all cached K/V."""
+    def clear_kv(self) -> None:
+        """Drop stored K/V only — ``committed`` keeps counting. Used internally
+        when a single oversized commit replaces the whole window."""
         for L in self._time_layers:
             self.k[L] = None
             self.v[L] = None
+
+    def reset(self) -> None:
+        """Clear all cached K/V and the committed-timestep counter."""
+        self.clear_kv()
+        self.committed = 0
 
     def append(
         self,

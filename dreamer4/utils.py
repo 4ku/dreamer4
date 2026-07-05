@@ -14,6 +14,7 @@ This module provides low-level helpers used across the codebase:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -73,17 +74,31 @@ class RMSLossNormalizer(nn.Module):
     Divides each loss by its running RMS estimate, so fixed coefficients
     control relative importance independent of raw loss magnitudes.
 
+    Near-convergence caveat: with a plain running-RMS divisor, a loss decaying
+    toward zero is divided by an ever-smaller estimate, so its normalized value
+    (and gradients) stays O(1) forever — an implicit adaptive-LR amplifier that
+    prevents the final polishing phase from settling (plateau + huge pre-clip
+    grad norms). ``floor_frac`` bounds this: the divisor never drops below
+    ``floor_frac * peak_rms`` (largest RMS seen for that term), so early training
+    keeps scale-free balancing while a term far below its peak contributes
+    proportionally to its actual value again (amplification ≤ ``1/floor_frac``).
+
     Args:
-        n_losses:  Number of loss terms to track.
-        decay:     EMA decay factor (default 0.99).
-        eps:       Floor for the RMS estimate (default 1e-8).
+        n_losses:   Number of loss terms to track.
+        decay:      EMA decay factor (default 0.99).
+        eps:        Floor for the RMS estimate (default 1e-8).
+        floor_frac: Divisor floor as a fraction of the term's peak RMS
+                    (default 0.0 = legacy unfloored behavior).
     """
 
-    def __init__(self, n_losses: int = 2, decay: float = 0.99, eps: float = 1e-8):
+    def __init__(self, n_losses: int = 2, decay: float = 0.99, eps: float = 1e-8,
+                 floor_frac: float = 0.0):
         super().__init__()
         self.decay = decay
         self.eps = eps
+        self.floor_frac = floor_frac
         self.register_buffer("rms_ema", torch.ones(n_losses))
+        self.register_buffer("rms_peak", torch.zeros(n_losses))
         self.register_buffer("initialized", torch.zeros(n_losses, dtype=torch.bool))
 
     @torch.no_grad()
@@ -95,7 +110,11 @@ class RMSLossNormalizer(nn.Module):
             self.initialized[idx] = True
         else:
             self.rms_ema[idx] = self.decay * self.rms_ema[idx] + (1 - self.decay) * val
+        self.rms_peak[idx] = torch.maximum(self.rms_peak[idx], self.rms_ema[idx])
 
     def normalize(self, idx: int, loss: torch.Tensor) -> torch.Tensor:
-        """Divide loss by its running RMS estimate."""
-        return loss / self.rms_ema[idx].clamp_min(self.eps)
+        """Divide loss by its (floored) running RMS estimate."""
+        div = self.rms_ema[idx]
+        if self.floor_frac > 0:
+            div = torch.maximum(div, self.floor_frac * self.rms_peak[idx])
+        return loss / div.clamp_min(self.eps)
