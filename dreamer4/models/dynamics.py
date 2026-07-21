@@ -1,9 +1,13 @@
 """
-Dynamics model with Shortcut Forcing for Dreamer 4.
+Dynamics model for Dreamer 4: the MODEL and its inference-time sampling.
 
-Predicts future latent representations given actions using the shortcut
-forcing objective — a combination of flow matching, shortcut models, and
-diffusion forcing (Paper Section 3.2, Eq. 6-8).
+Predicts future latent representations given actions, trained with shortcut
+forcing — a combination of flow matching, shortcut models, and diffusion
+forcing (Paper Section 3.2, Eq. 6-8). The TRAINING OBJECTIVES themselves
+(``shortcut_forcing_loss`` and the production ``clean_context_loss``) live in
+:mod:`dreamer4.train.dynamics_objectives` together with their
+schedule/corruption/ramp-weight building blocks; this module contains the
+architecture and the autoregressive samplers.
 
 Key design choices from the paper:
   - X-prediction (not V-prediction) to prevent error accumulation
@@ -26,9 +30,9 @@ from typing import Dict, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 
-from dreamer4.transformer.modality import Modality, TokenLayout
-from dreamer4.transformer import BlockCausalTransformer
-from dreamer4.transformer.kv_cache import KVCache
+from dreamer4.models.transformer.modality import Modality, TokenLayout
+from dreamer4.models.transformer import BlockCausalTransformer
+from dreamer4.models.transformer.kv_cache import KVCache
 
 
 ActionInput = Union[torch.Tensor, Dict[str, torch.Tensor], None]
@@ -480,254 +484,35 @@ class DynamicsModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Schedule Sampling (Eq. 4)
+# Shortcut step sizes are powers of two, d = 1/2^e, and the model consumes
+# the EXPONENT e as a discrete step index (embedding lookup): step_idx == e,
+# and the finest step d_min = 1/k_max has index emax = log2(k_max). This
+# helper converts k_max to that exponent. Used by the inference samplers
+# below and imported by dreamer4.train.dynamics_objectives.
 # ---------------------------------------------------------------------------
 
 def _log2_int(k_max: int) -> int:
-    """Compute log2(k_max), asserting k_max is a power of 2."""
+    """log2(k_max) as an int, asserting k_max is a power of 2."""
     e = int(round(math.log2(k_max)))
     assert (1 << e) == k_max, f"k_max={k_max} must be a power of 2"
     return e
 
 
-def sample_flow_schedule(
-    B: int,
-    T: int,
-    k_max: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Sample schedule for the flow matching (empirical) portion of the batch.
-
-    Uses the finest step size d_min = 1/k_max and uniform tau.
-
-    Returns:
-        d:          (B, T) float — step size (always d_min).
-        step_idx:   (B, T) long  — step index (always emax).
-        tau:        (B, T) float — signal level in [0, 1).
-        signal_idx: (B, T) long  — discrete signal index.
-    """
-    emax = _log2_int(k_max)
-
-    step_idx = torch.full((B, T), emax, device=device, dtype=torch.long)
-    d = torch.full((B, T), 1.0 / k_max, device=device, dtype=torch.float32)
-
-    j = torch.randint(0, k_max, (B, T), device=device, dtype=torch.long)
-    tau = j.float() / float(k_max)
-    signal_idx = j
-
-    return d, step_idx, tau, signal_idx
-
-
-def sample_bootstrap_schedule(
-    B: int,
-    T: int,
-    k_max: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Sample schedule for the bootstrap (self-consistency) portion.
-
-    Step size d is sampled uniformly as a power of two from
-    {1, 1/2, 1/4, ..., 1/(k_max/2)}, excluding d_min.
-    Tau is sampled on the grid reachable by the current d.
-
-    Paper Eq. 4:
-        d ~ 1/U({1,2,...,K_max/2})
-        tau ~ U({0, d, 2d, ..., 1-d})
-
-    Returns:
-        d:          (B, T) float
-        step_idx:   (B, T) long
-        tau:        (B, T) float
-        signal_idx: (B, T) long
-    """
-    emax = _log2_int(k_max)
-
-    # step_idx in [0, emax): 0 -> d=1, 1 -> d=1/2, ..., emax-1 -> d=2/k_max
-    step_idx = torch.randint(0, max(1, emax), (B, T), device=device, dtype=torch.long)
-    d = 1.0 / (1 << step_idx).float()  # (B, T)
-
-    K = (1 << step_idx).long()  # number of grid points for this d
-    j = torch.floor(torch.rand(B, T, device=device) * K.float()).long()
-    j = j.clamp(max=K - 1)
-    tau = j.float() / K.float()
-
-    scale = k_max // K
-    signal_idx = j * scale
-
-    return d, step_idx, tau, signal_idx
-
-
 # ---------------------------------------------------------------------------
-# Corruption & Weight
+# Action alignment — the model's input convention
 # ---------------------------------------------------------------------------
 
-def corrupt_representations(
-    z1: torch.Tensor,
-    tau: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+
+def align_actions(actions: torch.Tensor, T: int) -> torch.Tensor:
     """
-    Corrupt clean representations via linear interpolation with noise.
-
-    z_tilde = (1 - tau) * z0 + tau * z1,  where z0 ~ N(0, I)
-
-    Args:
-        z1:  (B, T, Nz, Dz) clean representations.
-        tau: (B, T) signal levels in [0, 1].
-
-    Returns:
-        z_tilde: (B, T, Nz, Dz) corrupted representations.
+    (B, T-1, D_a) dataset actions -> (B, T, D_a+1) per-frame aligned actions
+    with the start flag in the last channel (see module docstring).
     """
-    z0 = torch.randn_like(z1)
-    tau_4d = tau[..., None, None]  # (B, T, 1, 1)
-    z_tilde = (1.0 - tau_4d) * z0 + tau_4d * z1
-    return z_tilde
-
-
-def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
-    """
-    Ramp loss weight from paper Eq. 8: w(tau) = 0.9 * tau + 0.1
-
-    Focuses model capacity on higher signal levels where learning signal
-    is strongest. At tau=0 (pure noise), weight is 0.1; at tau=1, weight is 1.0.
-
-    Args:
-        tau: (...) signal levels in [0, 1].
-
-    Returns:
-        (...) weights in [0.1, 1.0].
-    """
-    return 0.9 * tau + 0.1
-
-
-# ---------------------------------------------------------------------------
-# Shortcut Forcing Loss (Eq. 7)
-# ---------------------------------------------------------------------------
-
-def shortcut_forcing_loss(
-    dynamics: DynamicsModel,
-    *,
-    z1: torch.Tensor,
-    actions: Optional[torch.Tensor] = None,
-    k_max: int,
-    bootstrap_fraction: float = 0.25,
-    agent_tokens: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Combined shortcut forcing loss: flow term + bootstrap term.
-
-    Paper Section 3.2, Eq. 7:
-      - Flow term (d=d_min):
-            ||f(z_tilde, tau, d, a) - z1||^2
-      - Bootstrap term (d > d_min):
-            (1-tau)^2 * ||v_hat - sg(b' + b'')/2||^2
-        where b', b'' are velocity predictions from two half-steps.
-      - Both terms are weighted by ramp_weight(tau).
-
-    Args:
-        dynamics:            The DynamicsModel.
-        z1:                  (B, T, Nz, Dz) clean packed representations.
-        actions:             (B, T, A) or None.
-        k_max:               Maximum sampling steps.
-        bootstrap_fraction:  Fraction of the batch for bootstrap targets.
-        agent_tokens:        (B, T, n_agent, D) or None.
-
-    Returns:
-        loss: Scalar combined loss.
-        aux:  Dict of diagnostic tensors (all detached).
-    """
-    device = z1.device
-    B, T = z1.shape[:2]
-
-    B_boot = max(0, min(B - 1, int(round(bootstrap_fraction * B))))
-    B_flow = B - B_boot
-
-    # --- Flow (empirical) portion ---
-    d_f, step_f, tau_f, sig_f = sample_flow_schedule(B_flow, T, k_max, device)
-    z_tilde_f = corrupt_representations(z1[:B_flow], tau_f)
-
-    # --- Bootstrap portion ---
-    if B_boot > 0:
-        d_b, step_b, tau_b, sig_b = sample_bootstrap_schedule(B_boot, T, k_max, device)
-        z_tilde_b = corrupt_representations(z1[B_flow:], tau_b)
-    else:
-        d_b = torch.zeros(0, T, device=device)
-        step_b = torch.zeros(0, T, device=device, dtype=torch.long)
-        tau_b = torch.zeros(0, T, device=device)
-        sig_b = torch.zeros(0, T, device=device, dtype=torch.long)
-        z_tilde_b = torch.zeros(0, T, *z1.shape[2:], device=device, dtype=z1.dtype)
-
-    # Concatenate full batch for one forward pass
-    step_full = torch.cat([step_f, step_b], dim=0)
-    tau_full = torch.cat([tau_f, tau_b], dim=0)
-    sig_full = torch.cat([sig_f, sig_b], dim=0)
-    z_tilde_full = torch.cat([z_tilde_f, z_tilde_b], dim=0)
-
-    z1_hat_full, _ = dynamics(
-        actions, step_full, sig_full, z_tilde_full,
-        agent_tokens=agent_tokens,
-    )
-
-    # --- Flow loss: ||z1_hat - z1||^2 weighted by ramp ---
-    z1_hat_flow = z1_hat_full[:B_flow]
-    w_f = ramp_weight(tau_f)  # (B_flow, T)
-    flow_per = (z1_hat_flow.float() - z1[:B_flow].float()).pow(2).mean(dim=(2, 3))
-    loss_flow = (flow_per * w_f).mean()
-
-    # --- Bootstrap loss (Eq. 7) ---
-    loss_boot = torch.tensor(0.0, device=device)
-    boot_mse = torch.tensor(0.0, device=device)
-
-    if B_boot > 0:
-        z1_hat_boot = z1_hat_full[B_flow:]
-        z_tilde_boot = z_tilde_full[B_flow:]
-        actions_boot = actions[B_flow:] if actions is not None else None
-        agent_boot = agent_tokens[B_flow:] if agent_tokens is not None else None
-
-        d_half = d_b / 2.0
-        step_half = step_b + 1  # one finer level
-
-        tau_plus = tau_b + d_half
-        sig_plus = sig_b + (torch.tensor(k_max, device=device).float() * d_half).long()
-        sig_plus = sig_plus.clamp(max=k_max)
-
-        # First half-step: predict z1 from z_tilde at (tau, d/2)
-        with torch.no_grad():
-            z1_h1, _ = dynamics(
-                actions_boot, step_half, sig_b, z_tilde_boot,
-                agent_tokens=agent_boot,
-            )
-            b_prime = (z1_h1.float() - z_tilde_boot.float()) / (1.0 - tau_b).clamp_min(1e-6)[..., None, None]
-            z_prime = z_tilde_boot.float() + b_prime * d_half[..., None, None]
-
-            # Second half-step: predict z1 from z_prime at (tau + d/2, d/2)
-            z1_h2, _ = dynamics(
-                actions_boot, step_half, sig_plus, z_prime.to(z_tilde_boot.dtype),
-                agent_tokens=agent_boot,
-            )
-            b_double = (z1_h2.float() - z_prime) / (1.0 - tau_plus).clamp_min(1e-6)[..., None, None]
-
-            v_target = ((b_prime + b_double) / 2.0)
-
-        # Convert model prediction to v-space
-        v_hat = (z1_hat_boot.float() - z_tilde_boot.float()) / (1.0 - tau_b).clamp_min(1e-6)[..., None, None]
-
-        w_b = ramp_weight(tau_b)
-        boot_per = (1.0 - tau_b).pow(2) * (v_hat - v_target).pow(2).mean(dim=(2, 3))
-        loss_boot = (boot_per * w_b).mean()
-        boot_mse = boot_per.mean().detach()
-
-    loss = (loss_flow * B_flow + loss_boot * B_boot) / B
-
-    aux = {
-        "flow_mse": flow_per.mean().detach(),
-        "boot_mse": boot_mse,
-        "loss_flow": loss_flow.detach(),
-        "loss_boot": loss_boot.detach(),
-        "tau_mean": tau_full.mean().detach(),
-    }
-    return loss, aux
+    B, _, D = actions.shape
+    aligned = torch.zeros(B, T, D + 1, device=actions.device, dtype=torch.float32)
+    aligned[:, 0, D] = 1.0                       # start flag: nothing led in
+    aligned[:, 1:, :D] = actions.float()
+    return aligned
 
 
 # ---------------------------------------------------------------------------

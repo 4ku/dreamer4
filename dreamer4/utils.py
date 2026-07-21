@@ -14,7 +14,6 @@ This module provides low-level helpers used across the codebase:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------

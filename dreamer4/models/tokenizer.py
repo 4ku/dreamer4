@@ -6,6 +6,10 @@ and reconstructs frames from latents (Decoder). Both components use the
 block-causal transformer backbone and are causal in time, enabling
 frame-by-frame decoding for interactive inference.
 
+Also here: :class:`FrozenTokenizer` — a trained checkpoint wrapped as the
+frozen pixels<->latents codec that dynamics training and inference consume
+(sliding temporal history + bottleneck packing).
+
 Paper reference: Section 3.1, Figure 2(a), Eq. 5.
 
 Architecture (Encoder):
@@ -38,13 +42,14 @@ from __future__ import annotations
 
 from typing import Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
-import lpips
 
-from dreamer4.transformer.modality import Modality, TokenLayout
-from dreamer4.transformer import BlockCausalTransformer
-from dreamer4.transformer.transformer import unpatchify
+from dreamer4.models.transformer.modality import Modality, TokenLayout
+from dreamer4.models.transformer import BlockCausalTransformer
+from dreamer4.models.transformer.transformer import patchify, unpatchify
+from dreamer4.utils import pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck
 
 
 # ---------------------------------------------------------------------------
@@ -391,87 +396,117 @@ class Tokenizer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Loss utilities
+# FrozenTokenizer (deployment form: pixels <-> packed dynamics latents)
 # ---------------------------------------------------------------------------
 
 
-class MAECompositedLPIPS(nn.Module):
+class FrozenTokenizer(nn.Module):
     """
-    Official LPIPS (``lpips`` package) on MAE-composited full frames.
+    A TRAINED tokenizer, frozen, as a pixels<->latents codec — the form in
+    which dynamics training and inference consume it:
 
-    LPIPS is defined on full images. We composite: visible patches use the
-    decoder prediction; masked patches (``mae_mask`` True) use ground truth,
-    then measure LPIPS against the full target image. Patch tensors are in
-    ``[0, 1]``; the underlying metric uses ``normalize=True`` (``[0, 1]`` RGB).
+        encode_frames(video (B,T,H,W,C) uint8) -> z (B,T,n_spatial,d_spatial)
+        decode_latents(z) -> images (B,T,C,H,W) in [0, 1]
+
+    **Sliding history.** ``latent[t]`` is the time-attention encoding of the
+    ``history`` frames ``[t-history+1 .. t]`` (taking the last position),
+    replicate-padding before the episode start. This DECOUPLES the
+    tokenizer's temporal receptive field (fixed ``history``) from the
+    dynamics rollout horizon: every latent depends on at most ``history``
+    frames, so it is a deterministic per-frame function — episodes can be
+    encoded once and cached, and the world model can roll arbitrarily far.
+    ``history=1`` is plain per-frame encoding (the same code path — a window
+    of one). Decoding uses the same sliding window over latents, matching
+    how the production stack renders dreams.
+
+    The bottleneck ``(n_latents, d_bottleneck)`` is packed to
+    ``(n_spatial, d_bottleneck * pack_k)`` — the tokenizer <-> dynamics
+    interface from the paper's Appendix A.
 
     Args:
-        net: Trunk for ``lpips.LPIPS`` (e.g. ``"alex"``, ``"vgg"``, ``"vgg16"``).
-        H, W, C: Image shape fed to ``unpatchify``.
-        patch_size: Patch side length.
-        verbose: Passed through to ``lpips.LPIPS``.
+        ckpt_path:  ``train_tokenizer`` checkpoint (EMA weights preferred).
+        history:    Sliding temporal window w >= 1.
+        pack_k:     Bottleneck packing factor (must divide n_latents).
+        decoder_ckpt: Optional second checkpoint whose DECODER replaces this
+                    one's (e.g. a noise-robust decoder fine-tuned with a
+                    frozen encoder — the latent space must be identical,
+                    which is verified).
+        device:     Where to run.
     """
 
-    def __init__(
-        self,
-        *,
-        net: str,
-        H: int,
-        W: int,
-        C: int,
-        patch_size: int,
-        verbose: bool = False,
-    ):
+    def __init__(self, ckpt_path, *, history: int = 1, pack_k: int = 1,
+                 decoder_ckpt=None, device: str | torch.device = "cuda"):
         super().__init__()
-        self.H = int(H)
-        self.W = int(W)
-        self.C = int(C)
-        self.patch_size = int(patch_size)
-        self.lpips_metric = lpips.LPIPS(net=net, verbose=verbose)
+        # lazy: the checkpoint loader lives in the trainer module, which
+        # imports the model classes above — a top-level import would cycle
+        from dreamer4.train.train_tokenizer import load_tokenizer_checkpoint
+        tok, ckpt = load_tokenizer_checkpoint(ckpt_path, device=device)
+        if ckpt["frame_meta"]["d_proprio"] is not None:
+            raise ValueError("proprio-decoding tokenizers are not supported as "
+                             "a dynamics codec — train the tokenizer with "
+                             "data.proprio=none for this use")
+        if decoder_ckpt:
+            robust, _ = load_tokenizer_checkpoint(decoder_ckpt, device=device)
+            enc_a, enc_b = tok.encoder.state_dict(), robust.encoder.state_dict()
+            if any(not torch.equal(enc_a[k], enc_b[k]) for k in enc_a):
+                raise ValueError(f"{decoder_ckpt} was not fine-tuned from "
+                                 f"{ckpt_path}: encoders differ, so its decoder "
+                                 "speaks a different latent space")
+            tok.decoder = robust.decoder
+        meta = ckpt["frame_meta"]
+        self.H, self.W, self.C = meta["H"], meta["W"], meta["C"]
+        self.patch_size = ckpt["config"]["model"]["patch_size"]
+        self.n_latents = ckpt["config"]["model"]["n_latents"]
+        self.d_bottleneck = ckpt["config"]["model"]["d_bottleneck"]
+        self.history = int(history)
+        if not 1 <= self.history <= meta["max_T"]:
+            raise ValueError(f"history={history} must be in [1, max_T="
+                             f"{meta['max_T']}] of the tokenizer")
+        if self.n_latents % pack_k:
+            raise ValueError(f"pack_k={pack_k} must divide n_latents={self.n_latents}")
+        self.pack_k = int(pack_k)
+        self.n_spatial = self.n_latents // self.pack_k
+        self.d_spatial = self.d_bottleneck * self.pack_k
+        for p in tok.parameters():
+            p.requires_grad_(False)
+        self.tok = tok.eval()
+        self.device = torch.device(device)
 
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        mae_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            pred:       (B, T, n_patches, patch_dim) decoder predictions.
-            target:     (B, T, n_patches, patch_dim) ground-truth patches.
-            mae_mask:   (B, T, n_patches, 1) bool — True where encoder mask replaced the patch.
+    def _slide(self, x: torch.Tensor) -> torch.Tensor:
+        """(B,T,*) -> (B*T, w, *): causal length-w windows per position,
+        replicate-padding the first w-1 slots (a static clip — exactly what
+        the tokenizer saw at every episode start)."""
+        B, T = x.shape[:2]
+        w = self.history
+        if w == 1:
+            return x.reshape(B * T, 1, *x.shape[2:])
+        pad = x[:, :1].expand(B, w - 1, *x.shape[2:])
+        padded = torch.cat([pad, x], dim=1)                    # (B, T+w-1, *)
+        windows = padded.unfold(1, w, 1).movedim(-1, 2)        # (B, T, w, *)
+        return windows.reshape(B * T, w, *x.shape[2:])
 
-        Returns:
-            Scalar mean LPIPS over batch*time.
-        """
-        if pred.shape != target.shape:
-            raise ValueError(
-                f"pred and target must match, got {tuple(pred.shape)} vs {tuple(target.shape)}"
-            )
-        H, W, C, patch_size = self.H, self.W, self.C, self.patch_size
+    @torch.no_grad()
+    def encode_frames(self, video) -> torch.Tensor:
+        """(B,T,H,W,C) uint8 (numpy or tensor) -> (B,T,n_spatial,d_spatial)."""
+        if isinstance(video, np.ndarray):
+            video = torch.from_numpy(video)
+        v = video.to(self.device).float() / 255.0
+        v = v.permute(0, 1, 4, 2, 3).contiguous()              # (B,T,C,H,W)
+        B, T = v.shape[:2]
+        windows = self._slide(v)                               # (B*T,w,C,H,W)
+        patches = patchify(windows, self.patch_size)
+        z = self.tok.encode(patches)[:, -1]                    # last frame per window
+        z = z.reshape(B, T, self.n_latents, self.d_bottleneck)
+        return pack_bottleneck_to_spatial(z, n_spatial=self.n_spatial, k=self.pack_k)
 
-        recon_patches = torch.where(mae_mask, target, pred)
-        recon_img = unpatchify(recon_patches.float(), H, W, C, patch_size) # (B, T, C, H, W)
-        tgt_img = unpatchify(target.float(), H, W, C, patch_size) # (B, T, C, H, W)
-
-        # Images are already in [0, 1], so no need to clamp.
-        # recon_img = recon_img.clamp(0.0, 1.0)
-        # tgt_img = tgt_img.clamp(0.0, 1.0)
-
-        if C == 1:
-            recon_img = recon_img.repeat(1, 1, 3, 1, 1) 
-            tgt_img = tgt_img.repeat(1, 1, 3, 1, 1)
-            c_lpips = 3
-        elif C == 3:
-            c_lpips = 3
-        else:
-            raise ValueError(f"LPIPS expects C in {{1, 3}}, got {C}")
-
-        B, T = recon_img.shape[:2]
-        recon_flat = recon_img.reshape(B * T, c_lpips, H, W)
-        tgt_flat = tgt_img.reshape(B * T, c_lpips, H, W)
-
-        with torch.autocast(device_type=recon_flat.device.type, enabled=False):
-            lp = self.lpips_metric(
-                recon_flat.float(), tgt_flat.float(), normalize=True
-            )
-        return lp.mean()
+    @torch.no_grad()
+    def decode_latents(self, z: torch.Tensor) -> torch.Tensor:
+        """(B,T,n_spatial,d_spatial) -> images (B,T,C,H,W) in [0,1]."""
+        B, T = z.shape[:2]
+        latents = unpack_spatial_to_bottleneck(z.to(self.device), k=self.pack_k)
+        windows = self._slide(latents)                         # (B*T,w,Nl,Db)
+        patches = self.tok.decoder(windows)[:, -1]             # last frame per window
+        patches = patches.reshape(B, T, *patches.shape[-2:])
+        img = unpatchify(patches, self.H, self.W, C=self.C,
+                         patch_size=self.patch_size)
+        return img.clamp(0.0, 1.0)

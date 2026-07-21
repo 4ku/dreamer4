@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch.distributions import Normal, Categorical, TransformedDistribution
 from torch.distributions.transforms import TanhTransform
 
-from dreamer4.distributions import SymExpTwoHot
+from dreamer4.models.distributions import SymExpTwoHot
 
 
 # ---------------------------------------------------------------------------

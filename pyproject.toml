@@ -26,7 +26,19 @@ dependencies = [
     "pytest",
 ]
 
+[project.scripts]
+dreamer4-train-tokenizer = "dreamer4.train.train_tokenizer:main"
+dreamer4-train-dynamics = "dreamer4.train.train_dynamics:main"
+
 [project.optional-dependencies]
+dino = [
+    # DINOv3 perceptual loss backbone (dreamer4.perceptual.DinoV3Perceptual)
+    "transformers",
+]
+lerobot = [
+    # parquet reading for LeRobot state/actions (dreamer4.data.lerobot)
+    "pyarrow",
+]
 envs = [
     # Environments — install separately: uv pip install -e ".[envs]"
     # Requires Python <=3.12 for pre-built mujoco/labmaze wheels.
@@ -47,6 +59,3 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["dreamer4*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

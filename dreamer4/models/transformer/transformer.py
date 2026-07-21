@@ -62,11 +62,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dreamer4.transformer.modality import TokenLayout
-from dreamer4.transformer.norms import RMSNorm
-from dreamer4.transformer.layers import BlockCausalLayer
-from dreamer4.transformer.kv_cache import KVCache
-from dreamer4.transformer.rope import shift_rope
+from dreamer4.models.transformer.modality import TokenLayout
+from dreamer4.models.transformer.norms import RMSNorm
+from dreamer4.models.transformer.layers import BlockCausalLayer
+from dreamer4.models.transformer.kv_cache import KVCache
+from dreamer4.models.transformer.rope import shift_rope
 
 
 def patchify(images: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -189,7 +189,7 @@ class BlockCausalTransformer(nn.Module):
         Output: (B, T, S, D) same shape as input.
 
     Example:
-        >>> from dreamer4.transformer.modality import Modality, TokenLayout
+        >>> from dreamer4.models.transformer.modality import Modality, TokenLayout
         >>> layout = TokenLayout(n_latents=4, segments=((Modality.IMAGE, 16),))
         >>> model = BlockCausalTransformer(
         ...     d_model=64, n_heads=4, depth=4,

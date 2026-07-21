@@ -42,7 +42,7 @@ class KVCache:
         max_T: Maximum number of past frames the cache is allowed to hold.
             The transformer is responsible for enforcing this bound — when a
             commit would exceed ``max_T``, it evicts the oldest cached frames
-            (re-rotating the remaining K via :func:`dreamer4.transformer.rope.shift_rope`)
+            (re-rotating the remaining K via :func:`dreamer4.models.transformer.rope.shift_rope`)
             so that ``t_cached <= max_T`` always holds post-commit.
 
     Attributes:
