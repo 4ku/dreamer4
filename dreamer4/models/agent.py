@@ -1,18 +1,26 @@
 """
-Agent heads for Dreamer 4: policy, reward, and value prediction.
+Agent herads for Deamer 4 — ARCHITECTURE ONLY (the objectives live in
+:mod:`dreamer4.train.agent_objectives`, per the models/-vs-train/ layering).
 
-This module implements the three heads that consume agent token embeddings
-from the dynamics transformer, plus the objective functions for training them.
+The heads consume agent-token output embeddings from the dynamics
+transformer (``wm_agent`` space mode):
 
 Phase 2 (Agent Finetuning — paper Section 3.3, Eq. 9):
     - TaskEncoder produces agent token inputs conditioned on task identity.
-    - PolicyHead predicts actions via multi-token prediction (MTP, L=8).
-    - RewardHead predicts rewards via MTP with SymExpTwoHot output.
+    - PolicyHead predicts actions via multi-token prediction (MTP).
+    - RewardHead predicts rewards via MTP with SymExpTwoHot output. Episode
+      termination is DERIVED from it (gridworld: reward +1 <=> goal reached,
+      verified 0 disagreements in 47,695 transitions) rather than carried by
+      a dedicated head — see train.agent_objectives.continues_from_reward.
 
 Phase 3 (Imagination Training — paper Section 3.3, Eq. 10-11):
     - ValueHead predicts discounted returns with SymExpTwoHot output.
-    - TD(lambda) returns computed from imagined rollouts.
-    - PMPO policy objective with reverse KL to behavioral prior.
+
+Slot convention — ``POLICY_SLOT`` / ``REWARD_SLOT`` / ``VALUE_SLOT`` below.
+Each head reads ONE agent token, so with ``n_agent=3`` per timestep the
+labor is divided by position rather than pooled. The constants live here
+because the convention is a property of the heads, and both the trainer and
+the online evaluator must index the same way.
 
 Architecture note: agent tokens attend to all other modalities in the
 dynamics transformer (wm_agent mode), but no other modality can attend
@@ -21,16 +29,25 @@ back to agent tokens, preventing causal confusion of the world model.
 
 from __future__ import annotations
 
-import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Normal, Categorical, TransformedDistribution
 from torch.distributions.transforms import TanhTransform
 
 from dreamer4.models.distributions import SymExpTwoHot
+
+
+# ---------------------------------------------------------------------------
+# Agent-token slots — which token each head reads (see the module docstring).
+# Everything that indexes agent outputs (the trainer, the online evaluator)
+# imports these, so the assignment changes in exactly one place.
+# ---------------------------------------------------------------------------
+
+POLICY_SLOT = 0
+REWARD_SLOT = 1
+VALUE_SLOT = 2      # phase 3; reserved so warm-starting needs no arch change
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +288,44 @@ class PolicyHead(nn.Module):
             lp = d.log_prob(actions).sum(dim=-1)
             return actions, lp
 
+    def mode(self, params: torch.Tensor) -> torch.Tensor:
+        """
+        The deterministic ("greedy") action: argmax for discrete, the squashed
+        mean for continuous. Counterpart of :meth:`sample`; used when a policy
+        is deployed without exploration.
+
+        Args:
+            params: Output of ``forward()``.
+
+        Returns:
+            (*, action_dim) — long for discrete, float in (-1, 1) otherwise.
+        """
+        if self.action_type == "continuous":
+            return torch.tanh(self._base_normal(params).mean)
+        logits = params.reshape(*params.shape[:-1], self.action_dim,
+                                self.num_categories)
+        return logits.argmax(-1)
+
+    def action_to_vector(self, action: torch.Tensor) -> torch.Tensor:
+        """
+        Encode an action the way the world model consumes it (the unified data
+        contract: "categorical actions arrive one-hot"). Continuous actions
+        pass through; discrete class ids become one-hot rows.
+
+        Args:
+            action: (*, action_dim) — long class ids for discrete.
+
+        Returns:
+            (*, action_dim) continuous, or (*, action_dim * num_categories)
+            one-hot for discrete.
+        """
+        if self.action_type == "continuous":
+            return action.float()
+        onehot = torch.nn.functional.one_hot(action.long(),
+                                             self.num_categories).float()
+        return onehot.reshape(*action.shape[:-1],
+                              self.action_dim * self.num_categories)
+
     def entropy(self, params: torch.Tensor) -> torch.Tensor:
         """
         Entropy of the distribution (summed over action dims).
@@ -444,187 +499,3 @@ class ValueHead(nn.Module):
             (*) scalar values.
         """
         return self.twohot.decode(self.forward(agent_embed))
-
-
-# ---------------------------------------------------------------------------
-# Objective Functions
-# ---------------------------------------------------------------------------
-
-def compute_lambda_returns(
-    rewards: torch.Tensor,
-    values: torch.Tensor,
-    continues: torch.Tensor,
-    *,
-    gamma: float = 0.997,
-    lam: float = 0.95,
-) -> torch.Tensor:
-    """
-    Compute TD(lambda) returns (paper Eq. 10).
-
-        R_t^lambda = r_t + gamma * c_t * ((1 - lam) * v_{t+1} + lam * R_{t+1}^lambda)
-        R_T^lambda = v_T
-
-    The recursion is computed backwards from t=T to t=1.
-
-    Args:
-        rewards:   (B, T) scalar rewards.
-        values:    (B, T) predicted values (from the value head).
-        continues: (B, T) float — 1.0 for non-terminal, 0.0 for terminal.
-        gamma:     Discount factor.
-        lam:       Lambda for TD(lambda) mixing.
-
-    Returns:
-        (B, T) lambda-return targets.
-    """
-    B, T = rewards.shape
-    returns = torch.zeros_like(rewards)
-
-    # Bootstrap from the last value
-    returns[:, -1] = values[:, -1]
-
-    for t in reversed(range(T - 1)):
-        returns[:, t] = (
-            rewards[:, t]
-            + gamma * continues[:, t] * (
-                (1.0 - lam) * values[:, t + 1]
-                + lam * returns[:, t + 1]
-            )
-        )
-
-    return returns
-
-
-def pmpo_policy_loss(
-    log_probs: torch.Tensor,
-    advantages: torch.Tensor,
-    *,
-    prior_log_probs: Optional[torch.Tensor] = None,
-    beta: float = 0.3,
-) -> Tuple[torch.Tensor, dict[str, float]]:
-    """
-    REINFORCE policy loss with percentile + unit-variance advantage normalization.
-
-    First applies percentile normalization (5th-95th range) to remove outliers,
-    then normalizes to unit variance so the policy gradient has consistent
-    magnitude regardless of the absolute advantage scale.
-
-    Args:
-        log_probs:       (B, T) log pi_theta(a|s) under the current policy.
-        advantages:      (B, T) A_t = R_t^lambda - v_t.
-        prior_log_probs: (B, T) log pi_prior(a|s) from behavioral prior.
-        beta:            KL regularization strength.
-
-    Returns:
-        (loss, info) where info contains diagnostic scalars.
-    """
-    adv = advantages.detach()
-
-    pct_5 = torch.quantile(adv, 0.05)
-    pct_95 = torch.quantile(adv, 0.95)
-    scale = (pct_95 - pct_5).clamp_min(1e-8)
-    adv = adv / scale
-
-    adv = adv / adv.std().clamp_min(1e-5)
-
-    loss = -(log_probs * adv).mean()
-
-    kl_val = 0.0
-    if prior_log_probs is not None and beta > 0:
-        kl = (log_probs - prior_log_probs).clamp(-5.0, 5.0).mean()
-        kl_val = kl.item()
-        loss = loss + beta * kl
-
-    pos_frac = (adv >= 0).float().sum() / max(adv.numel(), 1)
-
-    info = {
-        "advantage_std": adv.std().item(),
-        "advantage_pos_frac": pos_frac.item(),
-        "kl_to_prior": kl_val,
-        "log_prob_mean": log_probs.mean().item(),
-    }
-
-    return loss, info
-
-
-def behavior_cloning_loss(
-    policy_head: PolicyHead,
-    agent_embed: torch.Tensor,
-    target_actions: torch.Tensor,
-    mtp_length: int = 8,
-) -> torch.Tensor:
-    """
-    Behavior cloning loss with multi-token prediction (paper Eq. 9).
-
-    Computes the negative log-likelihood of target actions under each MTP
-    head, averaged over all heads and valid time steps.
-
-        L = -(1/L) * sum_{n=0}^{L-1} log p(a_{t+n} | h_t)
-
-    Args:
-        policy_head:    PolicyHead instance.
-        agent_embed:    (B, T, d_model) agent token embeddings.
-        target_actions: (B, T, action_dim) ground-truth actions.
-        mtp_length:     MTP horizon (should match policy_head.mtp_length).
-
-    Returns:
-        Scalar BC loss.
-    """
-    L = min(mtp_length, policy_head.mtp_length)
-    B, T = agent_embed.shape[:2]
-
-    all_params = policy_head.forward_all(agent_embed)
-    total_loss = torch.tensor(0.0, device=agent_embed.device)
-    count = 0
-
-    for n in range(L):
-        valid_T = T - n
-        if valid_T <= 0:
-            break
-        params_n = all_params[n][:, :valid_T]        # (B, valid_T, ...)
-        actions_n = target_actions[:, n:n + valid_T]  # (B, valid_T, action_dim)
-        lp = policy_head.log_prob(params_n, actions_n)
-        total_loss = total_loss - lp.mean()
-        count += 1
-
-    return total_loss / max(count, 1)
-
-
-def reward_prediction_loss(
-    reward_head: RewardHead,
-    agent_embed: torch.Tensor,
-    target_rewards: torch.Tensor,
-    mtp_length: int = 8,
-) -> torch.Tensor:
-    """
-    Reward prediction loss with multi-token prediction (paper Eq. 9).
-
-    Computes cross-entropy of SymExpTwoHot logits against target rewards
-    for each MTP distance, averaged over all heads and valid time steps.
-
-    Args:
-        reward_head:    RewardHead instance.
-        agent_embed:    (B, T, d_model) agent token embeddings.
-        target_rewards: (B, T) scalar ground-truth rewards.
-        mtp_length:     MTP horizon.
-
-    Returns:
-        Scalar reward prediction loss.
-    """
-    L = min(mtp_length, reward_head.mtp_length)
-    B, T = agent_embed.shape[:2]
-
-    all_logits = reward_head.forward_all(agent_embed)
-    total_loss = torch.tensor(0.0, device=agent_embed.device)
-    count = 0
-
-    for n in range(L):
-        valid_T = T - n
-        if valid_T <= 0:
-            break
-        logits_n = all_logits[n][:, :valid_T]          # (B, valid_T, num_bins)
-        rewards_n = target_rewards[:, n:n + valid_T]    # (B, valid_T)
-        loss_n = reward_head.twohot.loss(logits_n, rewards_n)
-        total_loss = total_loss + loss_n
-        count += 1
-
-    return total_loss / max(count, 1)

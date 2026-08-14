@@ -13,7 +13,12 @@ Training objectives, data loading and evaluation live OUTSIDE this
 subpackage (``dreamer4.train``, ``dreamer4.data``, ``dreamer4.dynamics_eval``).
 """
 
+from dreamer4.models.agent import (POLICY_SLOT, REWARD_SLOT, VALUE_SLOT,
+                                   PolicyHead, RewardHead, TaskEncoder,
+                                   ValueHead)
 from dreamer4.models.dynamics import DynamicsModel
 from dreamer4.models.tokenizer import Decoder, Encoder, FrozenTokenizer, Tokenizer
 
-__all__ = ["Decoder", "DynamicsModel", "Encoder", "FrozenTokenizer", "Tokenizer"]
+__all__ = ["POLICY_SLOT", "REWARD_SLOT", "VALUE_SLOT", "Decoder",
+           "DynamicsModel", "Encoder", "FrozenTokenizer", "PolicyHead",
+           "RewardHead", "TaskEncoder", "Tokenizer", "ValueHead"]

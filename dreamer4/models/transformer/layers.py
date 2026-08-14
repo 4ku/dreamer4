@@ -50,7 +50,7 @@ class SpaceAttention(nn.Module):
     Attention within each time step (across spatial tokens).
 
     Applies modality-aware attention: which tokens can see which is controlled
-    by the layout and mode (encoder/decoder/wm_agent_isolated/wm_agent).
+    by the layout and mode (encoder/decoder/decoder_cross/wm_agent).
 
     Applies 1D RoPE over spatial positions.
 

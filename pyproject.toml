@@ -29,6 +29,8 @@ dependencies = [
 [project.scripts]
 dreamer4-train-tokenizer = "dreamer4.train.train_tokenizer:main"
 dreamer4-train-dynamics = "dreamer4.train.train_dynamics:main"
+dreamer4-train-agent = "dreamer4.train.train_agent:main"
+dreamer4-eval-agent = "dreamer4.agent_eval:main"
 
 [project.optional-dependencies]
 dino = [

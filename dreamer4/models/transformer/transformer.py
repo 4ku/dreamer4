@@ -52,7 +52,7 @@ USAGE:
         ))
         transformer = BlockCausalTransformer(
             d_model=512, n_heads=8, n_kv_heads=2, depth=16,
-            layout=layout, space_mode="wm_agent_isolated", ...
+            layout=layout, space_mode="wm_agent", ...
         )
 """
 
@@ -171,8 +171,8 @@ class BlockCausalTransformer(nn.Module):
         depth:            Number of transformer layers.
         layout:           TokenLayout describing the spatial dimension.
         space_mode:       Modality mask mode ("encoder", "decoder",
-                         nt_isolated", "wm_agent").
-        n_kv_heads:       Number  "wm_ageof KV heads for GQA. Default = n_heads.
+                          "decoder_cross", "wm_agent").
+        n_kv_heads:       Number of KV heads for GQA. Default = n_heads.
         mlp_ratio:        MLP hidden = d_model * mlp_ratio (default 8/3).
         time_every:       Apply time attention every N layers (default 4).
         dropout:          Dropout rate (default 0.0).

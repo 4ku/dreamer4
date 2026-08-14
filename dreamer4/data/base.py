@@ -12,10 +12,20 @@ regardless of how the data is stored:
                                          LeRobot passes state through raw),
      "actions": (T-1, D_a)     float32 — optional, action VECTORS; a[t]
                                          drives the t -> t+1 transition
-                                         (categorical actions arrive one-hot)}
+                                         (categorical actions arrive one-hot),
+     "rewards": (T-1,)         float32 — optional, aligned with actions:
+                                         rewards[t] is the reward of the
+                                         t -> t+1 transition,
+     "terminals": (T-1,)       bool    — optional, aligned with actions:
+                                         True iff the t -> t+1 transition
+                                         ends the episode (frame t+1 is the
+                                         terminal observation)}
 
 Datasets with actions expose :attr:`action_dim`; the dynamics trainer
-requires it, the tokenizer trainer never asks.
+requires it, the tokenizer trainer never asks. Rewards/terminals ride along
+wherever the storage records them (gridworld shards do; LeRobot demos have
+no reward concept) — the agent trainer requires them, phase-1 trainers
+ignore them.
 
 Storage formats are special cases in sibling modules (``gridworld``,
 ``lerobot``); :func:`dreamer4.data.open_video_dataset` picks one by looking
@@ -83,6 +93,70 @@ class EpisodeVideoDataset:
         """Per-step action vector size, or None if clips carry no actions."""
         return None
 
+    def episode_meta(self, i: int) -> Dict:
+        """
+        Optional per-episode collector metadata (data-quality signals like
+        gridworld's ``noisiness``). Empty when the storage records none;
+        the agent trainer uses it to filter BC data, nothing else asks.
+        """
+        return {}
+
+    def bc_weight(self, i: int) -> float:
+        """
+        How much episode ``i`` should be IMITATED: 1.0 = clone it, 0.0 = use
+        it for the other heads but never for behavior cloning.
+
+        Defaults to 1.0 — "every recording is a demonstration", which is true
+        of teleop datasets. A collector that deliberately records mixed
+        quality (gridworld dials expert->random) overrides this; the criterion
+        is the DATASET's, so no trainer has to know what "noisiness" means.
+        """
+        return 1.0
+
+    # -- optional live-environment hooks (online agent evaluation) ----------
+    #
+    # A dataset that was recorded from a simulator can say how to reopen that
+    # simulator, so a trained policy can be rolled in it. Offline-only data
+    # (LeRobot demonstrations) leaves these unimplemented and simply has no
+    # online eval.
+
+    def env_spec(self) -> Optional[Dict]:
+        """
+        ``{"id": <gymnasium id>, "kwargs": {...}}`` for the environment this
+        data was recorded from, or None if there is no such environment.
+        """
+        return None
+
+    def continues_from_reward(self, reward_pred):
+        """
+        The domain's rule for spotting a terminal frame from a PREDICTED
+        reward: ``(B,T) -> (B,T) float`` (1 = keep going, 0 = terminal), or
+        None when this domain has no such rule.
+
+        Phase 3 needs it because a dream has no recorded terminals — the
+        reward head is the only signal available. Whether it is usable is a
+        property of the ENVIRONMENT, not of the model: it holds when
+        "rewarding" and "terminal" are the same event. Datasets where they
+        differ (a milestone reward mid-episode, an episode that ends in
+        failure with no reward) return None and need a real terminal
+        predictor instead. The trainer's ``term_f1`` gate measures this rule
+        on held-out data before phase 3 leans on it.
+        """
+        return None
+
+    def proprio_from_info(self, info: Dict) -> Optional[np.ndarray]:
+        """
+        One step's proprio ``(D_p,) float32`` read from a live env's ``info``
+        dict — the exact state, never inferred from the render. This is the
+        ONLY proprio source the online policy uses; a proprio model cannot be
+        evaluated in an env that does not report it.
+
+        It must produce the same convention the training clips carry — for
+        gridworld both come from the positions the collector recorded from
+        the env, scaled the same way (a test pins them together).
+        """
+        return None
+
     # -- optional domain-specific evaluation -------------------------------
 
     def eval_metrics(self, gt: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
@@ -138,6 +212,23 @@ class MergedEpisodeDataset(EpisodeVideoDataset):
     def _load_clip(self, i: int, start: int, length: int) -> dict:
         ds, j = self._locate(i)
         return ds.clip(j, start, length)
+
+    def episode_meta(self, i: int) -> Dict:
+        ds, j = self._locate(i)
+        return ds.episode_meta(j)
+
+    def bc_weight(self, i: int) -> float:
+        ds, j = self._locate(i)
+        return ds.bc_weight(j)
+
+    def env_spec(self) -> Optional[Dict]:
+        return self.parts[0].env_spec()
+
+    def proprio_from_info(self, info: Dict) -> Optional[np.ndarray]:
+        return self.parts[0].proprio_from_info(info)
+
+    def continues_from_reward(self, reward_pred):
+        return self.parts[0].continues_from_reward(reward_pred)
 
     @property
     def proprio_dim(self) -> Optional[int]:

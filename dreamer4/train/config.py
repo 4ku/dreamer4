@@ -248,6 +248,109 @@ class DynamicsTrainConfig:
 
 
 # ---------------------------------------------------------------------------
+# Agent training config (phase 2 — BC + reward + continue on agent tokens)
+# ---------------------------------------------------------------------------
+#
+# The dynamics ARCHITECTURE is not configured here: the agent trainer
+# requires ``--init_from`` (a train_dynamics checkpoint) and rebuilds that
+# exact model with ``n_agent`` agent tokens in ``wm_agent`` mode. Defaults =
+# the recipe: warm-start the whole transformer at the proven ft lr 5e-5,
+# fresh heads at 3e-4, keep the phase-1 clean-context WM loss running
+# (paper: "we continue to apply the video prediction loss"), BC only on
+# low-noise non-sticky episodes (the paper's task-relevant 50% analog).
+
+
+@dataclass
+class AgentDataConfig:
+    """What to finetune on. Episodes must carry actions AND rewards."""
+
+    path: str = ""              # dataset dir(s), comma-separated
+    val_frac: float = 0.05      # episode fraction held out for validation
+    seq_len: int = 4            # forward window — MUST stay the WM's trained window
+    batch_size: int = 64        # world-model (clean-context) batch
+    agent_batch_size: int = 64  # agent-heads batch (the second forward)
+    proprio: str = "player"     # must match the warm-start dynamics model
+    bc_frac: float = 0.5        # agent-batch fraction drawn from episodes the
+                                #   dataset says are worth imitating (paper's
+                                #   50/50 relevant/uniform). NOT a BC-quality
+                                #   knob — BC already ignores the rest via the
+                                #   row weight. It buys the REWARD head states
+                                #   an expert never visits, which is exactly
+                                #   where a phase-3 dream wanders.
+    end_frac: float = 0.25      # per-sample prob of pinning the window to the
+                                #   episode END (terminal frames for the
+                                #   reward heads)
+    episode_cache: int = 64     # decoded episodes kept while pre-encoding
+
+
+@dataclass
+class AgentModelConfig:
+    """Agent-token + head architecture (see dreamer4.models.agent)."""
+
+    n_agent: int = 3            # agent tokens per timestep; slots: 0 policy,
+                                #   1 reward, 2 value (phase 3)
+    num_tasks: int = 1          # gridworld is single-task (constant id 0)
+    mtp_length: int = 3         # MTP horizon; window 4 supports n=0..2
+                                #   (paper L=8 needs long contexts)
+    head_mlp_depth: int = 2     # hidden layers in each head MLP
+    head_mlp_ratio: float = 2.0  # head hidden = d_model * this
+    num_bins: int = 255         # SymExpTwoHot bins (reward/value heads)
+    bin_low: float = -20.0      # two-hot range in SYMLOG space; +-20 covers
+    bin_high: float = 20.0      #   +-e^20 (Minecraft-scale) — gridworld's
+                                #   +-1 rewards decode cleaner on +-3
+
+
+@dataclass
+class AgentLossConfig:
+    """Agent loss terms; RELATIVE weights (everything is RMS-normalized
+    together with the WM terms — paper: no hand-tuned scales)."""
+
+    bc_weight: float = 1.0
+    reward_weight: float = 0.3      # near-trivial modality: small weight
+                                    #   suffices (2026-07-04 lossnorm rule).
+                                    #   Termination is DERIVED from this head
+                                    #   (no continue head) — gated by term_f1.
+
+
+@dataclass
+class AgentOnlineEvalConfig:
+    """Online policy evaluation in the real GridWorld-v0 env."""
+
+    episodes: int = 300         # episodes per online eval
+    seed: int = 1000000         # env layout seeds (disjoint from the dataset's)
+    every: int = 0              # eval every N steps (0 = only after training)
+
+
+@dataclass
+class AgentTrainConfig:
+    """Top-level config for ``dreamer4.train.train_agent`` (phase 2)."""
+
+    data: AgentDataConfig = field(default_factory=AgentDataConfig)
+    agent: AgentModelConfig = field(default_factory=AgentModelConfig)
+    loss: AgentLossConfig = field(default_factory=AgentLossConfig)
+    tokenizer: TokenizerRefConfig = field(default_factory=TokenizerRefConfig)
+                                # empty ckpt = reuse the dynamics checkpoint's
+    objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
+    optim: OptimConfig = field(default_factory=lambda: OptimConfig(
+        lr=5e-5, warmup=200, grad_clip=0.5, amp=False))
+    eval: DynamicsEvalConfig = field(default_factory=DynamicsEvalConfig)
+    online: AgentOnlineEvalConfig = field(default_factory=AgentOnlineEvalConfig)
+
+    out: str = "runs/agent"
+    steps: int = 20000
+    seed: int = 0
+    device: str = "cuda"
+    head_lr: float = 3e-4       # fresh heads (policy/reward/continue/task)
+    log_every: int = 50
+    val_every: int = 2000
+    ckpt_every: int = 4000
+    resume: bool = False
+    init_from: str = ""         # REQUIRED: train_dynamics checkpoint to finetune
+    max_minutes: float = 0.0
+    tag: str = ""
+
+
+# ---------------------------------------------------------------------------
 # dict <-> dataclass
 # ---------------------------------------------------------------------------
 

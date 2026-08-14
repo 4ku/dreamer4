@@ -49,8 +49,8 @@ class SymExpTwoHot(nn.Module):
     def __init__(
         self,
         num_bins: int = 255,
-        low: float = -20.0,
-        high: float = 20.0,
+        low: float = -2.0,
+        high: float = 2.0,
     ):
         super().__init__()
         self.num_bins = num_bins

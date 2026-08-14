@@ -71,16 +71,24 @@ OBJECTIVES = ("clean_context", "shortcut_forcing")
 
 def build_dynamics(model: DynamicsModelConfig, *, n_spatial: int,
                    d_spatial: int, action_dim: int,
-                   d_proprio: Optional[int], max_T: int) -> DynamicsModel:
-    """``action_dim`` counts the ALIGNED vector (dataset dim + start flag)."""
+                   d_proprio: Optional[int], max_T: int, n_agent: int = 0,
+                   space_mode: str = "wm_agent") -> DynamicsModel:
+    """``action_dim`` counts the ALIGNED vector (dataset dim + start flag).
+
+    Phase-1 pretraining uses the default ``n_agent=0``: with no AGENT segment
+    the ``wm_agent`` mask degenerates to full world-to-world mixing. The agent
+    trainer rebuilds the same checkpointed architecture with ``n_agent > 0`` —
+    world-token outputs are unchanged by construction (world rows never attend
+    AGENT columns), which the no-op test asserts.
+    """
     return DynamicsModel(
         d_model=model.d_model, d_spatial=d_spatial, n_spatial=n_spatial,
-        n_register=model.n_register, n_agent=0, n_heads=model.n_heads,
+        n_register=model.n_register, n_agent=n_agent, n_heads=model.n_heads,
         n_kv_heads=model.n_kv_heads, depth=model.depth, k_max=model.k_max,
         action_dim=action_dim, mlp_ratio=8 / 3, time_every=model.time_every,
         use_qk_norm=True,
         logit_cap=(model.logit_cap if model.logit_cap > 0 else None),
-        space_mode="wm_agent_isolated", max_T=max_T, d_proprio=d_proprio)
+        space_mode=space_mode, max_T=max_T, d_proprio=d_proprio)
 
 
 def load_dynamics_checkpoint(path, *, device: str | torch.device = "cpu",
@@ -116,7 +124,10 @@ def encode_episodes(tokenizer: FrozenTokenizer, dataset: EpisodeVideoDataset,
     Encode whole episodes ONCE into cached latents (fp16, on device).
 
     Each entry: {"z": (Ti,Nz,Dz) fp16, "actions": (Ti-1,Da) float32,
-    "proprio"?: (Ti,d_p) float32, "video"?: (Ti,H,W,C) uint8}. Long episodes
+    "proprio"?: (Ti,d_p) float32, "video"?: (Ti,H,W,C) uint8,
+    "rewards"?/"terminals"?: (Ti-1,) when the dataset records them,
+    "meta"?: collector metadata dict (see ``episode_meta``),
+    "bc_weight": how much to imitate this episode (see ``bc_weight``)}. Long episodes
     are encoded in chunks with ``history-1`` frames of left context, which
     yields latents identical to a single pass (the sliding window sees at
     most ``history`` frames back).
@@ -133,8 +144,13 @@ def encode_episodes(tokenizer: FrozenTokenizer, dataset: EpisodeVideoDataset,
             z = tokenizer.encode_frames(video[None, lo : s + chunk])
             parts.append(z[0, s - lo :].to(torch.float16))
         entry = {"z": torch.cat(parts, 0), "actions": clip["actions"]}
-        if "proprio" in clip:
-            entry["proprio"] = clip["proprio"]
+        for key in ("proprio", "rewards", "terminals"):
+            if key in clip:
+                entry[key] = clip[key]
+        meta = dataset.episode_meta(int(i))
+        if meta:
+            entry["meta"] = meta
+        entry["bc_weight"] = dataset.bc_weight(int(i))
         if keep_video:
             entry["video"] = video
         episodes.append(entry)

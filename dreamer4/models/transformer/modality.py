@@ -24,20 +24,20 @@ MODES AND THEIR ATTENTION PATTERNS:
     - Non-LATENT tokens can attend to themselves AND to LATENT tokens
     Intuition: patches read from the latent summary to reconstruct the image.
 
-  "wm_agent_isolated" mode (used during world model pretraining):
-    - All non-AGENT tokens can attend to each other (full mixing)
-    - AGENT tokens can only attend to other AGENT tokens
-    - Non-AGENT tokens CANNOT see AGENT tokens
-    Intuition: agent tokens are "invisible" during pretraining, so the
-    world model doesn't learn to depend on them. This prevents
-    "causal confusion" — the world model should predict the future based
-    on actions, not based on what the agent intends to do.
-
-  "wm_agent" mode (used during agent finetuning):
+  "wm_agent" mode (the world model, both phases):
     - AGENT tokens can attend to ALL tokens (including actions, images, etc.)
-    - Non-AGENT tokens still CANNOT see AGENT tokens
+    - Non-AGENT tokens CANNOT see AGENT tokens
     Intuition: the agent reads the world state to predict actions and rewards,
-    but the world model's predictions remain independent of agent tokens.
+    but the world model's predictions remain independent of agent tokens —
+    this prevents "causal confusion", where the world model would learn to
+    predict the future from what the agent intends rather than from actions.
+
+    Phase-1 pretraining uses this same mode with ``n_agent=0``: with no AGENT
+    segment the mask degenerates to "every world token sees every world
+    token", which IS the pretraining pattern. (A separate
+    ``wm_agent_isolated`` mode — agent tokens present but blind — existed
+    until 2026-07-24; nothing ever trained with it, since pretraining carries
+    no agent tokens at all, so it was removed as dead weight.)
 """
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ def build_space_attn_mask(layout: TokenLayout, mode: str) -> torch.Tensor:
 
     Args:
         layout: The TokenLayout describing the spatial dimension.
-        mode: One of "encoder", "decoder", "wm_agent_isolated", "wm_agent".
+        mode: One of "encoder", "decoder", "decoder_cross", "wm_agent".
 
     Returns:
         (S, S) boolean tensor.
@@ -199,19 +199,6 @@ def build_space_attn_mask(layout: TokenLayout, mode: str) -> torch.Tensor:
         # every spatial output is forced to be a function of the latents.
         mask = is_k_lat.expand(S, S).clone()
 
-    elif mode == "wm_agent_isolated":
-        # Agent tokens only see agent tokens
-        # Non-agent tokens see everything EXCEPT agent tokens
-        is_q_agent = q_mod == int(Modality.AGENT)  # (S, 1)
-        is_k_agent = k_mod == int(Modality.AGENT)  # (1, S)
-
-        # Start with full connectivity
-        mask = torch.ones(S, S, dtype=torch.bool)
-        # Non-agent queries: block agent keys
-        mask = torch.where(~is_q_agent & is_k_agent, False, mask)
-        # Agent queries: only see agent keys
-        mask = torch.where(is_q_agent & ~is_k_agent, False, mask)
-
     elif mode == "wm_agent":
         # Agent tokens can see everything
         # Non-agent tokens cannot see agent tokens
@@ -225,7 +212,7 @@ def build_space_attn_mask(layout: TokenLayout, mode: str) -> torch.Tensor:
     else:
         raise ValueError(
             f"Unknown mode '{mode}'. Choose from: "
-            "'encoder', 'decoder', 'wm_agent_isolated', 'wm_agent'"
+            "'encoder', 'decoder', 'decoder_cross', 'wm_agent'"
         )
 
     return mask

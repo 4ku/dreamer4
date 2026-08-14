@@ -282,8 +282,8 @@ class DynamicsModel(nn.Module):
         [action(1), shortcut_signal(1), spatial(n_spatial), register(n_register), (agent(n_agent))]
 
     Uses the block-causal transformer backbone with space_mode controlling
-    the attention pattern (wm_agent_isolated for pretraining, wm_agent for
-    agent finetuning).
+    the attention pattern (``wm_agent`` throughout; pretraining just runs it
+    with ``n_agent=0``).
 
     The model predicts clean representations z1 (x-prediction) via a
     zero-initialized flow head, which prevents error accumulation in long
@@ -308,7 +308,7 @@ class DynamicsModel(nn.Module):
         dropout:            Dropout rate.
         use_qk_norm:        Use QKNorm in attention.
         logit_cap:          Attention logit soft capping.
-        space_mode:         Attention mode ("wm_agent_isolated" or "wm_agent").
+        space_mode:         Attention mode (the world model uses "wm_agent").
         max_T:              Maximum time steps for RoPE cache.
     """
 
