@@ -109,6 +109,7 @@ class AgentPolicy:
                  window: int = 4, tau_ctx: float = 0.1, task_id: int = 0,
                  greedy: bool = True,
                  proprio_from_info: Optional[Callable[[Dict], np.ndarray]] = None,
+                 continues_from_reward: Optional[Callable[[Any], Any]] = None,
                  reward_head=None, device: str | torch.device = "cuda"):
         if dynamics.d_proprio is not None and proprio_from_info is None:
             raise ValueError(
@@ -116,6 +117,11 @@ class AgentPolicy:
                 "required — pass the training dataset's proprio_from_info "
                 "(an env that cannot report its state cannot host this model)")
         self.proprio_from_info = proprio_from_info
+        # "does this reward mean the episode ended" is a fact about the ENV,
+        # not about the agent, so it arrives from the dataset like the proprio
+        # reader does. Without it the readouts simply omit the flag rather
+        # than invent a threshold.
+        self.continues_from_reward = continues_from_reward
         # optional: lets act_detailed report what the reward head predicts
         self.reward_head = None if reward_head is None else reward_head.eval()
         self.dynamics = dynamics.eval()
@@ -243,23 +249,64 @@ class AgentPolicy:
             action = (self.policy_head.mode(params) if self.greedy
                       else self.policy_head.sample(params)[0])
 
+        diag = {
+            **self._read_heads(slots),
+            "chosen": int(action.reshape(-1)[0]) if discrete else None,
+            "overridden": override is not None,
+        }
+        return self._commit(action), diag
+
+    def _read_heads(self, slots: torch.Tensor) -> Dict[str, Any]:
+        """The heads' answers for the frame ``slots`` came from: the action
+        distribution, the reward earned ARRIVING here, and the continue flag
+        the env's rule derives from it."""
         probs = None
-        if discrete:
+        if self.policy_head.action_type == "discrete":
+            params = self.policy_head(slots[POLICY_SLOT], head_idx=0)
             logits = params.reshape(self.policy_head.action_dim,
                                     self.policy_head.num_categories)
             probs = torch.softmax(logits, -1)[0].cpu().numpy().tolist()
         reward_pred = float(self.reward_head.predict(slots[REWARD_SLOT])) \
             if self.reward_head is not None else None
-        diag = {
-            "probs": probs,
-            "reward_pred": reward_pred,
-            # the phase-3 dream-stop rule, shown live
-            "continue_pred": (None if reward_pred is None
-                              else float(reward_pred <= 0.5)),
-            "chosen": int(action.reshape(-1)[0]) if discrete else None,
-            "overridden": override is not None,
-        }
-        return self._commit(action), diag
+        cont = None
+        if reward_pred is not None and self.continues_from_reward is not None:
+            # the phase-3 dream-stop rule, shown live. The hook itself returns
+            # None in domains where "rewarding" and "terminal" differ.
+            flags = self.continues_from_reward(torch.as_tensor([reward_pred]))
+            cont = None if flags is None else float(flags.reshape(-1)[0])
+        return {"probs": probs, "reward_pred": reward_pred,
+                "continue_pred": cont}
+
+    @torch.no_grad()
+    def peek(self, obs: np.ndarray, info: Optional[Dict] = None
+             ) -> Dict[str, Any]:
+        """
+        What the heads read off THIS frame, **without consuming it**.
+
+        :meth:`act_detailed` can only answer for a frame it is about to leave,
+        so the frame you are looking at after a step has never been shown to
+        the model — and a terminal frame never will be, because the episode
+        ends first. That last one is the interesting case: the reward head's
+        whole job is to recognise "I have arrived somewhere that pays", and
+        phase 3 stops dreams on exactly this readout.
+
+        Runs the same forward as :meth:`act_detailed` and then rewinds the
+        history, so it costs one frame of compute and changes nothing —
+        including the RNG stream, which is restored on the way out. Without
+        that, merely *watching* an episode would consume the draws the context
+        corruption makes and send a seeded episode down a different path than
+        the same seed evaluated headless. (The corruption is still redrawn per
+        call, so two reads of one frame can differ in the last decimal.)
+        """
+        marks = (len(self._frames), len(self._latents), len(self._proprios))
+        devices = [self.device] if self.device.type == "cuda" else []
+        try:
+            with torch.random.fork_rng(devices=devices):
+                return self._read_heads(self._agent_slots(obs, info))
+        finally:
+            for seq, n in zip((self._frames, self._latents, self._proprios),
+                              marks):
+                del seq[n:]
 
 
 def make_env(spec: Optional[Dict], **overrides):

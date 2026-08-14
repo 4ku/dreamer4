@@ -147,9 +147,14 @@ def load_agent_policy(path, *, device: str | torch.device = "cuda",
     Checkpoint -> ``(policy, env_spec)`` for online evaluation. Open the env
     with ``agent_eval.make_env(env_spec)``.
 
-    A proprio model also needs its proprio reader: the checkpoint records the
-    dataset path, and that dataset's ``proprio_from_info`` reads the env state
-    in the same convention its training clips used.
+    The env-specific readers come from the training dataset, which the
+    checkpoint records by path: ``proprio_from_info`` (required by a proprio
+    model) reads the env state in the same convention its clips used, and
+    ``continues_from_reward`` is the rule that turns a predicted reward into
+    "the episode ended here". Both are facts about the environment, so
+    neither belongs in the deployment loop. A dataset that is not on this
+    machine costs only those readouts — unless the model needs proprio, in
+    which case it cannot be deployed at all and the error says so.
     """
     modules, ckpt = load_agent_checkpoint(path, device=device)
     meta = ckpt["latent_meta"]
@@ -158,17 +163,22 @@ def load_agent_policy(path, *, device: str | torch.device = "cuda",
                                 pack_k=tok["pack_k"],
                                 decoder_ckpt=(tok["decoder_ckpt"] or None),
                                 device=device)
-    proprio_from_info = None
-    if modules["dynamics"].d_proprio is not None:
-        cfg_data = ckpt["config"]["data"]
-        proprio_from_info = open_video_dataset(
-            cfg_data["path"], proprio=cfg_data["proprio"],
-            actions=True).proprio_from_info
+    needs_proprio = modules["dynamics"].d_proprio is not None
+    cfg_data = ckpt["config"]["data"]
+    try:
+        dataset = open_video_dataset(cfg_data["path"],
+                                     proprio=cfg_data["proprio"], actions=True)
+    except Exception:
+        if needs_proprio:
+            raise
+        dataset = None
     policy = AgentPolicy(
         dynamics=modules["dynamics"], task_encoder=modules["task"],
         policy_head=modules["policy"], tokenizer=tokenizer,
         window=meta["window"], tau_ctx=meta["tau_ctx"], greedy=greedy,
-        proprio_from_info=proprio_from_info,
+        proprio_from_info=(dataset.proprio_from_info if needs_proprio else None),
+        continues_from_reward=(None if dataset is None
+                               else dataset.continues_from_reward),
         reward_head=modules["reward"], device=device)
     spec = ckpt.get("env_spec")
     if spec is None and ckpt.get("env_kwargs"):     # pre-2026-08-11 ckpts
