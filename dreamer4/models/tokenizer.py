@@ -1,41 +1,45 @@
 """
-Causal Tokenizer for Dreamer 4.
+Causal video tokenizer for Dreamer 4 — phase 1a of the training chain.
 
-Compresses raw video frames into continuous latent representations (Encoder)
-and reconstructs frames from latents (Decoder). Both components use the
-block-causal transformer backbone and are causal in time, enabling
-frame-by-frame decoding for interactive inference.
+:class:`Encoder` compresses raw video frames into a small continuous latent per
+timestep; :class:`Decoder` reconstructs frames from those latents. Both use the
+block-causal transformer backbone and are causal in time, so frames can be
+decoded one at a time during interactive inference.
 
-Also here: :class:`FrozenTokenizer` — a trained checkpoint wrapped as the
-frozen pixels<->latents codec that dynamics training and inference consume
-(sliding temporal history + bottleneck packing).
+Trained by :mod:`dreamer4.train.train_tokenizer` on a reconstruction +
+perceptual objective, then FROZEN: the dynamics model, the K=1 fine-tune, the
+readout heads and PMPO all run on this latent space, so retraining the
+tokenizer invalidates every downstream checkpoint.
 
-Paper reference: Section 3.1, Figure 2(a), Eq. 5.
+Encoder:
+    patches (B, T, Np, patch_dim)
+      -> linear to d_model
+      -> MAE patch masking (training only)
+      -> prepend n_latents learned latent tokens
+      -> BlockCausalTransformer ("encoder" mask)
+      -> take the latent tokens
+      -> linear to d_bottleneck -> tanh
+    output: z (B, T, n_latents, d_bottleneck) in [-1, 1]
 
-Architecture (Encoder):
-    patches (B,T,Np,Dp)
-      -> linear project to d_model
-      -> MAE masking (p ~ U(0, 0.9))
-      -> prepend N learned latent tokens
-      -> BlockCausalTransformer (encoder mode)
-      -> extract latent tokens
-      -> linear project to d_bottleneck
-      -> tanh
-    output: (B,T,N_latents,d_bottleneck) in [-1, 1]
+Decoder:
+    z (B, T, n_latents, d_bottleneck)
+      -> linear to d_model
+      -> append n_patches learned query tokens
+      -> BlockCausalTransformer ("decoder" or "decoder_cross" mask)
+      -> take the patch tokens
+      -> linear to patch_dim -> sigmoid
+    output: patches (B, T, Np, patch_dim) in [0, 1]
 
-Architecture (Decoder):
-    z (B,T,N_latents,d_bottleneck)
-      -> linear project up to d_model
-      -> append N_patches learned query tokens
-      -> BlockCausalTransformer (decoder mode)
-      -> extract patch tokens
-      -> linear project to patch_dim
-      -> sigmoid
-    output: (B,T,Np,Dp) in [0, 1]
+Attention within a timestep: in the encoder the latent tokens read from every
+modality while each modality otherwise only sees itself; in the decoder the
+patch queries read from the latents ("decoder_cross" lets them read from the
+latents only).
 
-Attention patterns:
-    Encoder: latents attend to all tokens; each modality only sees itself.
-    Decoder: latents attend to latents only; patches see themselves + latents.
+:class:`FrozenTokenizer` is the deployment form — a trained checkpoint wrapped
+as the pixels <-> packed-latents codec that dynamics training and inference
+consume (sliding temporal history + bottleneck packing).
+
+Paper reference: section 3.1, figure 2(a), eq. 5.
 """
 
 from __future__ import annotations
@@ -135,13 +139,11 @@ class Encoder(nn.Module):
         mae_p_min:     Minimum MAE masking probability.
         mae_p_max:     Maximum MAE masking probability.
         max_T:         Maximum time steps for RoPE cache.
-        d_proprio:     Optional proprioceptive input dimension (e.g. robot joint
-                       state, or player position on the gridworld). When set, one
-                       PROPRIO token per timestep is appended after the patches.
-                       Per the paper's multi-modality rule, latent tokens attend to
-                       all modalities while each modality attends only within
-                       itself — the existing "encoder" mask already implements
-                       this, so no masking changes are needed.
+        d_proprio:     Optional proprioceptive input width (robot joint state,
+                       agent position, ...). When set, one PROPRIO token per
+                       timestep is appended after the patches; the "encoder"
+                       mask already gives the latent tokens access to it while
+                       keeping each modality otherwise self-contained.
     """
 
     def __init__(
@@ -208,14 +210,17 @@ class Encoder(nn.Module):
         self, patch_tokens: torch.Tensor, proprio: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Encode one clip of patches into bottleneck latents.
+
         Args:
             patch_tokens: (B, T, n_patches, patch_dim) raw patch vectors.
             proprio:      (B, T, d_proprio) proprioceptive state; required iff the
                           encoder was built with ``d_proprio``.
 
         Returns:
-            z: (B, T, N_latents, d_bottleneck) in [-1, 1].
-            aux: mae_mask for loss computation.
+            z:        (B, T, n_latents, d_bottleneck) in [-1, 1].
+            mae_mask: (B, T, n_patches, 1) bool, True where a patch was masked
+                      (all False in eval mode or when masking is disabled).
         """
         B, T, n_patches, _ = patch_tokens.shape
         assert n_patches == self.n_patches
@@ -259,7 +264,13 @@ class Decoder(nn.Module):
         dropout:      Dropout rate.
         use_qk_norm:  Use QKNorm in attention.
         logit_cap:    Logit soft capping value.
+        space_mode:   Attention mask used to decode: "decoder" (patch queries
+                      see the other patches and the latents) or "decoder_cross"
+                      (patch queries see the latents only, which removes the
+                      constant-output shortcut that collapses a naive decoder).
         max_T:        Maximum time steps for RoPE cache.
+        d_proprio:    Optional proprioceptive width; when set, one PROPRIO query
+                      token is decoded back to the proprio vector.
     """
 
     def __init__(
@@ -296,10 +307,8 @@ class Decoder(nn.Module):
 
         segments = [(Modality.IMAGE, n_patches)]
         if d_proprio is not None:
-            # one learned PROPRIO query decoded back to the proprio vector; per the
-            # paper each decoder modality attends within itself and to the latents
-            # ("decoder" mode) or, under "decoder_cross", to the latents only —
-            # both existing masks handle the extra segment unchanged.
+            # one learned PROPRIO query token, decoded back to the proprio
+            # vector; both decoder masks handle the extra segment unchanged
             self.proprio_query = nn.Parameter(torch.empty(1, d_model))
             nn.init.normal_(self.proprio_query, std=0.02)
             self.proprio_head = nn.Linear(d_model, d_proprio)
@@ -327,8 +336,10 @@ class Decoder(nn.Module):
 
     def forward(self, z: torch.Tensor):
         """
+        Reconstruct one clip of patches from bottleneck latents.
+
         Args:
-            z: (B, T, N_latents, d_bottleneck) bottleneck representations.
+            z: (B, T, n_latents, d_bottleneck) bottleneck representations.
 
         Returns:
             (B, T, Np, patch_dim) reconstructed patches in [0, 1]; when the decoder
@@ -339,7 +350,7 @@ class Decoder(nn.Module):
         assert L == self.n_latents
 
         lat = self.up_proj(z)  # (B, T, n_latents, d_model)
-        qry = self.patch_queries.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1) # (B, T, n_patches, d_model)
+        qry = self.patch_queries.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1) # (B,T,Np,d_model)
         parts = [lat, qry]
         if self.d_proprio is not None:
             parts.append(self.proprio_query.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1))
@@ -350,6 +361,7 @@ class Decoder(nn.Module):
         patches = torch.sigmoid(self.patch_head(patches_out))
         if self.d_proprio is None:
             return patches
+        # the PROPRIO query is the last spatial token (appended in __init__)
         proprio_pred = self.proprio_head(x[:, :, -1, :])       # (B, T, d_proprio)
         return patches, proprio_pred
 
@@ -361,6 +373,9 @@ class Decoder(nn.Module):
 class Tokenizer(nn.Module):
     """
     Full causal tokenizer: Encoder -> bottleneck -> Decoder.
+
+    This is the training-time form (both halves trainable and differentiable);
+    :class:`FrozenTokenizer` is the inference-time wrapper around a checkpoint.
 
     Args:
         encoder: Encoder instance.
@@ -376,6 +391,8 @@ class Tokenizer(nn.Module):
         self, patch_tokens: torch.Tensor, proprio: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        Encode and reconstruct one clip (the tokenizer training forward pass).
+
         Args:
             patch_tokens: (B, T, Np, patch_dim) raw patch vectors.
             proprio:      (B, T, d_proprio), iff built with proprio support.
@@ -390,7 +407,17 @@ class Tokenizer(nn.Module):
         return pred, mae_mask
 
     def encode(self, patch_tokens: torch.Tensor, proprio: torch.Tensor | None = None) -> torch.Tensor:
-        """Encode patches to bottleneck latents (no MAE masking at eval)."""
+        """
+        Encode patches to bottleneck latents, dropping the MAE mask.
+
+        Args:
+            patch_tokens: (B, T, Np, patch_dim) raw patch vectors.
+            proprio:      (B, T, d_proprio), iff built with proprio support.
+
+        Returns:
+            (B, T, n_latents, d_bottleneck) in [-1, 1]. MAE masking is inactive
+            while the module is in eval mode.
+        """
         z, _ = self.encoder(patch_tokens, proprio=proprio)
         return z
 
@@ -402,35 +429,39 @@ class Tokenizer(nn.Module):
 
 class FrozenTokenizer(nn.Module):
     """
-    A TRAINED tokenizer, frozen, as a pixels<->latents codec — the form in
-    which dynamics training and inference consume it:
+    A trained tokenizer, frozen, as a pixels <-> latents codec — the form in
+    which dynamics training, imagination and evaluation consume it:
 
-        encode_frames(video (B,T,H,W,C) uint8) -> z (B,T,n_spatial,d_spatial)
-        decode_latents(z) -> images (B,T,C,H,W) in [0, 1]
+        encode_frames(video (B, T, H, W, C) uint8) -> z (B, T, n_spatial, d_spatial)
+        decode_latents(z) -> images (B, T, C, H, W) in [0, 1]
 
-    **Sliding history.** ``latent[t]`` is the time-attention encoding of the
-    ``history`` frames ``[t-history+1 .. t]`` (taking the last position),
-    replicate-padding before the episode start. This DECOUPLES the
-    tokenizer's temporal receptive field (fixed ``history``) from the
-    dynamics rollout horizon: every latent depends on at most ``history``
-    frames, so it is a deterministic per-frame function — episodes can be
-    encoded once and cached, and the world model can roll arbitrarily far.
-    ``history=1`` is plain per-frame encoding (the same code path — a window
-    of one). Decoding uses the same sliding window over latents, matching
-    how the production stack renders dreams.
+    Sliding history: ``latent[t]`` is the time-attention encoding of the
+    ``history`` frames ``[t-history+1 .. t]`` (the last position is taken),
+    replicate-padded before the episode start. This decouples the tokenizer's
+    temporal receptive field (fixed ``history``) from the dynamics rollout
+    horizon: every latent depends on at most ``history`` frames, so encoding is
+    a deterministic per-frame function — episodes can be encoded once and
+    cached, and the world model can roll arbitrarily far. ``history=1`` is plain
+    per-frame encoding (the same code path, a window of one). Decoding slides
+    the same window over latents, so dreams are rendered the way they were
+    encoded.
 
     The bottleneck ``(n_latents, d_bottleneck)`` is packed to
     ``(n_spatial, d_bottleneck * pack_k)`` — the tokenizer <-> dynamics
-    interface from the paper's Appendix A.
+    interface from the paper's appendix A.
+
+    Weights are frozen and the module is kept in eval mode: the latent space
+    must stay identical to the one every downstream checkpoint was trained on.
 
     Args:
         ckpt_path:  ``train_tokenizer`` checkpoint (EMA weights preferred).
         history:    Sliding temporal window w >= 1.
         pack_k:     Bottleneck packing factor (must divide n_latents).
         decoder_ckpt: Optional second checkpoint whose DECODER replaces this
-                    one's (e.g. a noise-robust decoder fine-tuned with a
-                    frozen encoder — the latent space must be identical,
-                    which is verified).
+                    one's (e.g. a noise-robust decoder fine-tuned with a frozen
+                    encoder). The encoders must match, which is verified —
+                    otherwise the decoder would be reading a different latent
+                    space.
         device:     Where to run.
     """
 
@@ -473,9 +504,9 @@ class FrozenTokenizer(nn.Module):
         self.device = torch.device(device)
 
     def _slide(self, x: torch.Tensor) -> torch.Tensor:
-        """(B,T,*) -> (B*T, w, *): causal length-w windows per position,
-        replicate-padding the first w-1 slots (a static clip — exactly what
-        the tokenizer saw at every episode start)."""
+        """(B, T, *) -> (B*T, w, *): the causal length-w window ending at each
+        position, with the first entry replicated into the w-1 slots before the
+        episode start (a static clip — what the tokenizer saw at every start)."""
         B, T = x.shape[:2]
         w = self.history
         if w == 1:
@@ -487,7 +518,14 @@ class FrozenTokenizer(nn.Module):
 
     @torch.no_grad()
     def encode_frames(self, video) -> torch.Tensor:
-        """(B,T,H,W,C) uint8 (numpy or tensor) -> (B,T,n_spatial,d_spatial)."""
+        """Encode a video to packed dynamics latents.
+
+        Args:
+            video: (B, T, H, W, C) uint8, numpy array or tensor.
+
+        Returns:
+            (B, T, n_spatial, d_spatial) packed bottleneck latents in [-1, 1].
+        """
         if isinstance(video, np.ndarray):
             video = torch.from_numpy(video)
         v = video.to(self.device).float() / 255.0
@@ -501,7 +539,8 @@ class FrozenTokenizer(nn.Module):
 
     @torch.no_grad()
     def decode_latents(self, z: torch.Tensor) -> torch.Tensor:
-        """(B,T,n_spatial,d_spatial) -> images (B,T,C,H,W) in [0,1]."""
+        """Render packed dynamics latents (B, T, n_spatial, d_spatial) back to
+        images (B, T, C, H, W) in [0, 1]."""
         B, T = z.shape[:2]
         latents = unpack_spatial_to_bottleneck(z.to(self.device), k=self.pack_k)
         windows = self._slide(latents)                         # (B*T,w,Nl,Db)

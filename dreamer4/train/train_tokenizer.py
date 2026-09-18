@@ -1,16 +1,21 @@
 """
-Train the Dreamer 4 causal video tokenizer (phase-1 world-model pretraining).
+Train the Dreamer 4 causal video tokenizer (phase 1a of the training chain).
+
+The tokenizer learns to compress frames into a small continuous latent per
+timestep and to reconstruct them again. It is frozen afterwards: the dynamics
+model, the K=1 fine-tune, the readout heads and PMPO all run on the latent
+space produced here.
 
 Dataset-agnostic: anything :func:`dreamer4.data.open_video_dataset` can read —
 gridworld shards or LeRobot datasets (one or several cameras, tiled into one
-frame per timestep). The
-objective is masked-autoencoding reconstruction (pixel L1/MSE + optional
-LPIPS / DINOv3 perceptual terms, optionally RMS-normalized), with optional
-extras that the production gridworld recipe relies on: weight EMA, latent
-noise for decoder robustness, latent-cycle consistency, decoder-only
-fine-tuning, and a proprio modality (robot joint-state analog).
+frame per timestep). The objective is per-patch reconstruction (L1 or MSE) plus
+optional LPIPS / DINOv3 perceptual terms, optionally RMS-normalized so the
+weights express relative importance. Optional extras: MAE patch masking, weight
+EMA, latent noise for decoder robustness, decoder-only fine-tuning
+(``--freeze_encoder``) and a proprio modality (robot joint state or another
+low-dimensional sensor vector).
 
-Usage (defaults reproduce the production gridworld tokenizer):
+Usage:
 
     python -m dreamer4.train.train_tokenizer \\
         --data.path data/gridworld_10k --out runs/tok_x --steps 16000
@@ -58,7 +63,9 @@ from dreamer4.train.config import (ModelConfig, TokenizerTrainConfig,
                                    save_config)
 from dreamer4.models.transformer.transformer import patchify, unpatchify
 
-PROPRIO_SENTINEL = -2.0   # "sensor missing" input value used by proprio dropout
+# "sensor missing" input value used by proprio dropout: outside the [-1, 1]
+# range datasets normalize proprio into, so it cannot be a real reading
+PROPRIO_SENTINEL = -2.0
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +75,18 @@ PROPRIO_SENTINEL = -2.0   # "sensor missing" input value used by proprio dropout
 
 def build_tokenizer(model: ModelConfig, *, frame_shape: Tuple[int, int, int],
                     d_proprio: Optional[int], max_T: int) -> Tokenizer:
-    """Instantiate encoder+decoder for frames of (H, W, C)."""
+    """
+    Build the encoder/decoder pair for frames of the given shape.
+
+    Args:
+        model:       Tokenizer architecture config.
+        frame_shape: Composed frame (H, W, C); patch_size must divide H and W.
+        d_proprio:   Proprio vector width, or None for a vision-only tokenizer.
+        max_T:       Longest time window the RoPE cache has to cover.
+
+    Returns:
+        An untrained :class:`Tokenizer`.
+    """
     H, W, C = frame_shape
     p = model.patch_size
     if H % p or W % p:
@@ -91,6 +109,7 @@ def build_tokenizer(model: ModelConfig, *, frame_shape: Tuple[int, int, int],
 
 
 def weights_from_checkpoint(ckpt: dict, prefer_ema: bool) -> dict:
+    """The EMA weights when present and requested, else the raw training ones."""
     if prefer_ema and ckpt.get("ema") is not None:
         return ckpt["ema"]
     return ckpt["model"]
@@ -102,10 +121,16 @@ def load_tokenizer_checkpoint(path, *, device: str | torch.device = "cpu",
     """
     Rebuild a tokenizer from a ``train_tokenizer`` checkpoint.
 
-    Returns ``(tokenizer.eval(), checkpoint_dict)``; the checkpoint carries
-    ``config`` (full nested train config) and ``frame_meta`` — H/W/C,
-    d_proprio and max_T (used to rebuild), plus n_patches/patch_dim/seq_len
-    for provenance.
+    Args:
+        path:      Path to ``checkpoints/latest.pt`` of a tokenizer run.
+        device:    Device the rebuilt model is moved to.
+        prefer_ema: Load the EMA weights when the checkpoint has them.
+
+    Returns:
+        ``(tokenizer.eval(), checkpoint_dict)``. The checkpoint carries
+        ``config`` (the full nested train config) and ``frame_meta`` — H/W/C,
+        d_proprio and max_T, which is what the rebuild needs, plus
+        n_patches/patch_dim/seq_len for provenance.
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model_cfg = config_from_dict(ModelConfig, ckpt["config"]["model"])
@@ -121,6 +146,9 @@ def _save_checkpoint(path: Path, *, tok: Tokenizer, ema: Optional[EMA],
                      opt: torch.optim.Optimizer, combiner: LossCombiner,
                      step: int, cfg: TokenizerTrainConfig,
                      frame_meta: dict) -> None:
+    """Write a resumable checkpoint: weights, EMA shadow, optimizer and
+    loss-normalizer state, plus the config and frame metadata needed to rebuild
+    the model from the file alone."""
     atomic_torch_save(path, {
         "kind": "dreamer4-tokenizer",
         "step": step,
@@ -143,10 +171,13 @@ def latent_noise_sigma(step: int, total_steps: int, *, noise_max: float,
     """
     Ceiling of the per-frame latent-noise magnitude at ``step``.
 
-    Held at 0 for ``warmup_frac`` of training (let the tokenizer escape
-    mean-collapse on clean reconstruction), then ramped linearly to
-    ``noise_max``. Teaches the decoder to render imperfect (e.g.
-    dynamics-drifted) latents; encode/eval are unaffected.
+    Held at 0 for ``warmup_frac`` of training, so the tokenizer can escape
+    mean-collapse on clean reconstruction first, then ramped linearly to
+    ``noise_max``. The noise teaches the decoder to render imperfect (e.g.
+    dynamics-drifted) latents; encoding and evaluation are unaffected.
+
+    Returns:
+        The upper bound of the uniform sigma range, 0.0 when noise is off.
     """
     if noise_max <= 0.0:
         return 0.0
@@ -156,35 +187,8 @@ def latent_noise_sigma(step: int, total_steps: int, *, noise_max: float,
     return noise_max * min(1.0, (step - hold) / max(1, total_steps - hold))
 
 
-def latent_consistency_loss(tok: Tokenizer, pred_patches: torch.Tensor,
-                            prop_pred: Optional[torch.Tensor],
-                            z: torch.Tensor, *, encoder_frozen: bool
-                            ) -> torch.Tensor:
-    """
-    Cycle term: re-encoding the reconstruction should give back ``z``.
-
-    Gradients flow into the DECODER only (through ``pred_patches``); encoder
-    weights are excluded, and MAE masking is off for the re-encode.
-    """
-    enc = tok.encoder
-    toggled = []
-    if not encoder_frozen:
-        for p in enc.parameters():
-            if p.requires_grad:
-                toggled.append(p)
-                p.requires_grad_(False)
-    mae_was_training = enc.mae.training
-    enc.mae.eval()
-    try:
-        z_recon, _ = enc(pred_patches, proprio=prop_pred)
-        return F.mse_loss(z_recon.float(), z.detach().float())
-    finally:
-        enc.mae.train(mae_was_training)
-        for p in toggled:
-            p.requires_grad_(True)
-
-
 def _set_train_mode(tok: Tokenizer, freeze_encoder: bool) -> None:
+    """Put the tokenizer back in train mode after a validation pass."""
     tok.train()
     if freeze_encoder:
         tok.encoder.eval()     # keeps MAE masking off for the frozen encoder
@@ -197,14 +201,23 @@ def _set_train_mode(tok: Tokenizer, freeze_encoder: bool) -> None:
 
 def _frames_to_images(patches: torch.Tensor, H: int, W: int, C: int,
                       patch_size: int) -> torch.Tensor:
+    """(B, T, Np, patch_dim) patches -> (B, T, C, H, W) images clamped to [0, 1]."""
     return unpatchify(patches.float(), H, W, C, patch_size).clamp(0.0, 1.0)
 
 
 def make_recon_strip(gt: torch.Tensor, pred: torch.Tensor, n: int = 8
                      ) -> torch.Tensor:
     """
-    (N, T, C, H, W) gt/pred in [0,1] -> one (C, H', W') image: per clip, the
-    ground-truth row over the reconstruction row, clips stacked vertically.
+    Build the reconstruction comparison image logged to TensorBoard.
+
+    Args:
+        gt:   (N, T, C, H, W) ground-truth frames in [0, 1].
+        pred: (N, T, C, H, W) reconstructions in [0, 1].
+        n:    Number of clips to draw (clipped to N).
+
+    Returns:
+        One (C, H', W') image: per clip, the ground-truth row of frames over
+        the reconstruction row, clips stacked vertically.
     """
     n = min(n, gt.shape[0])
     C = gt.shape[2]
@@ -226,10 +239,14 @@ def validate(tok: Tokenizer, dataset: EpisodeVideoDataset,
     """
     Reconstruct the fixed validation clips (no MAE masking in eval mode).
 
-    Returns (metrics, strip image). Metrics: pixel mse / l1 / psnr, proprio
-    decode MSE when enabled, plus any dataset-specific metrics (e.g. the
-    gridworld sprite-position errors) and ``gate_pass`` when the dataset
-    defines a gate.
+    The clip list is sampled once per run, so the numbers are comparable across
+    steps and across runs on the same dataset.
+
+    Returns:
+        ``(metrics, strip)``. Metrics: pixel mse / l1 / psnr, proprio decode
+        MSE when enabled, any dataset-specific metrics (e.g. sprite-position
+        errors on the gridworld) and ``gate_pass`` when the dataset defines a
+        gate. ``strip`` is the (C, H', W') comparison image of the first batch.
     """
     H, W, C = frame_shape
     tok.eval()
@@ -285,7 +302,17 @@ def validate(tok: Tokenizer, dataset: EpisodeVideoDataset,
 
 
 def train(cfg: TokenizerTrainConfig) -> Dict[str, float]:
-    """Run tokenizer training to completion; returns the final val metrics."""
+    """
+    Run tokenizer training to completion.
+
+    Writes every artifact under ``cfg.out`` (config, TensorBoard logs,
+    resumable checkpoints, the final reconstruction strip and ``final.json``)
+    and appends one summary row to ``<out>/../experiments.jsonl``.
+
+    Returns:
+        The final validation metrics, plus step count, parameter count and
+        wall-clock minutes.
+    """
     set_seed(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     out = Path(cfg.out)
@@ -363,7 +390,6 @@ def train(cfg: TokenizerTrainConfig) -> Dict[str, float]:
         dino_weight=cfg.loss.dino_weight, device=device)
     weights = {"recon": cfg.loss.recon_weight}
     weights.update({name: w for name, _, w in perceptual})
-    weights["consistency"] = cfg.loss.consistency_weight
     weights["proprio"] = cfg.loss.proprio_weight if use_proprio else 0.0
     combiner = LossCombiner(weights, normalize=cfg.loss.loss_norm,
                             decay=cfg.loss.loss_norm_decay,
@@ -470,13 +496,9 @@ def train(cfg: TokenizerTrainConfig) -> Dict[str, float]:
                 loss_prop = None
                 if use_proprio:
                     loss_prop = F.mse_loss(prop_pred.float(), proprio_target.float())
-                loss_cons = None
-                if cfg.loss.consistency_weight > 0.0:
-                    loss_cons = latent_consistency_loss(
-                        tok, pred, prop_pred, z, encoder_frozen=cfg.freeze_encoder)
 
             terms: Dict[str, Optional[torch.Tensor]] = {
-                "recon": loss_recon, "consistency": loss_cons, "proprio": loss_prop}
+                "recon": loss_recon, "proprio": loss_prop}
             if perceptual:                     # fp32, outside autocast
                 pr_img = _frames_to_images(pred, H, W, C, cfg.model.patch_size)
                 gt_img = _frames_to_images(patches, H, W, C, cfg.model.patch_size)
@@ -522,9 +544,10 @@ def train(cfg: TokenizerTrainConfig) -> Dict[str, float]:
                              frame_meta=frame_meta)
 
     # ---- final artifacts -------------------------------------------------
-    # Save first (raw + EMA weights stay separate — the run must remain
-    # resumable), then evaluate/render with the EMA weights swapped in.
-    # Deployment consumers get the EMA weights via load_tokenizer_checkpoint.
+    # Save first (raw and EMA weights stay separate, so the run remains
+    # resumable), then evaluate and render with the EMA weights swapped in.
+    # Consumers of the checkpoint get the EMA weights via
+    # load_tokenizer_checkpoint.
     _save_checkpoint(latest, tok=tok, ema=ema, opt=opt, combiner=combiner,
                      step=step, cfg=cfg, frame_meta=frame_meta)
     eval_weights = ema.state_dict() if ema is not None else None
@@ -565,6 +588,7 @@ def train(cfg: TokenizerTrainConfig) -> Dict[str, float]:
 
 
 def main(argv=None) -> None:
+    """CLI entry point: resolve defaults < YAML < flags into a config, then train."""
     cfg = parse_config(TokenizerTrainConfig, argv,
                        description=__doc__.split("\n\n")[0])
     if not cfg.data.path:

@@ -1,5 +1,5 @@
 """
-The unified episode format that every dataset loader implements.
+The unified episode format that every dataset adapter implements.
 
 A dataset is an indexed collection of *episodes* (contiguous recordings).
 Trainers only ever ask for fixed-length windows via
@@ -22,19 +22,23 @@ regardless of how the data is stored:
                                          terminal observation)}
 
 Datasets with actions expose :attr:`action_dim`; the dynamics trainer
-requires it, the tokenizer trainer never asks. Rewards/terminals ride along
-wherever the storage records them (gridworld shards do; LeRobot demos have
-no reward concept) — the agent trainer requires them, phase-1 trainers
-ignore them.
+requires it, the tokenizer trainer never asks. Rewards and terminals ride
+along wherever the storage records them (gridworld shards do; LeRobot
+demonstrations have no reward concept) — the phase-2/3 trainers require them,
+the phase-1 trainers ignore them.
 
 Storage formats are special cases in sibling modules (``gridworld``,
-``lerobot``); :func:`dreamer4.data.open_video_dataset` picks one by looking
-at the directory. To support a new format, subclass
-:class:`EpisodeVideoDataset`, implement ``__len__`` / ``episode_frames`` /
-``_load_clip``, and add a detection branch to ``open_video_dataset`` (in the
-package ``__init__``) — nothing in the trainers changes.
+``lerobot``); :func:`dreamer4.data.open_video_dataset` picks one by asking
+each adapter. To support a new format, subclass
+:class:`EpisodeVideoDataset`, implement ``recognizes`` / ``from_path`` /
+``__len__`` / ``episode_frames`` / ``_load_clip``, and add the class to
+``dreamer4.data.ADAPTERS`` — nothing in the trainers changes. The optional
+hooks below (``episode_meta``, ``bc_weight``, ``env_spec``,
+``continues_from_reward``, ``proprio_from_info``) are what the phase-2/3
+trainers ask an adapter for; each has a safe default, so an offline dataset
+simply trains without the parts that need a live environment.
 
-Domain-specific evaluation also plugs in here: :meth:`eval_metrics` and
+Domain-specific evaluation plugs in the same way: :meth:`eval_metrics` and
 :meth:`gate` let a dataset judge reconstructions by what MATTERS in its
 domain (e.g. gridworld's sprite positions), since pixel losses alone can
 hide exactly the content the downstream world model needs.
@@ -42,6 +46,7 @@ hide exactly the content the downstream world model needs.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -50,7 +55,27 @@ import numpy as np
 class EpisodeVideoDataset:
     """Base class implementing the unified format (see module docstring)."""
 
+    #: Proprio modes this adapter DERIVES from its own storage, beyond the
+    #: generic "none"/"auto" that every adapter understands. Declaring them
+    #: here keeps a domain's vocabulary out of the shared data layer and out
+    #: of the training configs: nothing above this class should enumerate
+    #: another domain's field names.
+    PROPRIO_MODES: Tuple[str, ...] = ()
+
     # -- to implement ------------------------------------------------------
+
+    @classmethod
+    def recognizes(cls, root: Path) -> bool:
+        """Whether ``root`` is stored in this adapter's format."""
+        raise NotImplementedError
+
+    @classmethod
+    def from_path(cls, root: Path, *, proprio: str = "none",
+                  actions: bool = False, **kwargs) -> "EpisodeVideoDataset":
+        """Build from a directory, translating the generic open() arguments
+        into this adapter's own constructor. Unknown kwargs are ignored so one
+        caller can serve adapters with different options."""
+        raise NotImplementedError
 
     def __len__(self) -> int:
         """Number of episodes."""
@@ -96,8 +121,9 @@ class EpisodeVideoDataset:
     def episode_meta(self, i: int) -> Dict:
         """
         Optional per-episode collector metadata (data-quality signals like
-        gridworld's ``noisiness``). Empty when the storage records none;
-        the agent trainer uses it to filter BC data, nothing else asks.
+        gridworld's ``noisiness``), empty when the storage records none. The
+        phase-2 trainer reports statistics from it; deciding what may be
+        imitated is :meth:`bc_weight`'s job.
         """
         return {}
 
@@ -110,6 +136,7 @@ class EpisodeVideoDataset:
         of teleop datasets. A collector that deliberately records mixed
         quality (gridworld dials expert->random) overrides this; the criterion
         is the DATASET's, so no trainer has to know what "noisiness" means.
+        Phase 2 clones the episodes whose weight is > 0.
         """
         return 1.0
 
@@ -130,7 +157,7 @@ class EpisodeVideoDataset:
     def continues_from_reward(self, reward_pred):
         """
         The domain's rule for spotting a terminal frame from a PREDICTED
-        reward: ``(B,T) -> (B,T) float`` (1 = keep going, 0 = terminal), or
+        reward: ``(B, T) -> (B, T)`` float (1 = keep going, 0 = terminal), or
         None when this domain has no such rule.
 
         Phase 3 needs it because a dream has no recorded terminals — the
@@ -139,8 +166,8 @@ class EpisodeVideoDataset:
         "rewarding" and "terminal" are the same event. Datasets where they
         differ (a milestone reward mid-episode, an episode that ends in
         failure with no reward) return None and need a real terminal
-        predictor instead. The trainer's ``term_f1`` gate measures this rule
-        on held-out data before phase 3 leans on it.
+        predictor instead. Phase 2 measures the rule on held-out data
+        (``term_f1``) before phase 3 leans on it.
         """
         return None
 
@@ -151,9 +178,9 @@ class EpisodeVideoDataset:
         ONLY proprio source the online policy uses; a proprio model cannot be
         evaluated in an env that does not report it.
 
-        It must produce the same convention the training clips carry — for
-        gridworld both come from the positions the collector recorded from
-        the env, scaled the same way (a test pins them together).
+        It must produce the same convention the training clips carry — same
+        fields in the same order, same scaling — or the policy sees a
+        different input online than it was trained on.
         """
         return None
 
@@ -175,9 +202,10 @@ class EpisodeVideoDataset:
 
 class MergedEpisodeDataset(EpisodeVideoDataset):
     """
-    Concatenation of several episode datasets — for training on multiple
-    collections at once (e.g. plain + sticky gridworld, as the dynamics
-    recipe does with its comma-separated data flag).
+    Concatenation of several episode datasets — for training on several
+    collections of the same environment at once
+    (:func:`dreamer4.data.open_video_dataset` builds one from a
+    comma-separated path).
 
     All parts must agree on frame shape, proprio_dim and action_dim; eval
     hooks are taken from the FIRST part (parts are assumed to share a domain).

@@ -1,34 +1,14 @@
 """
-SwiGLU Feed-Forward Network for Dreamer 4.
+SwiGLU feed-forward block, applied after every attention sublayer of the transformer.
 
-This module implements the MLP (feed-forward) block used after every
-attention sublayer in the transformer.
+    MLP(x) = W_out(SiLU(W_gate(x)) * W_up(x)),   SiLU(z) = z * sigmoid(z)
 
-WHAT IS SwiGLU?
+The element-wise product gates each hidden unit, which trains better than a plain ReLU MLP
+and is the usual choice in modern transformers. W_gate and W_up are fused into one linear
+layer of width ``2 * hidden`` and chunked afterwards: one GEMM instead of two.
 
-Standard transformer MLPs use:
-    MLP(x) = W2(ReLU(W1(x)))
-
-SwiGLU replaces ReLU with a *gated* activation:
-    MLP(x) = W_out(SiLU(W_gate(x)) * W_up(x))
-
-Here:
-  - W_gate and W_up each project from d_model to hidden_dim
-  - SiLU(z) = z * sigmoid(z)  (also called "Swish")
-  - The element-wise product SiLU(gate) * up acts as a learnable gate
-
-WHY SwiGLU?
-
-The gating mechanism lets the network learn to selectively pass or
-block information through each hidden dimension, producing smoother
-gradients and better training dynamics than ReLU. It's used in most
-modern transformers (LLaMA, PaLM, Gemma, etc.).
-
-IMPLEMENTATION NOTE:
-
-We fuse W_gate and W_up into a single linear layer that outputs
-2 * hidden_dim, then split (chunk) the output. This is more memory-
-efficient than two separate linear layers and fuses better on GPU.
+Input and output are ``(..., d_model)`` — the block acts per token, so the leading axes
+(B, T, S) pass through untouched.
 
 Reference: Shazeer, 2020 — "GLU Variants Improve Transformer"
 """
@@ -44,7 +24,8 @@ class SwiGLU(nn.Module):
 
     Args:
         d_model:   Input and output dimension.
-        mlp_ratio: Hidden dimension = d_model * mlp_ratio (default 4.0).
+        mlp_ratio: Hidden dimension = d_model * mlp_ratio (default 8/3, which keeps the
+                   parameter count of a gated MLP close to a 4x ungated one).
         dropout:   Dropout rate applied after each linear layer (default 0.0).
 
     Shape:
@@ -63,8 +44,8 @@ class SwiGLU(nn.Module):
         super().__init__()
         hidden = int(d_model * mlp_ratio)
 
-        # Single linear that produces both gate and up projections
-        # Output is 2 * hidden, which we split into two halves
+        # Single linear producing both the gate and the up projection;
+        # its 2 * hidden outputs are chunked in forward()
         self.fc_in = nn.Linear(d_model, 2 * hidden)
 
         # Project back down to d_model

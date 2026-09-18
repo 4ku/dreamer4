@@ -1,25 +1,15 @@
 """
-Normalization layers for Dreamer 4.
+The two normalization layers of the transformer: RMSNorm and QKNorm. Both preserve shape.
 
-This module provides two normalization layers used in the transformer:
+RMSNorm — ``(..., dim) -> (..., dim)``. Rescales by the root mean square without subtracting
+the mean, which is cheaper than LayerNorm and performs comparably in transformers. Used as
+the pre-norm in front of every attention and MLP sublayer.
+Reference: Zhang & Sennrich, 2019 — "Root Mean Square Layer Normalization"
 
-1. **RMSNorm** — Root Mean Square Normalization.
-   A simpler alternative to LayerNorm that skips the mean-centering step.
-   Used as "pre-layer normalization" before every attention and MLP sublayer.
-
-   Why not LayerNorm?  RMSNorm is ~10-20% faster because it doesn't compute
-   the mean, and empirically performs just as well for transformers.
-   Reference: Zhang & Sennrich, 2019 — "Root Mean Square Layer Normalization"
-
-2. **QKNorm** — Query-Key Normalization.
-   Normalizes Q and K vectors in attention before the dot product, preventing
-   the attention logits from growing unboundedly as the model gets deeper.
-   This is crucial for training stability in deep (20+ layer) transformers.
-   Reference: Dehghani et al., 2023 — "Scaling Vision Transformers to 22B"
-
-   How it works: L2-normalize each head's Q/K vector, then multiply by a
-   learnable per-head scale parameter. This keeps the dot products bounded
-   while still allowing the model to learn the right scale.
+QKNorm — ``(N, H, L, head_dim) -> (N, H, L, head_dim)`` for Q and K. L2-normalizes each
+head's vector and rescales it by a learnable per-head scale, so attention logits stay bounded
+instead of growing with depth. This matters for training stability in deep stacks.
+Reference: Dehghani et al., 2023 — "Scaling Vision Transformers to 22B"
 """
 
 import torch
@@ -56,8 +46,7 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute root mean square along last dimension
-        # x.pow(2).mean(-1) computes mean(x_i^2) for each position
+        # Root mean square over the last dimension, per position
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         # Normalize and apply learnable scale
         return x * (self.scale / rms)
@@ -70,8 +59,9 @@ class QKNorm(nn.Module):
     Normalizes Q and K independently using L2 normalization along the
     head dimension, then multiplies by a learnable per-head scale.
 
-    This bounds the maximum attention logit to `scale^2 * head_dim`,
-    preventing instabilities in deep transformers.
+    Because the rescaling fixes the length of every Q and K vector, the raw dot product
+    cannot exceed ``q_scale * k_scale`` (= head_dim at initialization) however deep the
+    stack is, which is what prevents logit blow-up.
 
     Args:
         head_dim: Dimension of each attention head.
@@ -96,11 +86,10 @@ class QKNorm(nn.Module):
         self.head_dim = head_dim
         if n_kv_heads is None:
             n_kv_heads = n_heads
-        # Learnable scale per head, initialized to sqrt(head_dim) so that
-        # after normalization the initial dot products have similar magnitude
-        # to standard scaled dot-product attention.
-        # Q scale has shape (n_heads, 1, 1) and K scale has (n_kv_heads, 1, 1)
-        # to support Grouped Query Attention where K has fewer heads.
+        # Learnable per-head scale, initialized to sqrt(head_dim): with unit-norm Q and K
+        # that puts the initial logits at the same magnitude as standard scaled
+        # dot-product attention. Shapes (n_heads, 1, 1) / (n_kv_heads, 1, 1) broadcast over
+        # (seq_len, head_dim) and let K keep fewer heads under GQA.
         self.q_scale = nn.Parameter(torch.full((n_heads, 1, 1), head_dim ** 0.5))
         self.k_scale = nn.Parameter(torch.full((n_kv_heads, 1, 1), head_dim ** 0.5))
 

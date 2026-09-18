@@ -1,15 +1,17 @@
 """
-Utility functions for Dreamer 4.
+Low-level helpers shared by the models and the trainers.
 
-This module provides low-level helpers used across the codebase:
+1. **Bottleneck packing** — the reshape between the tokenizer's bottleneck
+   and the dynamics model's spatial tokens: the tokenizer produces
+   (B, T, N_b, D_b) latents, the world model reads them as
+   (B, T, N_b/k, D_b*k) (paper Appendix A). Applied by
+   :class:`dreamer4.models.tokenizer.FrozenTokenizer`, the codec phase 1b
+   encodes through.
 
-1. **Bottleneck packing** — reshape tokenizer bottleneck representations
-   for consumption by the dynamics model. The tokenizer produces
-   (N_b, D_b) latents which are packed to (N_z, D_b * k) spatial tokens
-   where N_z = N_b / k  (Paper Appendix A).
-
-2. **RMS loss normalization** — normalize losses by their running RMS estimate.
-   This helps control the relative importance of different loss terms.
+2. **RMS loss normalization** — divide each loss term by a running RMS
+   estimate so fixed weights express RELATIVE importance regardless of raw
+   magnitudes. Trainers reach it through
+   :class:`dreamer4.train.common.LossCombiner`.
 """
 
 import torch
@@ -73,21 +75,20 @@ class RMSLossNormalizer(nn.Module):
     Divides each loss by its running RMS estimate, so fixed coefficients
     control relative importance independent of raw loss magnitudes.
 
-    Near-convergence caveat: with a plain running-RMS divisor, a loss decaying
-    toward zero is divided by an ever-smaller estimate, so its normalized value
-    (and gradients) stays O(1) forever — an implicit adaptive-LR amplifier that
-    prevents the final polishing phase from settling (plateau + huge pre-clip
-    grad norms). ``floor_frac`` bounds this: the divisor never drops below
-    ``floor_frac * peak_rms`` (largest RMS seen for that term), so early training
-    keeps scale-free balancing while a term far below its peak contributes
-    proportionally to its actual value again (amplification ≤ ``1/floor_frac``).
+    ``floor_frac`` guards the near-convergence failure mode: with a plain
+    running-RMS divisor a loss decaying toward zero is divided by an
+    ever-smaller estimate, so its normalized value and gradients stay O(1)
+    forever and the run never settles (plateau plus huge pre-clip grad norms).
+    The divisor never drops below ``floor_frac * peak_rms`` (largest RMS seen
+    for that term), capping the amplification at ``1/floor_frac`` while early
+    training keeps its scale-free balancing.
 
     Args:
         n_losses:   Number of loss terms to track.
         decay:      EMA decay factor (default 0.99).
         eps:        Floor for the RMS estimate (default 1e-8).
         floor_frac: Divisor floor as a fraction of the term's peak RMS
-                    (default 0.0 = legacy unfloored behavior).
+                    (default 0.0 = unfloored).
     """
 
     def __init__(self, n_losses: int = 2, decay: float = 0.99, eps: float = 1e-8,
@@ -102,7 +103,7 @@ class RMSLossNormalizer(nn.Module):
 
     @torch.no_grad()
     def update(self, idx: int, loss_val: torch.Tensor) -> None:
-        """Update the running RMS estimate for loss at index `idx`."""
+        """Update the running RMS estimate for the loss at index ``idx``."""
         val = loss_val.detach().float().abs().clamp_min(self.eps)
         if not self.initialized[idx]:
             self.rms_ema[idx] = val

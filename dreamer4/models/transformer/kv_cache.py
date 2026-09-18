@@ -1,19 +1,15 @@
 """
-KV-cache for incremental decoding of the block-causal transformer.
+KV cache for incremental decoding of the block-causal transformer.
 
-When the dynamics model rolls out autoregressively (paper Section 3.2
-inference), each new frame is produced by K=4 denoising steps that all
-condition on the same fixed past. Without a cache, every denoising step
-re-runs the whole transformer on the growing past.
+When the dynamics model rolls out autoregressively (paper Section 3.2), each new frame costs
+K denoising steps that all condition on the same fixed past; without a cache every one of
+those steps re-runs the whole transformer over the whole past.
 
-Time attention is the *only* operation in this architecture that mixes
-across timesteps (space attention is within-frame; the MLP is per-token).
-So during an incremental forward for a new token, past contributes only
-through time attention's K and V. We cache exactly those tensors —
-post-QKNorm, post-RoPE — at each time-attention layer, and nothing else.
-
-Non-time-attention layers never touch the cache: the new token passes
-through their space attention and MLP without looking up any past state.
+Time attention is the *only* operation in this architecture that mixes across timesteps
+(space attention stays inside one frame, the MLP is per token), so the past reaches a new
+token only through time attention's K and V. The cache holds exactly those tensors — stored
+post-QKNorm and post-RoPE — for each time-attention layer, and nothing else. Layers without
+time attention have no cross-time state and never touch the cache.
 """
 
 from __future__ import annotations
@@ -33,8 +29,8 @@ class KVCache:
     Tensors are stored **post-QKNorm and post-RoPE** so that the incremental
     forward only needs to project K, V for the new tokens and concatenate.
 
-    Non-time-attention layer indices are simply absent from the cache — they
-    have no cross-time state to remember.
+    Layer indices without time attention are simply absent from the cache — they have no
+    cross-time state to remember.
 
     Args:
         time_layer_indices: Layer indices (into the transformer's ``layers``
@@ -64,6 +60,7 @@ class KVCache:
 
     @property
     def time_layers(self) -> Tuple[int, ...]:
+        """Sorted indices of the layers that own a cache slot."""
         return self._time_layers
 
     @property
@@ -76,6 +73,7 @@ class KVCache:
         return 0
 
     def has_layer(self, layer_idx: int) -> bool:
+        """True if this layer does time attention and therefore has a cache slot."""
         return layer_idx in self.k
 
     def get(self, layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:

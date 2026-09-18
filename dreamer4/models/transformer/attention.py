@@ -1,35 +1,26 @@
 """
-Multi-Head Attention with GQA, logit capping, QKNorm, and RoPE for Dreamer 4.
+Multi-head attention with GQA, QKNorm, RoPE and attention-logit soft capping.
 
-This module implements the core attention mechanism with all enhancements
-described in the Dreamer 4 paper (Section 3.4):
+Single attention primitive shared by both attention types in ``layers.py``: space attention
+(over the S tokens of one timestep) and time attention (over T timesteps at one spatial
+position). Input and output are ``(N, L, D)``; what ``N`` and ``L`` mean is decided by the
+caller, which flattens ``(B, T, S, D)`` onto those two axes before calling.
 
-1. **Grouped Query Attention (GQA)**: Multiple query heads share the same
-   key/value head, reducing KV cache size for faster inference on long video
-   sequences. E.g., 8 query heads with 2 KV heads = 4x smaller KV cache.
+Features (Dreamer 4 paper, Section 3.4):
+  - GQA: several query heads share one key/value head, shrinking the KV cache for long
+    rollouts (8 query heads over 2 KV heads = 4x smaller cache).
+  - QKNorm: Q and K are normalized before the dot product, which keeps the logits of deep
+    stacks bounded.
+  - Logit soft capping: ``cap * tanh(logits / cap)`` keeps a single score from dominating
+    (as in Gemma 2).
+  - RoPE: relative positions are encoded by rotating Q and K.
 
-2. **QKNorm**: Normalizes Q and K before the dot product to stabilize
-   training of deep transformers.
+Per call: project x to Q, K, V -> split into heads -> QKNorm -> RoPE -> repeat K/V up to the
+query head count -> scaled dot-product attention (masked, optionally capped) -> merge heads ->
+output projection.
 
-3. **Attention logit soft capping**: Applies `cap * tanh(logits / cap)` to
-   prevent any single attention score from dominating. Used in Gemma 2.
-
-4. **RoPE integration**: Applies rotary position embeddings to Q and K
-   before the dot product to encode relative positions.
-
-The typical data flow through this module:
-
-    Input (N, L, D)
-    -> Linear projection to Q, K, V
-    -> Reshape to heads: Q (N, n_heads, L, head_dim)
-                          K (N, n_kv_heads, L, head_dim)
-                          V (N, n_kv_heads, L, head_dim)
-    -> QKNorm (optional)
-    -> RoPE (optional)
-    -> Expand K,V to match Q heads (GQA repeat)
-    -> Scaled dot-product attention (with optional mask + logit capping)
-    -> Concatenate heads and project out
-    -> Output (N, L, D)
+``forward`` attends over a whole sequence. ``forward_kv_cached`` attends incrementally: it
+projects only the new tokens and reads the past from cached K/V, for autoregressive rollout.
 """
 
 from __future__ import annotations
@@ -109,13 +100,10 @@ class MultiheadAttention(nn.Module):
         rope_sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Forward pass.
+        Attend over a full sequence.
 
         Args:
-            x: (N, L, D) input tensor where
-               N = batch size (number of sequences processed in parallel),
-               L = sequence length (number of tokens),
-               D = model dimension (d_model, total embedding size per token).
+            x: (N, L, D) — N sequences of L tokens, model dimension D.
             attn_mask: (N, 1, L, L) or (1, 1, L, L) boolean mask where True
                        means "allowed to attend" (PyTorch SDPA convention).
                        Mutually exclusive with is_causal.
@@ -153,11 +141,9 @@ class MultiheadAttention(nn.Module):
 
         # Compute attention
         if self.logit_cap is not None:
-            # Manual attention with logit capping:
-            # logits = (Q @ K^T) / sqrt(head_dim)
-            # logits = cap * tanh(logits / cap)
-            # weights = softmax(logits + mask)
-            # output = weights @ V
+            # Fused SDPA cannot cap logits, so the capped path attends by hand and
+            # materializes the full (N, n_heads, L, L) logit matrix:
+            #   logits = (Q @ K^T) / sqrt(head_dim) -> cap -> mask -> softmax -> @ V
             scale = self.head_dim ** -0.5
             logits = torch.matmul(q, k.transpose(-2, -1)) * scale  # (N, H, L, L)
 
@@ -201,13 +187,12 @@ class MultiheadAttention(nn.Module):
         rope_sin: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Incremental attention that projects Q, K, V only for new tokens and
-        optionally concatenates K, V with a cache of past K, V.
+        Attend incrementally: project Q, K, V for new tokens only and prepend cached past K, V.
 
-        Past K, V are expected **post-QKNorm and post-RoPE** at positions
-        ``[0, T_past)``. Newly projected K_new is QKNorm'd and RoPE'd at
-        positions ``[T_past, T_total)`` before being concatenated. Q_new gets
-        the same positional rotation as K_new.
+        Past K, V must already be **post-QKNorm and post-RoPE** at positions ``[0, T_past)``;
+        the cache stores them in that form so this path only projects and rotates the new
+        tokens, at positions ``[T_past, T_total)``. Q_new gets the same rotation as K_new.
+        Attention is causal by construction, so no mask argument is accepted.
 
         Args:
             x_new:   (N, T_new, D) — new tokens only.

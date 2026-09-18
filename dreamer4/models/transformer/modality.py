@@ -1,43 +1,37 @@
 """
-Token modality system and attention masks for Dreamer 4.
+Token modalities and the space-attention masks they induce.
 
-The Dreamer 4 transformer processes several types of tokens simultaneously
-within each time step. This module defines:
+Every timestep carries S tokens of several kinds (image patches, latents, actions, proprio,
+registers, agent tokens). This module defines:
 
-1. **Modality enum**: Labels for each token type (IMAGE, LATENT, ACTION, etc.)
-2. **TokenLayout**: A description of how the spatial dimension S is divided
-   into contiguous segments of different modalities.
-3. **build_space_attn_mask**: Builds the (S, S) boolean attention mask that
-   controls which tokens can attend to which other tokens, based on the
-   modality layout and the current mode.
+1. ``Modality`` — the token-type labels.
+2. ``TokenLayout`` — how the S axis is split into contiguous per-modality segments.
+3. ``build_space_attn_mask(layout, mode)`` — the (S, S) boolean mask saying which token may
+   attend to which *within one timestep*. Time attention is not masked here; it is plain
+   causal masking over T.
 
 MODES AND THEIR ATTENTION PATTERNS:
 
-  "encoder" mode (used in the tokenizer encoder):
-    - LATENT tokens can attend to ALL tokens (they aggregate information)
-    - Non-LATENT tokens can only attend within their own modality
-    Intuition: latents are the "summary" tokens that read from patches,
-    while patches only see other patches (not latents).
+  "encoder" (tokenizer encoder):
+    LATENT tokens attend to everything; every other token attends only within its own
+    modality. Latents are the summary that patches write into, and patches never read that
+    summary back.
 
-  "decoder" mode (used in the tokenizer decoder):
-    - LATENT tokens can only attend to other LATENT tokens
-    - Non-LATENT tokens can attend to themselves AND to LATENT tokens
-    Intuition: patches read from the latent summary to reconstruct the image.
+  "decoder" (tokenizer decoder):
+    LATENT tokens attend only to latents; other tokens attend to their own modality plus the
+    latents, so patches reconstruct from the latent summary.
 
-  "wm_agent" mode (the world model, both phases):
-    - AGENT tokens can attend to ALL tokens (including actions, images, etc.)
-    - Non-AGENT tokens CANNOT see AGENT tokens
-    Intuition: the agent reads the world state to predict actions and rewards,
-    but the world model's predictions remain independent of agent tokens —
-    this prevents "causal confusion", where the world model would learn to
-    predict the future from what the agent intends rather than from actions.
+  "decoder_cross" (tokenizer decoder, Perceiver-IO style):
+    Every token attends to latents only — no patch-to-patch mixing.
 
-    Phase-1 pretraining uses this same mode with ``n_agent=0``: with no AGENT
-    segment the mask degenerates to "every world token sees every world
-    token", which IS the pretraining pattern. (A separate
-    ``wm_agent_isolated`` mode — agent tokens present but blind — existed
-    until 2026-07-24; nothing ever trained with it, since pretraining carries
-    no agent tokens at all, so it was removed as dead weight.)
+  "wm_agent" (dynamics model):
+    AGENT tokens attend to everything; no other token can see an AGENT token. The agent reads
+    world state to predict actions, rewards and values, while the world model's predictions
+    stay independent of agent tokens — otherwise it learns to predict the future from what the
+    agent intends rather than from the action actually taken ("causal confusion").
+    Pretraining uses this same mode with ``n_agent=0``: with no AGENT segment the mask
+    degenerates to "every world token sees every world token", which is the pretraining
+    pattern.
 """
 
 from __future__ import annotations
@@ -60,7 +54,7 @@ class Modality(IntEnum):
     IMAGE = 0             # Image patch tokens
     ACTION = 1            # Action embedding tokens
     PROPRIO = 2           # Proprioceptive state tokens (for robotics)
-    REGISTER = 3          # Register tokens (learnable, for temporal consistency)
+    REGISTER = 3          # Learnable per-frame scratch tokens; no head reads their outputs
     SPATIAL = 4           # Packed spatial tokens (tokenizer output in dynamics)
     SHORTCUT_SIGNAL = 5   # Shortcut signal token carrying both tau and d (concat along channels)
     AGENT = 7             # Agent tokens (for policy/reward/value heads)
@@ -133,6 +127,9 @@ class TokenLayout:
         """
         Returns a dict mapping each Modality to its slice within the S dim.
 
+        A modality that appears in several segments is reported once, at its first
+        segment; empty segments (count 0) are omitted.
+
         Example:
             >>> layout = TokenLayout(n_latents=2, segments=((Modality.IMAGE, 3),))
             >>> layout.slices()
@@ -193,10 +190,10 @@ def build_space_attn_mask(layout: TokenLayout, mode: str) -> torch.Tensor:
         mask = torch.where(is_q_lat, lat_to_lat, nonlat_row)
 
     elif mode == "decoder_cross":
-        # Perceiver-IO style decode: patches attend ONLY to latents (no
-        # patch<->patch mixing), latents attend only to latents. This removes
-        # the constant-output escape hatch that collapses the naive decoder —
-        # every spatial output is forced to be a function of the latents.
+        # Perceiver-IO style decode: every query attends to latents only, patches and
+        # latents alike. With no patch<->patch mixing the decoder loses the constant-output
+        # escape hatch that collapses the plain "decoder" mask: every spatial output is
+        # forced to be a function of the latents.
         mask = is_k_lat.expand(S, S).clone()
 
     elif mode == "wm_agent":

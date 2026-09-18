@@ -1,5 +1,6 @@
 """
-Typed configuration for the training entrypoints.
+Typed configuration for the phase-1 training entrypoints (tokenizer and
+dynamics).
 
 One nested dataclass tree per trainer, three ways to set values (later wins):
 
@@ -15,9 +16,9 @@ The resolved config is saved to ``<out>/config.yaml`` by the trainer, and the
 same dict is embedded in every checkpoint, so a run is always reproducible
 from its artifacts.
 
-Defaults below ARE the production gridworld recipe (train_recipe_16tok.sh
-STEP 1, 2026-07-06): a d256/depth-2 tokenizer, 16 latents x 16 dims,
-loss-normalized L1 + LPIPS(up128) w2, EMA 0.999, bf16 autocast.
+The defaults below ARE the reference phase-1a tokenizer recipe: a
+d256/depth-2 tokenizer, 16 latents x 16 dims, loss-normalized L1 +
+LPIPS(up128) w2, EMA 0.999, bf16 autocast.
 """
 
 from __future__ import annotations
@@ -50,8 +51,9 @@ class DataConfig:
     num_workers: int = 2        # DataLoader workers (0 = decode in main process)
     cameras: str = ""           # LeRobot only: restrict/order cameras (comma list)
     camera_layout: str = "hstack"   # LeRobot only: camera tiling hstack|vstack|grid
-    proprio: str = "none"       # none|player|player_goal (gridworld)|auto
-                                # (dataset-stored, e.g. LeRobot observation.state)
+    proprio: str = "none"       # none|auto (dataset-stored, e.g. LeRobot
+                                # observation.state), or a mode the dataset's
+                                # adapter declares (dreamer4.data.PROPRIO_MODES)
     episode_cache: int = 999    # LeRobot: decoded episodes kept in memory per worker
 
 
@@ -64,7 +66,8 @@ class ModelConfig:
     depth: int = 2              # encoder and decoder each
     n_heads: int = 4
     n_kv_heads: int = 2
-    n_latents: int = 16         # bottleneck tokens per frame (16 = gridworld floor)
+    n_latents: int = 16         # bottleneck tokens per frame. 16 is the floor
+                                # MEASURED on gridworld; richer scenes need more
     d_bottleneck: int = 16      # dims per bottleneck token (tanh, [-1, 1])
     time_every: int = 2         # time attention every N layers
     decoder_mode: str = "decoder_cross"  # 'decoder' collapses; keep decoder_cross
@@ -85,12 +88,12 @@ class LossConfig:
     perceptual_up: int = 128            # LPIPS upscale resolution
     lpips_net: str = "alex"
     dino_weight: float = 1.0            # DINOv3 weight in hybrid mode
-    consistency_weight: float = 0.0     # re-encode(recon) ~ z; trains decoder only
     proprio_weight: float = 0.3         # 0.1-0.3 sweet spot; 1.0 starves pixels
     loss_norm: bool = True              # divide each term by its running RMS
     loss_norm_decay: float = 0.99
     loss_norm_floor: float = 0.2        # divisor floor as frac of peak RMS
-                                        # (0.2 > 0.05 > naive — 2026-07-04 sweep)
+                                        # (0.2 swept better than 0.05 and than
+                                        #  no floor at all)
 
 
 @dataclass
@@ -99,6 +102,9 @@ class OptimConfig:
 
     lr: float = 3e-4
     warmup: int = 500           # linear LR warmup steps
+    lr_final: float = 0.0       # dynamics trainer: linearly decay `lr` to this across
+                                #   the bootstrap ramp (or the post-warmup steps when
+                                #   there is none); 0 = constant after warmup
     grad_clip: float = 1.0
     weight_decay: float = 0.01
     beta1: float = 0.9
@@ -133,20 +139,20 @@ class TokenizerTrainConfig:
     latent_noise_warmup_frac: float = 0.0  # hold noise at 0 for this frac of steps
     proprio_dropout: float = 0.0    # per-sample prob of -2 sentinel proprio input
     max_minutes: float = 0.0    # wall-clock budget; 0 = none
-    tag: str = ""               # free-form label for the experiment journal
+    tag: str = ""               # free-form label recorded in experiments.jsonl
 
 
 # ---------------------------------------------------------------------------
 # Dynamics training config
 # ---------------------------------------------------------------------------
 #
-# Defaults ARE the production gridworld recipe STEP 3 (train_recipe_16tok.sh,
-# 2026-07-06 + the 2026-07-20 image-batch-frame0 finding): clean-context
-# objective with 1-step scheduled sampling (ramped to 0.7), ctx-noise band
-# 0.05-0.15, image batches 0.15 from episode frame 0, joint proprio w0.3.
-# STEP 4 (the K=1-maker) = same config + init_from STEP 3's checkpoint +
-# objective.bootstrap_frac 0.5 + objective.sched_warmup_frac 0.3 +
-# optim.lr 5e-5 + optim.warmup 200 + steps 36000.
+# The defaults ARE the reference world-model recipe minus the bootstrap term:
+# clean-context objective with 1-step scheduled sampling (ramped to 0.7),
+# ctx-noise band 0.05-0.15, image batches 0.15 taken from episode frame 0,
+# joint proprio w0.3. The K=1-maker is the bootstrap term, ramped in over the
+# second half of the SAME run (objective.bootstrap_frac 0.5 with
+# bootstrap_start_frac 0.55 / bootstrap_ramp_frac 0.10, optim.lr_final 5e-5).
+# See scripts/train_gridworld.sh for the end-to-end recipe.
 
 
 @dataclass
@@ -157,7 +163,8 @@ class DynamicsDataConfig:
     val_frac: float = 0.05      # episode fraction held out for validation
     seq_len: int = 4            # training window (frames); 4 is a SHARP optimum
     batch_size: int = 64
-    proprio: str = "none"       # none|player (gridworld)|auto (dataset-stored)
+    proprio: str = "auto"       # auto (the adapter's default state), none, or an
+                                # adapter's own mode -- see dreamer4.data.PROPRIO_MODES
     cameras: str = ""           # LeRobot only: restrict/order cameras
     camera_layout: str = "hstack"   # LeRobot only: camera tiling
     episode_cache: int = 64     # decoded episodes kept while pre-encoding
@@ -174,9 +181,9 @@ class DynamicsModelConfig:
     n_register: int = 4
     k_max: int = 4              # finest shortcut grid (d_min = 1/k_max)
     K: int = 4                  # denoising steps per frame at inference/eval
-    time_every: int = 4         # d8/te4: same gate class as te2 at half the
-                                # time layers (2026-07-21 depth ladder; user
-                                # default). TOTAL depth sets the class.
+    time_every: int = 4         # time attention every N layers. d8/te4 gates
+                                # as well as te2 with half the time layers:
+                                # TOTAL depth sets the quality class.
     logit_cap: float = 50.0
 
 
@@ -202,11 +209,14 @@ class ObjectiveConfig:
                                         #   seed spread ~7x vs 0.5)
     sched_warmup_frac: float = 0.4      # ramp sched prob 0 -> target over this frac
     image_batch_prob: float = 0.15      # prob of a T=1 no-context step (dream-from-
-                                        #   scratch; KEEP 0.15 — 0.3 retracted)
-    image_batch_frame0: bool = True     # image batches use episode frame 0 only
-                                        #   (terminal frames taught sprite-dropping)
-    bootstrap_frac: float = 0.0         # >0 adds the shortcut bootstrap term (STEP 4:
-                                        #   0.5 — trains flexible inference K=1/2/4)
+                                        #   scratch); 0.3 measured worse
+    bootstrap_frac: float = 0.0         # TARGET bootstrap batch fraction; >0 adds the
+                                        #   shortcut bootstrap term (the recipe uses 0.5
+                                        #   — makes K=1/2/4 inference all legal)
+    bootstrap_start_frac: float = 0.0   # hold the fraction at 0 for this frac of the
+                                        #   run before ramping (0 = target from step 1)
+    bootstrap_ramp_frac: float = 0.0    # ramp 0 -> bootstrap_frac over this frac of the
+                                        #   run, then hold to the end (0 = step change)
     boot_weight: float = 0.5            # relative weight of the bootstrap term
     proprio_weight: float = 0.3         # relative weight of the joint proprio term
 
@@ -231,7 +241,7 @@ class DynamicsTrainConfig:
     tokenizer: TokenizerRefConfig = field(default_factory=TokenizerRefConfig)
     objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
     optim: OptimConfig = field(default_factory=lambda: OptimConfig(
-        grad_clip=0.5, amp=False))      # the production dynamics runs are fp32
+        grad_clip=0.5, amp=False))      # the reference dynamics recipe is fp32
     eval: DynamicsEvalConfig = field(default_factory=DynamicsEvalConfig)
 
     out: str = "runs/dynamics"
@@ -242,112 +252,9 @@ class DynamicsTrainConfig:
     val_every: int = 2000
     ckpt_every: int = 4000
     resume: bool = False        # continue from <out>/checkpoints/latest.pt
-    init_from: str = ""         # warm-start weights (bootstrap-LATER fine-tune)
+    init_from: str = ""         # warm-start weights from this checkpoint
     max_minutes: float = 0.0    # wall-clock budget; 0 = none
-    tag: str = ""               # free-form label for the experiment journal
-
-
-# ---------------------------------------------------------------------------
-# Agent training config (phase 2 — BC + reward + continue on agent tokens)
-# ---------------------------------------------------------------------------
-#
-# The dynamics ARCHITECTURE is not configured here: the agent trainer
-# requires ``--init_from`` (a train_dynamics checkpoint) and rebuilds that
-# exact model with ``n_agent`` agent tokens in ``wm_agent`` mode. Defaults =
-# the recipe: warm-start the whole transformer at the proven ft lr 5e-5,
-# fresh heads at 3e-4, keep the phase-1 clean-context WM loss running
-# (paper: "we continue to apply the video prediction loss"), BC only on
-# low-noise non-sticky episodes (the paper's task-relevant 50% analog).
-
-
-@dataclass
-class AgentDataConfig:
-    """What to finetune on. Episodes must carry actions AND rewards."""
-
-    path: str = ""              # dataset dir(s), comma-separated
-    val_frac: float = 0.05      # episode fraction held out for validation
-    seq_len: int = 4            # forward window — MUST stay the WM's trained window
-    batch_size: int = 64        # world-model (clean-context) batch
-    agent_batch_size: int = 64  # agent-heads batch (the second forward)
-    proprio: str = "player"     # must match the warm-start dynamics model
-    bc_frac: float = 0.5        # agent-batch fraction drawn from episodes the
-                                #   dataset says are worth imitating (paper's
-                                #   50/50 relevant/uniform). NOT a BC-quality
-                                #   knob — BC already ignores the rest via the
-                                #   row weight. It buys the REWARD head states
-                                #   an expert never visits, which is exactly
-                                #   where a phase-3 dream wanders.
-    end_frac: float = 0.25      # per-sample prob of pinning the window to the
-                                #   episode END (terminal frames for the
-                                #   reward heads)
-    episode_cache: int = 64     # decoded episodes kept while pre-encoding
-
-
-@dataclass
-class AgentModelConfig:
-    """Agent-token + head architecture (see dreamer4.models.agent)."""
-
-    n_agent: int = 3            # agent tokens per timestep; slots: 0 policy,
-                                #   1 reward, 2 value (phase 3)
-    num_tasks: int = 1          # gridworld is single-task (constant id 0)
-    mtp_length: int = 3         # MTP horizon; window 4 supports n=0..2
-                                #   (paper L=8 needs long contexts)
-    head_mlp_depth: int = 2     # hidden layers in each head MLP
-    head_mlp_ratio: float = 2.0  # head hidden = d_model * this
-    num_bins: int = 255         # SymExpTwoHot bins (reward/value heads)
-    bin_low: float = -20.0      # two-hot range in SYMLOG space; +-20 covers
-    bin_high: float = 20.0      #   +-e^20 (Minecraft-scale) — gridworld's
-                                #   +-1 rewards decode cleaner on +-3
-
-
-@dataclass
-class AgentLossConfig:
-    """Agent loss terms; RELATIVE weights (everything is RMS-normalized
-    together with the WM terms — paper: no hand-tuned scales)."""
-
-    bc_weight: float = 1.0
-    reward_weight: float = 0.3      # near-trivial modality: small weight
-                                    #   suffices (2026-07-04 lossnorm rule).
-                                    #   Termination is DERIVED from this head
-                                    #   (no continue head) — gated by term_f1.
-
-
-@dataclass
-class AgentOnlineEvalConfig:
-    """Online policy evaluation in the real GridWorld-v0 env."""
-
-    episodes: int = 300         # episodes per online eval
-    seed: int = 1000000         # env layout seeds (disjoint from the dataset's)
-    every: int = 0              # eval every N steps (0 = only after training)
-
-
-@dataclass
-class AgentTrainConfig:
-    """Top-level config for ``dreamer4.train.train_agent`` (phase 2)."""
-
-    data: AgentDataConfig = field(default_factory=AgentDataConfig)
-    agent: AgentModelConfig = field(default_factory=AgentModelConfig)
-    loss: AgentLossConfig = field(default_factory=AgentLossConfig)
-    tokenizer: TokenizerRefConfig = field(default_factory=TokenizerRefConfig)
-                                # empty ckpt = reuse the dynamics checkpoint's
-    objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
-    optim: OptimConfig = field(default_factory=lambda: OptimConfig(
-        lr=5e-5, warmup=200, grad_clip=0.5, amp=False))
-    eval: DynamicsEvalConfig = field(default_factory=DynamicsEvalConfig)
-    online: AgentOnlineEvalConfig = field(default_factory=AgentOnlineEvalConfig)
-
-    out: str = "runs/agent"
-    steps: int = 20000
-    seed: int = 0
-    device: str = "cuda"
-    head_lr: float = 3e-4       # fresh heads (policy/reward/continue/task)
-    log_every: int = 50
-    val_every: int = 2000
-    ckpt_every: int = 4000
-    resume: bool = False
-    init_from: str = ""         # REQUIRED: train_dynamics checkpoint to finetune
-    max_minutes: float = 0.0
-    tag: str = ""
+    tag: str = ""               # free-form label recorded in experiments.jsonl
 
 
 # ---------------------------------------------------------------------------

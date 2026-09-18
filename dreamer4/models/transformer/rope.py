@@ -1,27 +1,21 @@
 """
-Rotary Position Embeddings (RoPE) for Dreamer 4.
+Rotary position embeddings (RoPE): cache construction, application, and re-rotation.
 
-RoPE encodes token positions by *rotating* the query and key vectors in
-the complex plane. Two tokens with the same relative distance will always
-produce the same dot-product contribution, regardless of their absolute
-positions — this is the key advantage over additive sinusoidal embeddings.
+RoPE encodes a position by rotating the Q and K vectors by an angle proportional to it. The
+angles cancel in the dot product, so an attention score depends only on the distance between
+two tokens and not on where the pair sits in the sequence. Low-frequency dimensions carry
+coarse position, high-frequency ones fine position.
 
-HOW IT WORKS (intuition):
-  Think of each pair of consecutive dimensions (d0, d1) as a 2D point.
-  RoPE rotates this point by an angle proportional to the position:
-    angle = position * frequency
+Everything here is 1D. Tokens live on a 2D grid (timestep, spatial index), and the two axes
+are handled by rotating over the *full* head dimension separately in each attention type:
+space attention rotates by spatial index inside a frame, time attention by timestep. The head
+dimension is split in half and ``(x_i, x_i+half)`` is the pair rotated together, so the
+angle table is tiled twice rather than interleaved.
 
-  Low-frequency dimensions capture coarse position (far vs close),
-  high-frequency dimensions capture fine position (exact offset).
-
-  When computing Q · K, the rotation angles subtract, so the attention
-  score only depends on the *relative* position (pos_q - pos_k).
-
-FOR THE 2D CASE (space + time):
-  Dreamer 4 has tokens arranged on a 2D grid: (time_step, spatial_token).
-  We use "axial RoPE": split the head dimension in half, apply 1D RoPE
-  with spatial positions on the first half and temporal positions on the
-  second half. This is the standard approach for video transformers.
+    build_rope_cache(seq_len, head_dim) -> (cos, sin), each (seq_len, head_dim)
+    apply_rope(x, cos, sin)             -> x rotated to positions [0, seq_len)
+    shift_rope(x, cos, sin, shift)      -> x re-rotated backward by a constant offset, used
+                                           when the KV cache evicts its oldest frames
 
 Reference: Su et al., 2021 — "RoFormer: Enhanced Transformer with Rotary
 Position Embedding"
@@ -52,8 +46,9 @@ def build_rope_cache(
         device: Device for the output tensors.
 
     Returns:
-        cos_cache: (seq_len, head_dim) — cosines, repeated for each dim pair.
-        sin_cache: (seq_len, head_dim) — sines, repeated for each dim pair.
+        cos_cache: (seq_len, head_dim) — cosines; the half-length angle table is tiled
+                   twice, so dimensions i and i + head_dim/2 share an angle.
+        sin_cache: (seq_len, head_dim) — sines, same layout.
 
     Example:
         >>> cos, sin = build_rope_cache(128, head_dim=64)
@@ -63,8 +58,8 @@ def build_rope_cache(
     assert head_dim % 2 == 0, f"head_dim must be even, got {head_dim}"
     half = head_dim // 2
 
-    # Frequencies: freq_i = 1 / base^(2i/d) for i in [0, half)
-    # We compute in log-space for numerical stability
+    # Frequencies: freq_i = 1 / base^(2i/d) for i in [0, half),
+    # evaluated as exp(-2i/d * log(base)) for numerical stability
     i = torch.arange(half, device=device, dtype=torch.float32)
     freq = torch.exp(-i * (2.0 / head_dim) * torch.log(torch.tensor(base)))
     # freq shape: (half,)
@@ -76,9 +71,9 @@ def build_rope_cache(
     # angles[p, i] = pos[p] * freq[i]
     angles = torch.outer(pos, freq)  # (seq_len, half)
 
-    # Duplicate each angle for the pair of dimensions it applies to:
-    # [angle_0, angle_0, angle_1, angle_1, ...]
-    # This makes the shape (seq_len, head_dim), matching the head dimension
+    # Tile the angle table so dimensions i and i+half share an angle:
+    # [a_0, ..., a_half-1, a_0, ..., a_half-1] — the half-split layout that
+    # apply_rope rotates in. Shape becomes (seq_len, head_dim).
     cos_cache = torch.cos(angles).repeat(1, 2)  # (seq_len, head_dim)
     sin_cache = torch.sin(angles).repeat(1, 2)  # (seq_len, head_dim)
 
@@ -91,17 +86,19 @@ def apply_rope(
     sin: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Apply rotary position embedding to a tensor.
+    Apply rotary position embedding to Q or K.
 
-    For each consecutive pair of dimensions (x0, x1), applies:
-        x0' = x0 * cos - x1 * sin
-        x1' = x0 * sin + x1 * cos
-
-    This is equivalent to rotating the 2D vector (x0, x1) by the angle.
+    Dimensions are paired half against half — ``(x_i, x_i+half)`` is one 2D vector, rotated
+    by that position's angle:
+        x_i'      = x_i * cos - x_i+half * sin
+        x_i+half' = x_i * sin + x_i+half * cos
+    This is the layout build_rope_cache emits (i and i+half share an angle), not the
+    interleaved-pair variant.
 
     Args:
         x:   (..., seq_len, head_dim) — typically Q or K.
-        cos: (seq_len, head_dim) — cosine cache from build_rope_cache.
+        cos: (seq_len, head_dim) — cosine cache from build_rope_cache. A single-row
+             (1, head_dim) cache is allowed and applies one rotation to every position.
         sin: (seq_len, head_dim) — sine cache from build_rope_cache.
 
     Returns:
@@ -121,9 +118,8 @@ def apply_rope(
         cos = cos.unsqueeze(0)
         sin = sin.unsqueeze(0)
 
-    # Build the "rotated" version: swap pairs and negate first of each pair
-    # For dimensions [d0, d1, d2, d3, ...] -> [-d1, d0, -d3, d2, ...]
-    # This is the standard RoPE rotation formula
+    # Partner vector of the rotation: the upper half moves to the front, negated.
+    # [d_0 ... d_half-1, d_half ... d_2half-1] -> [-d_half ... -d_2half-1, d_0 ... d_half-1]
     half = head_dim // 2
     x_rot = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
@@ -139,16 +135,14 @@ def shift_rope(
     """
     Rotate ``x`` **backward** by a constant ``shift`` positions in RoPE space.
 
-    If ``x`` currently carries RoPE for absolute positions ``[p, p+L)`` then
-    after ``shift_rope(x, cos, sin, shift=s)`` it carries RoPE for positions
-    ``[p - s, p - s + L)``. The operation is the inverse rotation by ``s``
-    positions — i.e. apply RoPE with angle ``-s * freq``, using the identities
-    ``cos(-a) = cos(a)`` and ``sin(-a) = -sin(a)``.
+    If ``x`` carries RoPE for absolute positions ``[p, p+L)``, then after
+    ``shift_rope(x, cos, sin, shift=s)`` it carries RoPE for ``[p - s, p - s + L)``. It is the
+    inverse rotation by ``s`` positions, applied as RoPE with angle ``-s * freq`` via
+    ``cos(-a) = cos(a)``, ``sin(-a) = -sin(a)``.
 
-    Used by the KV cache sliding window: after evicting the oldest ``s``
-    cached frames, the remaining cached K's effective positions shift from
-    ``[s, T_cached)`` back to ``[0, T_cached - s)`` — that's a single rotation
-    by ``-s``, applied uniformly across all cached positions.
+    Used by the KV cache sliding window: evicting the oldest ``s`` frames moves the remaining
+    cached K from effective positions ``[s, T_cached)`` back to ``[0, T_cached - s)``, which
+    is one uniform rotation by ``-s`` rather than a re-encode.
 
     Args:
         x: ``(..., seq_len, head_dim)`` — e.g. cached K tensors of shape

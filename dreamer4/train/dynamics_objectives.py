@@ -1,7 +1,10 @@
 """
-Training objectives for the latent-space dynamics model — ALL of them.
+Training objectives for the latent-space dynamics model (phase 1b).
 
-Two objectives, selected by ``--objective.objective``:
+Each objective takes a batch of clean latent windows plus their ALIGNED
+actions and returns the loss terms that :mod:`dreamer4.train.train_dynamics`
+weights and backpropagates. Two are available, selected by
+``--objective.objective``:
 
 1. :func:`shortcut_forcing_loss` — the paper's objective (Section 3.2,
    Eq. 4/7). Every frame of the window is independently noised at its own
@@ -9,10 +12,10 @@ Two objectives, selected by ``--objective.objective``:
    step + a bootstrap term distilling two half-steps). Kept as the faithful
    baseline; on sparse content it collapses — the model learns to denoise
    each frame from its own input instead of reading context and actions.
-2. :func:`clean_context_loss` — the production fix. Context frames stay
-   nearly clean (the inference regime); ONE target frame is noised across
-   the full signal grid and is the only graded frame — the model can only
-   score by reading context + action. Adds the exposure-bias machinery the
+2. :func:`clean_context_loss` — the default. Context frames stay nearly
+   clean (the inference regime); ONE target frame is noised across the full
+   signal grid and is the only graded frame — the model can only score by
+   reading context + action. Adds the exposure-bias machinery the gridworld
    recipe relies on: a context-noise band, scheduled sampling, an optional
    single-slot bootstrap term, and a joint proprio stream.
 
@@ -24,10 +27,10 @@ velocity-space steps of the bootstrap teacher (Eq. 7).
 discrete spaces) driving the ``t -> t+1`` transition. The model is fed
 per-frame ALIGNED actions with a start flag: ``A[t] = [a[t-1], 0]`` — "the
 action that led into frame t" — and ``A[0] = [zeros, 1]`` (nothing led into
-the first frame of a window). For gridworld's one-hot moves this reproduces
-the proven 5-category NULL encoding exactly; for continuous robot actions it
-is the natural generalization. The helper is the model's input convention and
-lives with the model: :func:`dreamer4.models.dynamics.align_actions`.
+the first frame of a window). For one-hot moves this reproduces a discrete
+NULL category exactly; for continuous robot actions it is the natural
+generalization. The helper is the model's input convention and lives with
+the model: :func:`dreamer4.models.dynamics.align_actions`.
 
 **Two noise parameterizations to keep straight** (both inherited from the
 paper): ``tau`` is a SIGNAL level (``tau=1`` is clean — corruption mixes
@@ -35,11 +38,11 @@ paper): ``tau`` is a SIGNAL level (``tau=1`` is clean — corruption mixes
 NOISE fractions (``0.1`` means 10% noise — mixing ``(1-tc) * clean +
 tc * noise``). The context helpers below say which one they take.
 
-Deliberately NOT ported from the root-level experimental script: naive deep
-roll-in (measured harmful — contradictory supervision), relabeled roll-in
-(requires a queryable env transition rule — impossible on real video),
-alternating batch lengths and the shortcut-mix schedule (both superseded by
-the bootstrap-later fine-tune in the production recipe).
+Deliberately not implemented here, after being tried: naive deep roll-in
+(harmful — the supervision it produces is self-contradictory) and roll-in
+with relabeled targets (needs a queryable env transition rule, which
+recorded video cannot offer). Alternating batch lengths and a shortcut-mix
+schedule are both superseded by the bootstrap ramp late in training.
 """
 
 from __future__ import annotations
@@ -60,10 +63,13 @@ def sample_flow_schedule(
     B: int, T: int, k_max: int, device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Schedule for the flow-matching (empirical) portion of a batch: always the
-    finest step size d_min = 1/k_max, tau uniform on its grid.
+    Schedule for the flow-matching (empirical) portion of a batch.
 
-    Returns (d, step_idx, tau, signal_idx), each (B, T).
+    Always the finest step size ``d_min = 1/k_max``, with ``tau`` uniform on
+    that grid.
+
+    Returns:
+        ``(d, step_idx, tau, signal_idx)``, each ``(B, T)``.
     """
     emax = _log2_int(k_max)
     step_idx = torch.full((B, T), emax, device=device, dtype=torch.long)
@@ -76,11 +82,14 @@ def sample_bootstrap_schedule(
     B: int, T: int, k_max: int, device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Schedule for the bootstrap (self-distillation) portion, paper Eq. 4:
-    ``d ~ 1/U({1, 2, ..., k_max/2})`` (excluding d_min), ``tau`` uniform on
-    the grid reachable with that d.
+    Schedule for the bootstrap (self-distillation) portion, paper Eq. 4.
 
-    Returns (d, step_idx, tau, signal_idx), each (B, T).
+    ``d ~ 1/U({1, 2, ..., k_max/2})`` — every step size EXCEPT ``d_min``,
+    which is what the flow term already covers — and ``tau`` uniform on the
+    grid reachable with that ``d``.
+
+    Returns:
+        ``(d, step_idx, tau, signal_idx)``, each ``(B, T)``.
     """
     emax = _log2_int(k_max)
     # step_idx in [0, emax): 0 -> d=1, 1 -> d=1/2, ..., emax-1 -> d=2/k_max
@@ -99,8 +108,11 @@ def _expand(t: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
 
 def corrupt_representations(clean: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
     """
-    Corrupt to SIGNAL level ``tau``: ``(1 - tau) * z0 + tau * clean`` with
-    ``z0 ~ N(0, I)``. ``tau``'s shape must be a leading prefix of ``clean``'s.
+    Corrupt ``clean`` down to SIGNAL level ``tau``.
+
+    ``(1 - tau) * z0 + tau * clean`` with ``z0 ~ N(0, I)``, so ``tau = 1``
+    leaves the input untouched. ``tau``'s shape must be a leading prefix of
+    ``clean``'s; the trailing dims are broadcast over.
     """
     z0 = torch.randn_like(clean)
     tau = _expand(tau, clean)
@@ -149,16 +161,25 @@ def shortcut_forcing_loss(
     agent_tokens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Flow term (every frame, d = d_min) + bootstrap term (a batch fraction at
-    coarser d; teacher = two half-steps in velocity space, no-grad), both
-    ramp-weighted. See the module docstring for when NOT to use this.
+    The paper's objective: flow term plus self-distilled bootstrap term.
+
+    The flow term grades every frame at ``d = d_min``; the bootstrap term
+    grades a fraction of the ROWS at coarser ``d`` against a no-grad teacher
+    that takes two half-steps in velocity space. Both are ramp-weighted. See
+    the module docstring for when NOT to use this.
 
     Args:
-        z1:      (B, T, Nz, Dz) clean packed representations.
-        actions: (B, T, D_a+1) aligned actions (or None for unconditional).
+        z1:                 (B, T, Nz, Dz) clean packed representations.
+        actions:            (B, T, D_a+1) aligned actions, or None for an
+                            unconditional model.
+        k_max:              Finest shortcut grid (``d_min = 1/k_max``).
+        bootstrap_fraction: Fraction of the batch rows put on the bootstrap
+                            schedule; the rest carry the flow term.
+        agent_tokens:       (B, T, n_agent, d_model) or None.
 
     Returns:
-        (scalar loss, aux dict of detached diagnostics).
+        ``(scalar loss, aux)`` where ``aux`` holds detached diagnostics
+        (flow_mse, boot_mse, loss_flow, loss_boot, tau_mean).
     """
     device = z1.device
     B, T = z1.shape[:2]
@@ -247,19 +268,36 @@ def clean_context_loss(
     """
     Predict frame ``p`` of ``z1`` from its (nearly) clean context.
 
+    Only frame ``p`` is graded, so the only way to score is to read the
+    context frames and the action that led into ``p``.
+
     Args:
-        z1:       (B, T, Nz, Dz) clean packed latents, T > p.
-        actions:  (B, T, D_a+1) ALIGNED actions (:func:`align_actions`).
-        p:        Target frame index (0 = no context: image batch).
-        proprio:  (B, T, d_p) joint proprio stream, iff the model has one —
-                  context corrupted like the latents, target noised with the
-                  SAME tau and denoised jointly.
-        (others:  see the module docstring.)
+        z1:             (B, T, Nz, Dz) clean packed latents, T > p.
+        actions:        (B, T, D_a+1) ALIGNED actions (:func:`align_actions`).
+        p:              Target frame index (0 = no context, an image batch).
+        k_max:          Finest shortcut grid (``d_min = 1/k_max``).
+        K:              Denoising steps used by the scheduled-sampling
+                        generation of the last context frame.
+        tau_ctx:        Context NOISE fraction, and the fallback when no band
+                        is given. Matches the inference-time corruption.
+        ctx_noise_min:  Low end of the per-frame context-noise band; None
+                        falls back to ``tau_ctx``.
+        ctx_noise_max:  High end of that band; None (or <= the low end)
+                        disables the band and uses a fixed level.
+        do_sched:       Replace the LAST context frame with the model's own
+                        1-step generation (scheduled sampling), so training
+                        sees the kind of error a rollout actually feeds back.
+                        Needs ``p >= 2``; ignored otherwise.
+        proprio:        (B, T, d_p) joint proprio stream, iff the model has
+                        one — context corrupted like the latents, target
+                        noised with the SAME tau and denoised jointly.
+        bootstrap_frac: Fraction of the rows whose target slot also carries
+                        the bootstrap term (0 disables it).
 
     Returns:
-        terms: {"flow": t, "proprio": t | None, "bootstrap": t | None} for the
-               trainer's LossCombiner.
-        aux:   float diagnostics (flow_mse, boot_mse).
+        ``(terms, aux)``. ``terms`` is {"flow": t, "proprio": t | None,
+        "bootstrap": t | None} for the trainer's ``LossCombiner``; ``aux``
+        holds float diagnostics (flow_mse, boot_mse).
     """
     B = z1.shape[0]
     device = z1.device

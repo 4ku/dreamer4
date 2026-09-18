@@ -1,18 +1,17 @@
-"""
-Distributions for Dreamer 4 agent heads.
+"""Symlog and two-hot primitives for the scalar heads (reward and value).
 
-Provides:
-    symlog / symexp — Symmetric log/exp transforms (Dreamer 3, Appendix B).
-    SymExpTwoHot   — Discretized distribution used for reward and value
-                     prediction. Bin centers are linearly spaced in symlog
-                     space then mapped to value space via symexp.
+The reward and value heads do not regress a scalar directly; they predict a categorical
+distribution over fixed bins and take its expectation, as in DreamerV3. Bin centres are spaced
+uniformly in symlog space and mapped back with symexp, which concentrates resolution near zero
+(where most rewards live) while still covering a wide range.
 
-The two-hot encoding places probability mass on exactly two adjacent bins,
-interpolating linearly based on proximity to the true value. This gives a
-smooth, differentiable target for cross-entropy training while remaining
-expressive enough to represent multi-modal reward distributions.
+    symlog / symexp -- symmetric log and exp transforms, inverses of each other.
+    SymExpTwoHot    -- the binned distribution: ``encode`` builds the soft target, ``decode``
+                       turns logits back into a scalar, ``loss`` is the cross-entropy.
 
-Paper reference: Section 3.3 (reward/value heads use symexp twohot output).
+The two-hot target puts mass on exactly the two bins adjacent to the true value, interpolating
+linearly between them, which keeps the cross-entropy target smooth while letting the prediction
+stay multi-modal.
 """
 
 from __future__ import annotations
@@ -33,17 +32,14 @@ def symexp(x: torch.Tensor) -> torch.Tensor:
 
 
 class SymExpTwoHot(nn.Module):
-    """
-    Discretized scalar distribution with symexp-spaced bins.
-
-    Bin centers are uniformly spaced in symlog space over [low, high],
-    then mapped to value space via symexp. This concentrates resolution
-    near zero (where most rewards live) while covering a wide range.
+    """Discretized scalar distribution with symexp-spaced bins.
 
     Args:
-        num_bins: Number of discrete bins (odd recommended for a bin at 0).
-        low:      Lower bound in symlog space.
-        high:     Upper bound in symlog space.
+        num_bins: Number of discrete bins (odd recommended, so that one bin sits at 0).
+        low:      Lower bound in SYMLOG space; the lowest bin centre is ``symexp(low)``.
+        high:     Upper bound in SYMLOG space. The range must cover the environment's rewards
+                  and little more -- far-out bins carrying even a thousandth of the probability
+                  mass move the decoded scalar by orders of magnitude.
     """
 
     def __init__(
@@ -60,18 +56,16 @@ class SymExpTwoHot(nn.Module):
         self.register_buffer("bin_values", bin_values)
 
     def encode(self, values: torch.Tensor) -> torch.Tensor:
-        """
-        Produce a soft two-hot encoding for scalar values.
+        """Produce a soft two-hot encoding for scalar values.
 
-        For each value, finds the two adjacent bins and distributes
-        weight proportional to proximity (linear interpolation).
+        For each value, finds the two adjacent bins and splits the weight between them in
+        proportion to proximity (linear interpolation). Values outside the bin range are clamped.
 
         Args:
             values: (*) arbitrary-shape scalar tensor.
 
         Returns:
-            (*, num_bins) two-hot encoding with exactly two non-zero
-            entries per row that sum to 1.
+            (*, num_bins) two-hot encoding with at most two non-zero entries per row, summing to 1.
         """
         shape = values.shape
         flat = values.reshape(-1)
@@ -99,13 +93,10 @@ class SymExpTwoHot(nn.Module):
         return encoded.reshape(*shape, self.num_bins)
 
     def decode(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        Decode bin logits to scalar values.
-
-        Applies softmax then computes expectation over bin values.
+        """Decode bin logits to scalar values: softmax, then expectation over the bin centres.
 
         Args:
-            logits: (*, num_bins) raw logits from network.
+            logits: (*, num_bins) raw logits from the head.
 
         Returns:
             (*) scalar predicted values.
@@ -116,15 +107,14 @@ class SymExpTwoHot(nn.Module):
     def log_prob(
         self, logits: torch.Tensor, values: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Negative cross-entropy of logits against two-hot targets.
+        """Negative cross-entropy of logits against the two-hot targets of ``values``.
 
         Args:
             logits: (*, num_bins) raw logits.
             values: (*) scalar targets.
 
         Returns:
-            (*) log probability (negative cross-entropy per element).
+            (*) log probability, one per element.
         """
         target = self.encode(values)
         log_probs = F.log_softmax(logits, dim=-1)
@@ -133,14 +123,13 @@ class SymExpTwoHot(nn.Module):
     def loss(
         self, logits: torch.Tensor, values: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Mean cross-entropy loss against two-hot targets.
+        """Mean cross-entropy loss against the two-hot targets of ``values``.
 
         Args:
             logits: (*, num_bins) raw logits.
             values: (*) scalar targets.
 
         Returns:
-            Scalar loss (mean over all elements).
+            Scalar loss, averaged over all elements.
         """
         return -self.log_prob(logits, values).mean()

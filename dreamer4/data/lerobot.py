@@ -10,16 +10,17 @@ A LeRobot dataset (https://github.com/huggingface/lerobot) is laid out as:
 
 The VIDEO tree is always consumed: cameras are the subdirectories under
 ``videos/chunk-*/`` (feature keys like ``observation.images.top``); episodes
-are matched across cameras by chunk + file stem, keeping only episodes
-present in every camera.
+are matched across cameras by chunk + file stem. Only episodes present in
+EVERY camera survive, and the ones that do not are dropped silently — a
+camera with a short recording shrinks the dataset without any error.
 
 The PARQUET files are read on demand (``pyarrow``, an optional dependency —
-``pip install dreamer4[lerobot]``): ``action`` vectors when the dynamics
-trainer asks for actions, and ``observation.state`` as the proprio stream
-when opened with ``proprio="auto"``. Row ``t`` of both belongs to frame
+``pip install 'dreamer4-pytorch[lerobot]'``): ``action`` vectors when the
+dynamics trainer asks for actions, and ``observation.state`` as the proprio
+stream when opened with ``proprio="auto"``. Row ``t`` of both belongs to frame
 ``t``; per the unified contract, ``action[t]`` drives the ``t -> t+1``
-transition. Values are passed through UNNORMALIZED — normalize per-robot
-when real data lands (LeRobot ships stats in ``meta/``).
+transition. Values are passed through UNNORMALIZED — per-robot normalization
+is the caller's concern (LeRobot ships stats in ``meta/``).
 
 Multiple cameras are tiled into ONE frame per timestep
 (:func:`compose_cameras`): the tokenizer backbone is patch-count-agnostic
@@ -27,8 +28,8 @@ Multiple cameras are tiled into ONE frame per timestep
 
 Videos are decoded on demand with imageio(-ffmpeg) and LRU-cached per
 DataLoader worker. Each cache entry is one decoded (camera, episode) clip —
-for long/high-res episodes lower ``episode_cache`` and hide decode latency
-with more workers.
+for long or high-resolution episodes lower ``episode_cache`` and hide decode
+latency with more workers.
 """
 
 from __future__ import annotations
@@ -102,6 +103,22 @@ class LeRobotVideoDataset(EpisodeVideoDataset):
         episode_cache: Decoded (camera, episode) clips kept in memory.
     """
 
+    #: Proprio comes from the dataset's own ``observation.state`` under the
+    #: generic "auto" mode, so this adapter derives no extra modes of its own.
+    PROPRIO_MODES = ()
+
+    @classmethod
+    def recognizes(cls, root: Path) -> bool:
+        return (root / "meta").is_dir() and (root / "videos").is_dir()
+
+    @classmethod
+    def from_path(cls, root: Path, *, proprio: str = "none",
+                  actions: bool = False, cameras=None,
+                  camera_layout: str = "hstack", episode_cache: int = 64, **_):
+        return cls(root, cameras=cameras, camera_layout=camera_layout,
+                   actions=actions, state_as_proprio=(proprio == "auto"),
+                   episode_cache=episode_cache)
+
     def __init__(self, root: Union[str, Path], *,
                  cameras: Optional[Sequence[str]] = None,
                  camera_layout: str = "hstack", actions: bool = False,
@@ -145,8 +162,11 @@ class LeRobotVideoDataset(EpisodeVideoDataset):
         """
         Match episodes by chunk+stem across camera dirs (and the data/ tree).
 
-        Returns (video_episodes, parquets): per episode a {camera: path} dict
-        and the matching ``data/chunk-*/<stem>.parquet`` path (or None).
+        Episodes missing from any camera are dropped without warning.
+
+        Returns:
+            (video_episodes, parquets): per episode a {camera: path} dict and
+            the matching ``data/chunk-*/<stem>.parquet`` path (or None).
         """
         per_cam: Dict[str, Dict[str, Path]] = {}
         for chunk in sorted((root / "videos").glob("chunk-*")):

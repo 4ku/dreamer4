@@ -1,59 +1,34 @@
 """
-Block-Causal Transformer for Dreamer 4.
+Block-causal transformer: the backbone shared by the tokenizer and the dynamics model.
 
-This is the top-level module that stacks BlockCausalLayers into a full
-transformer. It is the shared backbone used by both the tokenizer
-(encoder + decoder) and the dynamics model.
+Stacks ``depth`` BlockCausalLayers and applies a final RMSNorm; input and output are both
+``(B, T, S, D)``. Every layer runs space attention (within a timestep, under the layout's
+modality mask) and a SwiGLU MLP; every ``time_every``-th layer also runs causal time
+attention, so a token sees its own timestep in full and past timesteps at its own spatial
+position. RoPE supplies positions (independently along the space and time axes), GQA keeps
+the KV cache small, and QKNorm plus attention-logit capping keep the deep stack stable.
 
-ARCHITECTURE SUMMARY:
+    Input (B, T, S, D)
+      -> [layer 0]  space + mlp
+      -> [layer 1]  space + mlp
+      -> [layer 2]  space + mlp
+      -> [layer 3]  space + TIME + mlp        (time_every=4)
+      -> ...
+      -> RMSNorm
+      -> Output (B, T, S, D)
 
-    Input: (B, T, S, D)
-      |
-      v
-    [BlockCausalLayer 0]  space_attn + mlp
-    [BlockCausalLayer 1]  space_attn + mlp
-    [BlockCausalLayer 2]  space_attn + mlp
-    [BlockCausalLayer 3]  space_attn + TIME_attn + mlp   (time_every=4)
-    [BlockCausalLayer 4]  space_attn + mlp
-    ...
-    [BlockCausalLayer N-1]
-      |
-      v
-    RMSNorm (final)
-      |
-      v
-    Output: (B, T, S, D)
+The caller supplies the TokenLayout that defines S and the mask mode:
 
-Each layer has:
-  - Space attention with modality mask (within each time step)
-  - Time attention with causal mask (every Nth layer, across time steps)
-  - SwiGLU MLP
+    tokenizer encoder:  TokenLayout(n_latents=16, segments=((Modality.IMAGE, 196),))
+                        with space_mode="encoder"
+    dynamics model:     TokenLayout(n_latents=0, segments=((Modality.ACTION, 1),
+                        (Modality.SHORTCUT_SIGNAL, 1), (Modality.SPATIAL, 128),
+                        (Modality.REGISTER, 4), (Modality.AGENT, 1)))
+                        with space_mode="wm_agent"
 
-Key features:
-  - RoPE for positional encoding (separate spatial and temporal)
-  - GQA for efficient KV cache
-  - QKNorm + logit soft capping for training stability
-  - Pre-norm residual connections
-
-USAGE:
-
-    For the tokenizer encoder:
-        layout = TokenLayout(n_latents=16, segments=((Modality.IMAGE, 196),))
-        transformer = BlockCausalTransformer(
-            d_model=256, n_heads=4, depth=8,
-            layout=layout, space_mode="encoder",
-            ...
-        )
-
-    For the dynamics model:
-        layout = TokenLayout(n_latents=0, segments=(
-            (Modality.ACTION, 1), (Modality.SPATIAL, 128),
-            (Modality.REGISTER, 4), (Modality.AGENT, 1), ...
-        ))
-        transformer = BlockCausalTransformer(
-            d_model=512, n_heads=8, n_kv_heads=2, depth=16,
-            layout=layout, space_mode="wm_agent", ...
-        )
+``forward`` doubles as the rollout path: hand it a ``KVCache`` (from ``make_kv_cache``) and it
+attends against cached past K/V instead of recomputing the past. ``patchify`` / ``unpatchify``
+live here too — the pixel-space helpers that turn frames into patch tokens and back.
 """
 
 from __future__ import annotations
@@ -102,8 +77,8 @@ def patchify(images: torch.Tensor, patch_size: int) -> torch.Tensor:
     # Merge batch and time for F.unfold, which expects 4D input
     x = images.reshape(B * T, C, H, W)
 
-    # F.unfold extracts sliding local blocks (patches) from the image.
-    # With stride == kernel_size, we get non-overlapping patches.
+    # F.unfold extracts sliding local blocks (patches) from the image; stride ==
+    # kernel_size makes them non-overlapping.
     # Output shape: (B*T, C * patch_size * patch_size, N_patches)
     patches = F.unfold(x, kernel_size=patch_size, stride=patch_size)
 
@@ -178,7 +153,8 @@ class BlockCausalTransformer(nn.Module):
         dropout:          Dropout rate (default 0.0).
         use_qk_norm:      Use QKNorm in attention (default True).
         logit_cap:        Attention logit soft capping (default 50.0).
-        max_T:            Max time steps for RoPE cache (default 1024).
+        max_T:            Max time steps for the temporal RoPE cache (default 256); also
+                          bounds the KV cache built by ``make_kv_cache``.
 
     Shape:
         Input:  (B, T, S, D) where
@@ -254,6 +230,8 @@ class BlockCausalTransformer(nn.Module):
         commit: bool = False,
     ) -> torch.Tensor:
         """
+        Run the stack over ``x``, optionally against a KV cache.
+
         Args:
             x: ``(B, T, S, D)`` input tensor.
             cache: optional ``KVCache`` for incremental decoding.

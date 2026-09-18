@@ -1,36 +1,30 @@
 """
-Transformer layers for Dreamer 4: SpaceAttention, TimeAttention, BlockCausalLayer.
+The stackable transformer layer and its two attention types.
 
-This module combines the building blocks (attention, MLP, norms, RoPE, modality
-masks) into the two types of attention layers and the full transformer layer.
+Assembles attention, MLP, norms, RoPE and the modality masks into one layer over a
+``(B, T, S, D)`` tensor — batch, timesteps, spatial tokens per timestep, model dimension —
+returning the same shape.
 
-THE BLOCK-CAUSAL PATTERN:
+  SpaceAttention: one timestep at a time. Reshape (B, T, S, D) -> (B*T, S, D), attend under
+    the modality mask with RoPE over spatial index, reshape back. Mixes tokens within a frame.
 
-  Given input (B, T, S, D):
-    - B = batch, T = time steps, S = spatial tokens, D = model dim
+  TimeAttention: one spatial position at a time. Reshape (B, T, S, D) -> (B*S, T, D), attend
+    causally with RoPE over timestep, reshape back. Mixes a position with its own past.
 
-  SpaceAttention: processes each time step independently.
-    Reshape (B, T, S, D) -> (B*T, S, D), apply attention with modality mask,
-    reshape back. This lets all tokens within a time step interact.
+Together they give the block-causal pattern: a token sees every token of its own timestep and
+every token of past timesteps, never the future. Time attention runs only every ``time_every``
+layers (default 4, paper Section 3.4), which saves compute and pushes most of the capacity
+into spatial processing.
 
-  TimeAttention: processes each spatial position independently across time.
-    Reshape (B, T, S, D) -> (B*S, T, D), apply CAUSAL attention, reshape back.
-    This lets each spatial position attend to its history (past time steps).
+One layer, pre-norm residuals (normalize before each sublayer, add to the residual):
 
-  The combination gives "block-causal": tokens can see all tokens at the
-  same time step, and all tokens at past time steps, but NOT future time steps.
+    x = x + SpaceAttention(RMSNorm(x))      # always
+    x = x + TimeAttention(RMSNorm(x))       # only on time layers
+    x = x + MLP(RMSNorm(x))                 # always
 
-  TimeAttention is only applied every Nth layer (default: every 4th layer,
-  as in the paper Section 3.4). This saves compute and provides an inductive
-  bias that focuses most computation on spatial processing.
-
-ONE TRANSFORMER LAYER:
-  x = x + SpaceAttention(RMSNorm(x))      # always
-  x = x + TimeAttention(RMSNorm(x))       # only every N layers
-  x = x + MLP(RMSNorm(x))                 # always
-
-This is the "pre-norm" residual pattern: normalize before each sublayer,
-add the result to the residual. This is more stable than post-norm.
+``forward`` is the training / full-sequence path; ``forward_incremental`` is the rollout path,
+which runs space attention and the MLP on new tokens only and exchanges time-attention K/V
+with the KV cache.
 """
 
 from __future__ import annotations
@@ -49,17 +43,16 @@ class SpaceAttention(nn.Module):
     """
     Attention within each time step (across spatial tokens).
 
-    Applies modality-aware attention: which tokens can see which is controlled
-    by the layout and mode (encoder/decoder/decoder_cross/wm_agent).
-
-    Applies 1D RoPE over spatial positions.
+    Which token may see which is fixed at construction: the (S, S) modality mask and the
+    RoPE cache over spatial positions are both built from ``layout``, so every forward must
+    arrive with exactly ``layout.total_tokens()`` spatial tokens.
 
     Args:
         d_model:     Model dimension.
         n_heads:     Number of query heads.
         n_kv_heads:  Number of KV heads for GQA.
         layout:      TokenLayout describing the spatial dimension.
-        mode:        Attention mode ("encoder", "decoder", etc.).
+        mode:        Modality mask mode ("encoder", "decoder", "decoder_cross", "wm_agent").
         dropout:     Attention dropout.
         use_qk_norm: Use QKNorm.
         logit_cap:   Logit soft capping value.
@@ -186,7 +179,6 @@ class TimeAttention(nn.Module):
         """
         B, T, S, D = x.shape
 
-        # All spatial positions get time attention
         # Reshape: (B, T, S, D) -> (B, S, T, D) -> (B*S, T, D)
         x_t = x.permute(0, 2, 1, 3).contiguous().reshape(B * S, T, D)
 
@@ -246,14 +238,9 @@ class BlockCausalLayer(nn.Module):
             x = x + TimeAttention(RMSNorm(x))
         x = x + SwiGLU(RMSNorm(x))
 
-    Time attention is included only if (layer_index + 1) % time_every == 0.
-    For example, with time_every=4 and 0-indexed layers:
-        Layer 0: space + mlp
-        Layer 1: space + mlp
-        Layer 2: space + mlp
-        Layer 3: space + TIME + mlp   (layer 3+1=4, 4%4==0)
-        Layer 4: space + mlp
-        ...
+    Time attention is included only if ``(layer_index + 1) % time_every == 0`` — with
+    time_every=4 and 0-based indices, layers 3, 7, 11, ... are the time layers, and the
+    last layer of a depth divisible by time_every is always one of them.
 
     Args:
         d_model:          Model dimension.

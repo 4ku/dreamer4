@@ -1,6 +1,7 @@
 """
-Small shared training utilities: seeding, LR warmup, weight EMA, weighted
-loss combination with optional RMS normalization, and run logging.
+Plumbing shared by the phase-1 trainers (tokenizer and dynamics): seeding,
+atomic checkpoint writes, LR warmup, weight EMA, weighted loss combination
+with optional RMS normalization, and run logging.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from dreamer4.utils import RMSLossNormalizer
 
 
 def set_seed(seed: int) -> None:
+    """Seed the python, numpy and torch RNGs from one integer."""
     random.seed(seed)
     np.random.seed(seed % 2 ** 32)
     torch.manual_seed(seed)
@@ -45,9 +47,13 @@ class EMA:
     The EMA ("shadow") weights are what validation and final artifacts use —
     they smooth out reconstruction artifacts of the raw trajectory. Only
     TRAINABLE floating parameters are averaged; frozen parameters and buffers
-    track the live value verbatim — so e.g. a frozen encoder stays
+    track the live value verbatim, so e.g. a frozen encoder stays
     bit-identical through the EMA instead of drifting by float rounding.
-    Construct AFTER freezing parameters.
+    Construct AFTER freezing parameters, or the frozen ones get averaged too.
+
+    Args:
+        model: The model whose ``state_dict`` is shadowed.
+        decay: EMA decay per update (closer to 1 = slower, smoother).
     """
 
     def __init__(self, model: nn.Module, decay: float):
@@ -114,6 +120,10 @@ class LossCombiner:
     that has collapsed far below its peak from being amplified back to O(1)
     forever (see :class:`dreamer4.utils.RMSLossNormalizer`).
 
+    A term whose value is None this step is skipped entirely (not even
+    reported); one whose weight is 0.0 is still reported raw but left out of
+    the total.
+
     Args:
         weights:    Ordered mapping term name -> relative weight. The order
                     fixes normalizer slots, so keep it stable across resume.
@@ -139,8 +149,13 @@ class LossCombiner:
         """
         Combine raw loss tensors into the total training loss.
 
-        Returns (total, {name: raw float value}) — raw values are logged;
-        normalization only affects the total.
+        Args:
+            terms: {name: scalar tensor or None}; names must be known
+                   weights, None means "not computed this step".
+
+        Returns:
+            (total, {name: raw float value}) — the raw values are what gets
+            logged; normalization only affects the total.
         """
         unknown = set(terms) - set(self.slots)
         if unknown:

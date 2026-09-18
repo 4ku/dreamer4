@@ -1,11 +1,26 @@
 """
-The gridworld toy environment — our tokenizer/dynamics testbed.
+The gridworld toy environment — the tokenizer/dynamics testbed.
 
 Adapts the sharded dataset written by ``gridworld-collect`` (``manifest.json``
 + ``shard_*.npz``) to the unified format. Requires the companion
 ``gridworld`` package — imported lazily, it is NOT a dependency of dreamer4.
 
-All gridworld DOMAIN knowledge lives here, not in the trainer:
+All gridworld DOMAIN knowledge lives here, not in the trainer. This is also
+the worked example of the adapter contract every environment must provide
+(see :class:`dreamer4.data.base.EpisodeVideoDataset`); the phase-2/3 trainers
+call exactly these hooks and nothing else:
+
+- ``clip`` (via ``_load_clip``) — frames, proprio, one-hot actions, rewards,
+  terminals in the unified format;
+- ``episode_meta`` — the collector's per-episode quality signals;
+- ``bc_weight`` — which episodes may be imitated (the criterion is the
+  dataset's, so no trainer has to know what "noisiness" means);
+- ``env_spec`` — how to reopen the live env for real-env evaluation;
+- ``continues_from_reward`` — the domain's terminal rule, which is what stops
+  a dream that has no recorded terminals;
+- ``proprio_from_info`` — one step's proprio from a live env's ``info``.
+
+Gridworld's own specifics:
 
 - proprio — player (row,col) in [-1,1], optionally + goal — read from the
   positions the collector recorded from the env's own state (dataset format
@@ -13,7 +28,8 @@ All gridworld DOMAIN knowledge lives here, not in the trainer:
   clips and, via :meth:`proprio_from_info`, the online policy;
 - the sprite-position eval hook: mean Manhattan error (in cells) of the
   reconstructed player/goal, and the ≤1-cell deployment **gate**. Pixel
-  losses alone would happily lose the 0.8%-of-pixels sprites.
+  losses alone would happily lose the sprites, which are under 1 % of the
+  pixels.
 """
 
 from __future__ import annotations
@@ -21,6 +37,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Union
 
+import json
 import numpy as np
 
 from dreamer4.data.base import EpisodeVideoDataset
@@ -58,6 +75,27 @@ class GridworldEpisodeDataset(EpisodeVideoDataset):
     """
 
     N_MOVES = 4
+
+    #: Positions come from the collector's recorded state, so these modes are
+    #: this adapter's alone (see EpisodeVideoDataset.PROPRIO_MODES).
+    PROPRIO_MODES = ("player", "player_goal")
+
+    @classmethod
+    def recognizes(cls, root: Path) -> bool:
+        manifest = root / "manifest.json"
+        if not manifest.exists():
+            return False
+        try:
+            return "episodes" in json.loads(manifest.read_text())
+        except (ValueError, OSError):
+            return False
+
+    @classmethod
+    def from_path(cls, root: Path, *, proprio: str = "none",
+                  actions: bool = False, **_):
+        # "auto" means the agent's own state: its position on the grid.
+        return cls(root, proprio=("player" if proprio == "auto" else proprio),
+                   actions=actions)
 
     def __init__(self, root: Union[str, Path], *, proprio: str = "none",
                  actions: bool = False):
@@ -144,15 +182,24 @@ class GridworldEpisodeDataset(EpisodeVideoDataset):
 
     #: BC-eligibility thresholds on the collector's quality dials. A cloned
     #: policy is only as good as what it imitates, and this collector records
-    #: the full expert->random spectrum on purpose.
-    BC_MAX_NOISINESS = 0.2
+    #: the full expert->random spectrum on purpose. Deliberately wide: a band
+    #: that is already near-perfect leaves phase-3 RL nothing to improve, so
+    #: the demonstrations kept here are good but not optimal.
+    BC_MAX_NOISINESS = 0.6
     BC_MAX_STICKINESS = 0.1
 
+    #: Clone only episodes that actually reached the goal. A low-noise episode
+    #: can still fail, and cloning a failure teaches the policy the behaviour
+    #: that produced it.
+    BC_REQUIRE_SUCCESS = True
+
     def bc_weight(self, i: int) -> float:
-        """Clone only the clean episodes (see the class constants). At the
-        production thresholds this keeps ~2,000 of 12,350 training episodes —
-        a band with 100% success and 1.14x optimal paths."""
+        """Clone only the clean, SUCCESSFUL episodes (see the class constants).
+        On a mixed-quality collection these thresholds keep roughly half the
+        episodes — the pool phase 2 clones from."""
         rec = self._ds.episodes[i]
+        if self.BC_REQUIRE_SUCCESS and not rec.get("success", True):
+            return 0.0
         return float(rec["noisiness"] <= self.BC_MAX_NOISINESS
                      and rec.get("stickiness", 0.0) <= self.BC_MAX_STICKINESS)
 
@@ -164,9 +211,9 @@ class GridworldEpisodeDataset(EpisodeVideoDataset):
         """
         Terminal iff the ARRIVING reward says "goal" — valid here because in
         gridworld the goal is the only rewarding event AND the only way an
-        episode ends: verified 0 disagreements over 47,695 transitions
-        (2026-07-24). This is what phase 3 stops dreams with, and it is a
-        fact about THIS env — see the base-class contract.
+        episode ends: checked with zero disagreements over tens of thousands
+        of recorded transitions. This is what phase 3 stops dreams with, and
+        it is a fact about THIS env — see the base-class contract.
 
         Args:
             reward_pred: (B, T) decoded rewards, arrival-aligned.
@@ -177,20 +224,27 @@ class GridworldEpisodeDataset(EpisodeVideoDataset):
         return (reward_pred <= self.TERMINAL_REWARD).float()
 
     def env_spec(self) -> Dict:
-        """The live env this data came from, reconstructed from the manifest
-        (obstacle density is not recorded — the env default matches the
-        collector default)."""
+        """The live env this data came from, reconstructed from the manifest.
+
+        ``obstacle_density`` is passed through only when the manifest records
+        it. Older datasets omit the key and fall back to the env default —
+        which is the RANGE (0.0, 0.25), not 0. A dataset collected at density
+        0 whose manifest predates the field therefore evaluates on mazes it
+        never saw, silently; add the key to its manifest.json rather than
+        overriding at every call site."""
         m = self._ds.manifest
-        return {"id": m.get("env_id", "GridWorld-v0"),
-                "kwargs": {"size": int(m["size"]),
-                           "max_steps": int(m["max_steps"]),
-                           "step_penalty": float(m["step_penalty"]),
-                           "goal_reward": float(m["goal_reward"])}}
+        kwargs = {"size": int(m["size"]),
+                  "max_steps": int(m["max_steps"]),
+                  "step_penalty": float(m["step_penalty"]),
+                  "goal_reward": float(m["goal_reward"])}
+        if m.get("obstacle_density") is not None:
+            d = m["obstacle_density"]
+            kwargs["obstacle_density"] = tuple(d) if isinstance(d, (list, tuple)) else float(d)
+        return {"id": m.get("env_id", "GridWorld-v0"), "kwargs": kwargs}
 
     def eval_metrics(self, gt: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
         """
-        Sprite metrics on (N, T, H, W, C) float [0,1] frames — the proven
-        gate conventions (diag_openloop, 2026-07-06):
+        Sprite metrics on (N, T, H, W, C) float [0, 1] frames:
 
         - ``player_err``: Manhattan cell error of the player, all frames;
         - ``player_present``: fraction of frames whose reconstruction has a
@@ -216,6 +270,7 @@ class GridworldEpisodeDataset(EpisodeVideoDataset):
         return out
 
     def gate(self, metrics: Dict[str, float]) -> Optional[bool]:
+        """Go/no-go: both sprites reconstructed within one cell on average."""
         if "player_err" not in metrics:
             return None
         return (metrics["player_err"] <= 1.0

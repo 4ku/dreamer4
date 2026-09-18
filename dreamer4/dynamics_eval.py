@@ -1,5 +1,11 @@
 """
-Honest evaluation for latent dynamics models — three tools, three questions:
+Evaluation of a phase-1b dynamics model — three tools, three questions.
+
+All three take a trained dynamics model and a batch of REAL latents and
+actions; :func:`gate_rollout` additionally needs the frozen tokenizer (to
+decode the dream back to pixels) and the dataset (for its domain hooks).
+:mod:`dreamer4.train.train_dynamics` calls them during validation and again
+for the final gate table.
 
 - :func:`one_step_eval` — **"is it even a conditional model?"** No dreaming:
   at every step the model gets the TRUE history (teacher-forced) and
@@ -10,19 +16,20 @@ Honest evaluation for latent dynamics models — three tools, three questions:
 - :func:`windowed_rollout` — **"produce the dream."** The mechanism, no
   scoring: after ``ctx`` real frames the model generates frame after frame
   conditioned on its OWN previous generations, seeing only the last
-  ``window-1`` frames — exactly the deployed loop (sliding window,
-  per-window start-flag action alignment, ``tau_ctx`` context corruption).
+  ``window-1`` frames — exactly the loop imagination runs in (sliding
+  window, per-window start-flag action alignment, ``tau_ctx`` context
+  corruption).
 - :func:`gate_rollout` — **"judge the dream."** Runs the rollout, decodes it,
   and scores it against the REAL frames: latent/pixel error, the dataset's
   domain hooks (``eval_metrics`` — e.g. gridworld sprite errors — and the
   pass/fail ``gate``), plus ms/frame. This is the number that decides
-  whether a run ships: teacher-forced losses and unwindowed rollouts both
-  flatter the model (the 2026-07-05/06 overnight lesson — "only the
-  windowed gate tells the truth").
+  whether a world model ships: teacher-forced losses and rollouts that keep
+  the whole history both flatter the model, so only the windowed gate is
+  trustworthy.
 
-The two evals bracket the failure modes: gate bad + one-step good => drift
-(errors compound when the model feeds on itself); gate bad + one-step bad =>
-conditioning itself is broken. Also here: :func:`save_demo_gif`, the
+The two scored evals bracket the failure modes: gate bad + one-step good =>
+drift (errors compound once the model feeds on itself); gate bad + one-step
+bad => conditioning itself is broken. Also here: :func:`save_demo_gif`, the
 human-eyeball artifact.
 """
 
@@ -54,19 +61,27 @@ def windowed_rollout(
     tau_ctx: float = 0.1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], float]:
     """
-    PRODUCE a dream (no scoring): frames ``ctx..T-1`` generated open-loop
-    under the real action sequence, each conditioned on the model's own
-    previous generations through the sliding window.
+    PRODUCE a dream (no scoring).
+
+    Frames ``ctx..T-1`` are generated open-loop under the real action
+    sequence, each conditioned on the model's own previous generations
+    through the sliding window.
 
     Args:
-        z_full:  (B, T, Nz, Dz) real latents; only the first ``ctx`` are used
-                 as context, the rest exist for scoring by the caller.
-        actions: (B, T-1, D_a) dataset action vectors.
-        window:  Sliding context window (= the trained seq_len).
+        z_full:       (B, T, Nz, Dz) real latents; only the first ``ctx`` are
+                      used as context, the rest exist for the caller to score
+                      against.
+        actions:      (B, T-1, D_a) dataset action vectors.
         proprio_full: (B, T, d_p) iff the model has a joint proprio stream.
+        window:       Sliding context window; use the trained ``seq_len``, as
+                      the model never saw a longer one.
+        ctx:          Real frames handed over before dreaming starts.
+        K:            Denoising steps per generated frame.
+        k_max:        Finest shortcut grid the model was trained on.
+        tau_ctx:      Context corruption level, matching training.
 
     Returns:
-        (z_dream (B, T-ctx, Nz, Dz), proprio_dream | None, ms_per_frame).
+        ``(z_dream (B, T-ctx, Nz, Dz), proprio_dream | None, ms_per_frame)``.
     """
     if window < 2:
         raise ValueError("windowed_rollout needs window >= 2 (one context "
@@ -99,8 +114,9 @@ def windowed_rollout(
         zs.append(z_new.clamp(-1, 1))
     if device.type == "cuda":
         torch.cuda.synchronize()
-    # per generated frame PER EPISODE — the batched ms/step convention all
-    # recorded speed baselines use (diag_openloop / the recipe header)
+    # ms per generated frame PER EPISODE: the loop's wall time divided by both
+    # the dreamed horizon and the batch, so the number stays comparable across
+    # batch sizes. Every speed figure quoted for this model uses it.
     ms = (time.perf_counter() - t0) * 1000.0 / (max(T - ctx, 1) * B)
 
     z_dream = torch.stack(zs[ctx:], 1)
@@ -122,18 +138,27 @@ def gate_rollout(
     tau_ctx: float = 0.1,
 ) -> Tuple[Dict[str, float], Tuple[torch.Tensor, torch.Tensor]]:
     """
-    JUDGE the dream: run :func:`windowed_rollout`, decode it, and score it
-    against the REAL frames — the shipping verdict for a dynamics model.
+    JUDGE the dream — the shipping verdict for a dynamics model.
+
+    Runs :func:`windowed_rollout`, decodes the result with the frozen
+    tokenizer and scores it against the REAL frames.
 
     Args:
-        batch: {"z": (B,T,Nz,Dz), "actions": (B,T-1,Da), "video": (B,T,H,W,C)
-               uint8, "proprio"?: (B,T,d_p)} — T = ctx + horizon.
+        tokenizer: The frozen tokenizer that defines this latent space; it
+                   decodes the dream, and must be the SAME one the dynamics
+                   model was trained against or the pixels are meaningless.
+        dataset:   Supplies the domain hooks ``eval_metrics`` and ``gate``.
+        batch:     {"z": (B, T, Nz, Dz), "actions": (B, T-1, Da), "video":
+                   (B, T, H, W, C) uint8, "proprio"?: (B, T, d_p)}, with
+                   ``T = ctx + horizon``.
+        window, ctx, K, k_max, tau_ctx: See :func:`windowed_rollout`.
 
     Returns:
-        metrics — latent/pixel MSE over the dreamed span, per-frame ms,
-        dataset hook metrics (e.g. sprite errors) and ``gate_pass`` when the
-        dataset defines a gate, plus proprio rollout error when present;
-        (gt_frames, dream_frames) — (B, T-ctx, C, H, W) in [0,1] for strips.
+        ``(metrics, (gt_frames, dream_frames))``. ``metrics`` holds
+        latent/pixel MSE over the dreamed span, per-frame ms, the dataset's
+        own hook metrics (e.g. sprite errors), ``gate_pass`` when the dataset
+        defines a gate, and proprio rollout error when the model has that
+        stream. The frame pair is (B, T-ctx, C, H, W) in [0,1], for strips.
     """
     z_full, video = batch["z"], batch["video"]
     proprio = batch.get("proprio")
@@ -175,16 +200,25 @@ def one_step_eval(
     proprio: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     """
-    PROBE the basics (no dreaming): teacher-forced 1-step prediction from
-    TRUE history vs the copy baseline (``z[t-1]`` as the prediction of
-    ``z[t]``). Errors cannot compound, so this isolates whether
-    context+action conditioning is used at all: healthy =>
-    ``onestep_mse << copy_mse``.
+    PROBE the basics (no dreaming).
+
+    Teacher-forced 1-step prediction from TRUE history, against the copy
+    baseline (``z[t-1]`` used as the prediction of ``z[t]``). Errors cannot
+    compound, so this isolates whether context+action conditioning is used at
+    all: healthy => ``onestep_mse << copy_mse``.
 
     Args:
         z1:      (B, T, Nz, Dz) real latents.
         actions: (B, T-1, D_a) dataset action vectors.
+        ctx:     First frame to predict; frames before it are history only.
+        K:       Denoising steps per predicted frame.
+        k_max:   Finest shortcut grid the model was trained on.
+        tau_ctx: Context corruption level, matching training.
         proprio: (B, T, d_p) iff the model has a joint proprio stream.
+
+    Returns:
+        {"onestep_mse": mean over predicted frames, "copy_mse": the same
+        span scored by the copy-last-frame baseline}.
     """
     T = z1.shape[1]
     aligned = align_actions(actions, T)
@@ -205,11 +239,17 @@ def one_step_eval(
 def save_demo_gif(gt: torch.Tensor, dream: torch.Tensor, out_path, *,
                   ctx: int, scale: int = 10, fps: int = 4) -> None:
     """
-    Side-by-side GT (top) vs dream (bottom) animation.
+    Write a side-by-side GT (top) vs dream (bottom) animated GIF.
 
     Args:
-        gt, dream: (B, T, C, H, W) in [0,1] — dream covers frames ctx..T-1;
-                   pass the FULL ground truth so the context phase is visible.
+        gt, dream: (B, T, C, H, W) in [0,1]. ``dream`` covers frames
+                   ``ctx..T-1`` only; pass the FULL ground truth so the
+                   context phase is visible in both rows.
+        out_path:  Destination file.
+        ctx:       Context length, used to label frames and to index into
+                   ``dream``.
+        scale:     Nearest-neighbour upscale factor per pixel.
+        fps:       Playback rate of the written GIF.
     """
     from PIL import Image, ImageDraw
     gt_np = (gt.numpy().transpose(0, 1, 3, 4, 2) * 255).astype(np.uint8)

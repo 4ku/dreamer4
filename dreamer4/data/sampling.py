@@ -1,8 +1,13 @@
 """
-Clip sampling on top of the unified episode format: the infinite training
-stream (a torch ``IterableDataset``), the fixed deterministic validation
-clip list, episode-level train/val splitting, and the uint8-batch → float
-frames conversion used at the device boundary.
+Clip sampling on top of the unified episode format.
+
+Turns an :class:`~dreamer4.data.base.EpisodeVideoDataset` into what the
+trainers actually iterate: an infinite stream of random fixed-length clips (a
+torch ``IterableDataset``), a fixed deterministic validation clip list, an
+episode-level train/val split, and the uint8-batch -> float-frames conversion
+applied at the device boundary. The tokenizer trainer consumes the stream
+directly; the dynamics trainer uses the split and pre-encodes whole episodes
+through the frozen tokenizer instead.
 """
 
 from __future__ import annotations
@@ -85,9 +90,9 @@ def split_train_val(n_episodes: int, *, val_frac: float, seed: int,
     Episode-level train/val split (clips never cross the split).
 
     ``min_val`` floors the validation pool (capped at half the dataset so
-    training is never starved) — evals that need stable statistics, like the
-    dynamics gate, pass 64. With a single episode both sides point at it
-    (degenerate but usable for smoke tests).
+    training is never starved) — evals that need stable statistics, such as
+    the dynamics rollout gate, pass 64. With a single episode both sides
+    point at it (degenerate but usable for smoke tests).
     """
     if n_episodes < 2:
         only = np.arange(n_episodes)

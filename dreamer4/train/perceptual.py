@@ -1,16 +1,20 @@
 """
-Perceptual reconstruction losses for tokenizer training.
+Perceptual reconstruction losses for tokenizer training (phase 1a).
+
+Each module compares a reconstructed frame with its ground truth in a frozen
+network's feature space and returns one scalar; the trainer adds the result to
+the pixel L1/MSE term. :func:`build_perceptual` turns the loss config into the
+list of active terms. Nothing here is trained or saved.
 
 Two frozen backbones, usable alone or summed ("hybrid"):
 
-- **LPIPS** (``lpips`` package, AlexNet trunk by default). Early dense conv
+- LPIPS (``lpips`` package, AlexNet trunk by default). Early dense conv
   features localize small/sparse content well; frames are upscaled
   (nearest) to ``up`` pixels first — LPIPS is calibrated around 64+ px.
-- **DINOv3** (HF ``transformers``, lazy import). Early ViT patch features
+- DINOv3 (HF ``transformers``, lazy import). Early ViT patch features
   add richer global structure. Deep layers are deliberately NOT used: on
-  sparse content (a 1-px sprite) deep/abstract features are blind and the
-  ViT averages the signal away; early, pixel-near layers carry it. Both
-  points were verified by perceptual inversion on the gridworld.
+  sparse content (a 1-px sprite) deep/abstract features are blind, since the
+  ViT averages the signal away; early, pixel-near layers carry it.
 
 Inputs are always full frames ``(N, C, H, W)`` in ``[0, 1]``; grayscale is
 repeated to 3 channels. Both modules keep their parameters frozen and should
@@ -63,6 +67,7 @@ class LpipsPerceptual(nn.Module):
             p.requires_grad_(False)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """(N, C, H, W) pred/target in [0, 1] -> mean LPIPS distance (scalar)."""
         pred, target = _to_rgb(pred), _to_rgb(target)
         if self.up and pred.shape[-1] != self.up:
             pred = F.interpolate(pred, size=self.up, mode="nearest")
@@ -120,6 +125,8 @@ class DinoV3Perceptual(nn.Module):
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def _features(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """(N, 3, H, W) in [0, 1] -> one (N, n_patches, D) tensor per selected
+        layer, with the CLS and register tokens dropped."""
         align = False if self.upsample in ("bilinear", "bicubic") else None
         x = F.interpolate(x, size=self.size, mode=self.upsample, align_corners=align)
         x = (x - self.mean.to(x)) / self.std.to(x)
@@ -128,6 +135,8 @@ class DinoV3Perceptual(nn.Module):
         return [F.normalize(f, dim=-1) for f in feats] if self.normalize else feats
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """(N, C, H, W) pred/target in [0, 1] -> patch-feature MSE (scalar),
+        averaged over the selected layers; the target branch is detached."""
         fp = self._features(_to_rgb(pred))
         with torch.no_grad():
             ft = self._features(_to_rgb(target))
@@ -135,6 +144,8 @@ class DinoV3Perceptual(nn.Module):
 
 
 def _hf_token() -> str | None:
+    """Hugging Face token from ``HF_TOKEN`` or the file ``HF_TOKEN_FILE`` points
+    at; None when neither is set (fine for ungated checkpoints)."""
     token = os.environ.get("HF_TOKEN")
     if token:
         return token
