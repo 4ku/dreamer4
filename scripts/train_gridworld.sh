@@ -5,8 +5,9 @@
 #
 # TWO RECIPES, same chain, two environment variables apart:
 #
-#   empty maze  DENSITY=0         HEADS_STEPS=6000
-#   obstacles   DENSITY="0,0.25"  HEADS_STEPS=8000
+#   empty maze  DENSITY=0         HEADS_STEPS=4000
+#   obstacles   DENSITY="0,0.25"  HEADS_STEPS=8000   (not re-measured with the
+#                                                     current phase-2/3 defaults)
 #
 # Everything is an environment variable with a default, so a different
 # dataset, run dir, GPU or seed needs no edit:
@@ -17,8 +18,8 @@
 #   SEED=1                  seed for every phase
 #   BC_FRAC=1.0             fraction of the eligible demonstrations phase 2
 #                           may clone (e.g. 0.2 clones a fifth of them)
-#   HEADS_STEPS=6000        phase-2 steps
-#   PMPO_STEPS=3200         phase-3 policy updates
+#   HEADS_STEPS=4000        phase-2 steps
+#   PMPO_STEPS=1000         phase-3 policy updates
 #   TOK=""                  path of an existing tokenizer run dir; when set,
 #                           phase 1a is skipped and that tokenizer is reused
 #   COLLECT=0               1 = collect DATA first if it does not exist
@@ -40,11 +41,11 @@
 # Few demonstrations (214 of them: cloning no longer solves the maze, phase 3 does;
 # 100 % success, path / shortest < 1.01, 10 min for phases 2-3 -- README, results):
 #
-#   BC_FRAC=0.04 HEADS_STEPS=4000 PMPO_STEPS=1000 OUT=runs/fewdemo \
-#     HEADS_EXTRA="--n_agent 8 --value_weight 1.0 --eval_every 1000000" \
-#     PMPO_EXTRA="--batch 256 --lr 1e-3 --lr_final 1e-4 --beta 0.03 --adv_drop_frac 0.1 \
-#       --adv_drop_final 0.9 --adv_drop_steps 300 --reward_decode mode --compile 1 \
-#       --eval_every 1000000" ./scripts/train_gridworld.sh
+#   BC_FRAC=0.04 OUT=runs/fewdemo ./scripts/train_gridworld.sh
+#
+# Phases 2 and 3 evaluate in the real env only once, at their end (that is how
+# the README's wall-clock numbers were taken); for curves pass e.g.
+# HEADS_EXTRA="--eval_every 1000" PMPO_EXTRA="--eval_every 200".
 #   COLLECT=1 DATA=data/gw_obs_10k OUT=runs/gw_obs DENSITY="0,0.25" \
 #     HEADS_STEPS=8000 ./scripts/train_gridworld.sh
 
@@ -59,8 +60,8 @@ OUT=${OUT:-runs/gridworld}
 GPU=${GPU:-0}
 SEED=${SEED:-1}
 BC_FRAC=${BC_FRAC:-1.0}
-HEADS_STEPS=${HEADS_STEPS:-6000}
-PMPO_STEPS=${PMPO_STEPS:-3200}
+HEADS_STEPS=${HEADS_STEPS:-4000}
+PMPO_STEPS=${PMPO_STEPS:-1000}
 TOK=${TOK:-}
 COLLECT=${COLLECT:-0}
 DENSITY=${DENSITY:-0}
@@ -130,7 +131,7 @@ else
   echo "=== phase 2: agent finetuning ==="
   $PYTHON -m dreamer4.train.train_heads \
     --dyn "$OUT/dyn/checkpoints/latest.pt" --out "$OUT/heads" \
-    --steps "$HEADS_STEPS" \
+    --steps "$HEADS_STEPS" --eval_every "$HEADS_STEPS" \
     --bc_frac "$BC_FRAC" --seed "$SEED" ${HEADS_EXTRA[@]+"${HEADS_EXTRA[@]}"}
 fi
 
@@ -143,9 +144,9 @@ else
   echo "=== phase 3: PMPO in imagination ==="
   PYTORCH_ALLOC_CONF=expandable_segments:True $PYTHON -m dreamer4.train.train_pmpo \
     --dyn "$OUT/dyn/checkpoints/latest.pt" \
-    --init_from "$OUT/heads/checkpoints/best.pt" --out "$OUT/rl" \
-    --K 1 --batch 32 --steps "$PMPO_STEPS" \
-    --eval_every 800 --eval_n 1000 --seed "$SEED" ${PMPO_EXTRA[@]+"${PMPO_EXTRA[@]}"}
+    --init_from "$OUT/heads/checkpoints/latest.pt" --out "$OUT/rl" \
+    --steps "$PMPO_STEPS" --eval_every "$PMPO_STEPS" --eval_n 1000 \
+    --seed "$SEED" ${PMPO_EXTRA[@]+"${PMPO_EXTRA[@]}"}
 fi
 
 echo "=== done: $OUT ==="

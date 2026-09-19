@@ -298,36 +298,43 @@ def parse_args():
     ap.add_argument("--init_from", required=True,
                     help="phase-2 checkpoint: warm start, KL prior and the frozen reward head")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--steps", type=int, default=3200)
-    ap.add_argument("--batch", type=int, default=32, help="dreams per update")
+    ap.add_argument("--steps", type=int, default=1000)
+    ap.add_argument("--batch", type=int, default=256,
+                    help="dreams per update; the rollout is latency-bound, 256 costs 10 %% more than 32")
     ap.add_argument("--horizon", type=int, default=0,
                     help="imagined steps per dream; 0 = the longest recorded episode")
-    ap.add_argument("--K", type=int, default=4, help="shortcut denoising steps per imagined frame")
+    ap.add_argument("--K", type=int, default=1, help="shortcut denoising steps per imagined frame")
     ap.add_argument("--term_prob", type=float, default=0.5,
                     help="end a dream when the reward head puts this much mass on a terminal reward")
-    ap.add_argument("--reward_decode", choices=("mean", "mode"), default="mean",
+    ap.add_argument("--reward_decode", choices=("mean", "mode"), default="mode",
                     help="how a dream turns the reward head's distribution into a number: the "
                          "expectation over all bins, or ('mode') the two-hot mean around the most "
-                         "likely bin, which ignores the mass a categorical head leaks onto far bins")
-    ap.add_argument("--lr", type=float, default=3e-4)
+                         "likely bin, which ignores the mass a categorical head leaks onto far bins. "
+                         "NOT in the paper; with 'mean' the gridworld recipe ends at 0.95-0.98 "
+                         "success instead of 1.000 (1 %% of leaked mass on the +1 bin pays the whole "
+                         "step cost). Use 'mean' where rewards are genuinely stochastic")
+    ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--value_lr", type=float, default=1e-3)
-    ap.add_argument("--lr_final", type=float, default=0.0, help="both rates decay linearly to this")
+    ap.add_argument("--lr_final", type=float, default=1e-4, help="both rates decay linearly to this")
     ap.add_argument("--grad_clip", type=float, default=0.5)
     ap.add_argument("--gamma", type=float, default=0.997, help="paper Eq. 10")
     ap.add_argument("--lam", type=float, default=0.95,
                     help="lambda of the lambda-return; the paper defines it but gives no value")
     ap.add_argument("--value_weight", type=float, default=0.5)
     ap.add_argument("--alpha", type=float, default=0.5, help="paper Eq. 11")
-    ap.add_argument("--beta", type=float, default=0.3,
-                    help="weight of the reverse KL to the behavioral prior (paper Eq. 11)")
-    ap.add_argument("--adv_drop_frac", type=float, default=0.0,
+    ap.add_argument("--beta", type=float, default=0.03,
+                    help="weight of the reverse KL to the behavioral prior (paper Eq. 11; the paper "
+                         "uses 0.3, which holds the policy to a weak cloned prior)")
+    ap.add_argument("--adv_drop_frac", type=float, default=0.1,
                     help="NOT in the paper: drop this fraction of each PMPO pool, smallest |advantage| "
-                         "first, so coin-flip advantages do not vote (0 = the paper's pure sign split)")
-    ap.add_argument("--adv_drop_final", type=float, default=-1.0,
+                         "first, so coin-flip advantages do not vote (0 with --adv_drop_final -1 = "
+                         "the paper's pure sign split)")
+    ap.add_argument("--adv_drop_final", type=float, default=0.9,
                     help="ramp the dropped fraction linearly to this value over --adv_drop_steps "
-                         "updates; negative = keep --adv_drop_frac throughout")
-    ap.add_argument("--adv_drop_steps", type=int, default=0)
-    ap.add_argument("--eval_every", type=int, default=3200)
+                         "updates; negative = keep --adv_drop_frac throughout. 0.5-0.9 measured "
+                         "alike; it needs a sharp critic (--n_agent >= 4), with a blunt one it hurts")
+    ap.add_argument("--adv_drop_steps", type=int, default=300)
+    ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--eval_n", type=int, default=1000)
     ap.add_argument("--eval_seed", type=int, default=31337,
                     help="episode seeds for the real-env evaluation: held-out layouts")
@@ -336,7 +343,8 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--amp", type=int, default=1, help="bf16 autocast (no grad scaler needed)")
-    ap.add_argument("--compile", type=int, default=0, help="torch.compile the dynamics model")
+    ap.add_argument("--compile", type=int, default=1,
+                    help="torch.compile the dynamics model: 0.57 -> 0.33 s per update for ~30 s of warm-up")
     return ap.parse_args()
 
 

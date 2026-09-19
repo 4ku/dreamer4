@@ -274,16 +274,17 @@ def parse_args():
     ap.add_argument("--dyn", required=True,
                     help="phase-1 dynamics checkpoint: tokenizer, dataset and env spec come from it")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--steps", type=int, default=6000)
+    ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--batch", type=int, default=32, help="clips per agent step")
     ap.add_argument("--lr", type=float, default=5e-4, help="learning rate of the agent heads")
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--reward_weight", type=float, default=1.0)
-    ap.add_argument("--value_weight", type=float, default=0.0,
+    ap.add_argument("--value_weight", type=float, default=1.0,
                     help="NOT in the paper (there the value head is born in phase 3): weight of a "
                          "critic-pretraining term, the value head regressed on the recorded "
                          "return-to-go of ALL training episodes. It makes the agent features carry "
-                         "the distance to the reward and hands phase 3 a critic that is not blank")
+                         "the distance to the reward and hands phase 3 a critic that is not blank; "
+                         "without it a fast phase 3 can collapse. 0 = the paper's objective")
     ap.add_argument("--gamma", type=float, default=0.997,
                     help="discount of the recorded returns for --value_weight; use phase 3's")
     ap.add_argument("--val_frac", type=float, default=0.05,
@@ -297,7 +298,11 @@ def parse_args():
     ap.add_argument("--reward_bin_high", type=float, default=1.0)
     ap.add_argument("--term_prob", type=float, default=0.5,
                     help="terminal-rule threshold used by the held-out terminal metrics")
-    ap.add_argument("--n_agent", type=int, default=1, help="agent tokens per time step")
+    ap.add_argument("--n_agent", type=int, default=8,
+                    help="agent tokens per time step, concatenated into h_t (the paper gives no "
+                         "number). With ONE the critic of phase 3 resolves the distance to the "
+                         "reward only to +-1 cell on the gridworld and PMPO, which reads the sign of "
+                         "the advantage, stalls at path/shortest 1.15; 4-8 remove that")
     ap.add_argument("--n_tasks", type=int, default=1,
                     help="minimum size of the task-embedding table; the trainer widens it to cover "
                          "every task id the dataset's episode metadata records")
