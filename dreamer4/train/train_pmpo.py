@@ -9,6 +9,9 @@ frozen behavioral prior and the frozen reward head. The checkpoints written here
 things, so a run can also be continued from one of its own. No environment is stepped during
 training.
 
+One network does everything, as in the paper: the transformer phase 2 finetuned is what the agent
+heads READ and what GENERATES the next imagined frame.
+
 The policy, reward and value heads sit on AGENT tokens inside the dynamics transformer
 (:mod:`dreamer4.models.agent_heads`). The transformer is FROZEN here -- "We only update the policy
 and value heads and keep the transformer frozen" (Section 3.3) -- so a rollout buffers the agent
@@ -200,11 +203,16 @@ class Imagination:
         prop = torch.as_tensor(starts_batch["proprio"], device=dev)
         act_hist = torch.as_tensor(starts_batch["actions"], device=dev)
         task = torch.as_tensor(starts_batch["task"], device=dev)
-        # One KV cache, capped at the policy's window and one slot short of the RoPE table (the
-        # spare slot holds the frame being denoised), so the imagined context has the same length
-        # as the clips phase 2 trained on and the window the evaluator plays with.
+        # One KV cache holding ``clip_T - 1`` PAST frames: the frame being committed (or denoised)
+        # is the window's last slot, so the policy reads ``clip_T`` slots -- the clips phase 2
+        # trained on and the window the evaluator plays with -- and the dynamics denoises against
+        # as many past frames as ITS training windows had. A longer cache is not a richer context,
+        # it is a broken simulator: the flow head has never seen it. Measured on the empty maze
+        # (dynamics trained on 4-frame windows, recorded actions replayed through this loop): up
+        # to 5 past frames the dreamed player is in the wrong cell on 0.2 % of the steps, with 7
+        # or 11 on 93-94 % -- and that is what `main` refuses below.
         cache = world.dyn.transformer.make_kv_cache()
-        cache.max_T = min(self.clip_T, world.max_T - 1)
+        cache.max_T = max(1, self.clip_T - 1)
 
         tape = Tape(B, horizon, dev)
         H = torch.zeros(B, horizon + 1, self.d_in, device=dev)
@@ -322,6 +330,14 @@ def main():
     (out / "checkpoints").mkdir(parents=True, exist_ok=True)
 
     world, agent = load_agent(cfg, dev)
+    if agent.clip_T > world.window:
+        raise ValueError(
+            f"this phase-2 checkpoint reads a {agent.clip_T}-slot context, but the dynamics model "
+            f"was trained on {world.window}-frame windows: dreamed with {agent.clip_T - 1} past "
+            f"frames it stops following the actions (the player lands in the wrong cell on >90 % "
+            f"of the steps), so the policy would be optimised inside a broken simulator. Rerun "
+            f"phase 2 with --clip_T <= {world.window}, or train phase 1b with a longer "
+            f"--data.seq_len.")
     if cfg.horizon <= 0:
         longest = max(world.dataset.episode_frames(i) for i in range(len(world.dataset))) - 1
         cfg.horizon = longest if longest > 0 else 40
@@ -381,7 +397,14 @@ def main():
 
         # PMPO (Eq. 11): sign-of-advantage policy term plus the reverse KL to the frozen prior.
         adv = targets[:, :H] - v.detach()[:, :H]
-        keep = alive[:, :H] > 0
+        # States the policy really ACTED from. The frame a dream ends on is occupied (its value,
+        # zero, is a legitimate critic target) but nothing is done from it: the action the rollout
+        # samples there is never executed, and its advantage is just -v(terminal). Eq. 11 only uses
+        # the SIGN of the advantage, so that one junk transition per finished dream would push a
+        # real action up or down at full weight -- in features that sit next to those of the
+        # states adjacent to the goal, which is where the damage showed (greedy success 1.000 ->
+        # 0.988 on the empty maze, every failure a loop one or two cells from the goal).
+        keep = (alive[:, :H] > 0) & (roll["continues"][:, :H] > 0)
         coeff, pinfo = pmpo_coeffs(adv[keep], alpha=cfg.alpha)
         dist = torch.distributions.Categorical(logits=lg[:, :H])
         lp = dist.log_prob(roll["actions"])[keep]

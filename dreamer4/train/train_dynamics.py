@@ -20,19 +20,26 @@ is the WINDOWED open-loop rollout (:mod:`dreamer4.dynamics_eval`) — the same
 dream loop phase 3 imagines in, scored by the dataset's own domain hooks
 (gridworld: sprite errors + the ≤1-cell gate).
 
-Usage (the defaults train without the bootstrap term, i.e. K=4 only):
+Usage (the defaults ARE the full phase, one run of 30 000 steps):
 
     python -m dreamer4.train.train_dynamics \\
         --data.path data/gridworld_10k \\
         --tokenizer.ckpt runs/tok_x/checkpoints/latest.pt \\
-        --out runs/dyn_x --steps 24000
+        --out runs/dyn_x
 
-    # the full phase: the bootstrap term that makes K=1 sampling accurate is
-    # ramped in over the second half of the SAME run -- fraction 0 until 55 %,
-    # 0 -> 0.5 by 65 %, held; the LR walks down to lr_final across the ramp
-    # and the loss normalizer is re-seeded where it opens
-    ... --steps 42000 --optim.lr_final 5e-5 --objective.bootstrap_frac 0.5 \\
-        --objective.bootstrap_start_frac 0.55 --objective.bootstrap_ramp_frac 0.10
+    # what those defaults are: the bootstrap term that makes K=1 sampling
+    # accurate is switched on for the last 20 % of the SAME run -- fraction 0
+    # until step 24 000, 0 -> 0.5 by 25 500, held; the LR walks 3e-4 -> 5e-5
+    # over the 1 000 steps BEFORE the ramp opens (decaying across the ramp
+    # diverges on the obstacle maze) and the loss normalizer is re-seeded where
+    # it opens. Spelled out:
+    ... --steps 30000 --optim.lr_final 5e-5 --optim.lr_decay_steps 1000 \\
+        --objective.bootstrap_frac 0.5 \\
+        --objective.bootstrap_start_frac 0.8 --objective.bootstrap_ramp_frac 0.05
+
+    # without the bootstrap term (K=4 only): --objective.bootstrap_frac 0
+    # bootstrap fine-tune of an existing model: --init_from <ckpt> --optim.lr 5e-5
+    #   --optim.lr_final 0 --objective.bootstrap_start_frac 0 --objective.bootstrap_ramp_frac 0.25
 
 Artifacts under ``--out``: ``config.yaml``, ``tb/``, resumable
 ``checkpoints/latest.pt``, ``demo.gif``, ``final.json`` (the full
@@ -412,6 +419,8 @@ def train(cfg: DynamicsTrainConfig) -> Dict[str, float]:
                  f"{obj.bootstrap_frac} by step {boot_full}, held to {cfg.steps}")
     if cfg.optim.lr_final > 0.0:
         lr_end = boot_full if boot_full > boot_start else cfg.steps
+        if cfg.optim.lr_decay_steps > 0 and boot_start > 0:
+            lr_end = boot_start          # decay finishes BEFORE the ramp opens
         log.info(f"lr schedule: {cfg.optim.lr:g} after warmup, decaying to "
                  f"{cfg.optim.lr_final:g} by step {lr_end}")
     opt = torch.optim.AdamW(dyn.parameters(), lr=cfg.optim.lr,
@@ -495,8 +504,15 @@ def train(cfg: DynamicsTrainConfig) -> Dict[str, float]:
             log.info(f"[budget] {cfg.max_minutes} min reached at step {step - 1}")
             step -= 1
             break
-        lr = decayed_lr(cfg.optim, step, cfg.steps,
-                        decay_from=boot_start, decay_to=boot_full)
+        if cfg.optim.lr_decay_steps > 0 and boot_start > 0:
+            # LR reaches lr_final BEFORE the first bootstrap row arrives
+            lr = decayed_lr(cfg.optim, step, cfg.steps,
+                            decay_from=max(cfg.optim.warmup,
+                                           boot_start - cfg.optim.lr_decay_steps),
+                            decay_to=boot_start)
+        else:
+            lr = decayed_lr(cfg.optim, step, cfg.steps,
+                            decay_from=boot_start, decay_to=boot_full)
         for group in opt.param_groups:
             group["lr"] = lr
         boot_frac = bootstrap_frac_at(obj, step, cfg.steps)

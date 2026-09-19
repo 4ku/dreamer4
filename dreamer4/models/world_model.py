@@ -78,6 +78,9 @@ class WorldModel:
         self.max_T = int(meta["max_T"])                          # longest window its RoPE covers
         self.k_max = int(config["model"]["k_max"])
         self.tau_ctx = float(config["objective"]["tau_ctx"])     # signal level it reads them at
+        # The pretraining objective's own settings (context-noise band, scheduled sampling, ...):
+        # phase 2 keeps the video-prediction loss running and has to run it the way phase 1b did.
+        self.objective = dict(config["objective"])
         # meta["action_dim"] counts the dataset's action vector PLUS the start flag the dynamics
         # model prepends; the rollout builds the action vector itself, so it needs the dataset's.
         self.action_vec_dim = int(meta["action_dim"]) - 1

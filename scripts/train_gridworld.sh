@@ -96,10 +96,11 @@ fi
 # ONE run. The bootstrap term (two half-steps distilled into one) is what makes
 # single-step sampling legal -- imagination cannot afford K=4 per dreamed frame
 # -- but it can only distill a model that already exists, so its batch fraction
-# stays 0 for the first 55 % of training, ramps to 0.5 over the next 10 % and
-# is held there. Across the ramp the LR walks from 3e-4 down to 5e-5 and the
-# loss normalizer is re-seeded once: with either left out the model collapses
-# a few thousand steps after the ramp opens.
+# stays 0 for the first 24 000 steps, ramps to 0.5 over the next 1 500 and is
+# held there to 30 000. The LR walks from 3e-4 down to 5e-5 over the 1 000
+# steps BEFORE the ramp opens, and the loss normalizer is re-seeded once where
+# it opens: decaying the LR across the ramp instead diverges on the obstacle
+# maze. These are the trainer defaults; they are spelled out to pin the recipe.
 if done_phase "$OUT/dyn"; then
   echo "=== phase 1b: already done ==="
 else
@@ -107,9 +108,9 @@ else
   $PYTHON -m dreamer4.train.train_dynamics \
     --data.path "$DATA" \
     --tokenizer.ckpt "$TOK/checkpoints/latest.pt" \
-    --out "$OUT/dyn" --steps 42000 --optim.lr 3e-4 --optim.lr_final 5e-5 \
-    --objective.bootstrap_frac 0.5 \
-    --objective.bootstrap_start_frac 0.55 --objective.bootstrap_ramp_frac 0.10 \
+    --out "$OUT/dyn" --steps 30000 --optim.lr 3e-4 --optim.lr_final 5e-5 \
+    --optim.lr_decay_steps 1000 --objective.bootstrap_frac 0.5 \
+    --objective.bootstrap_start_frac 0.8 --objective.bootstrap_ramp_frac 0.05 \
     --seed "$SEED" --resume True
 fi
 

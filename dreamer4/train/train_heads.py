@@ -31,6 +31,7 @@ the world model are the same network.
 """
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -274,10 +275,15 @@ def parse_args():
     ap.add_argument("--mtp", type=int, default=8,
                     help="multi-token-prediction length L (paper Eq. 9); 1 makes phase 2 cheap")
     ap.add_argument("--clip_T", type=int, default=0,
-                    help="context slots the agent token sees; 0 = the world model's max_T - 1")
+                    help="context slots the agent token sees; 0 = the window the dynamics model "
+                         "was trained on (its data.seq_len), the longest context phase 3 can "
+                         "dream with")
     ap.add_argument("--d_hidden", type=int, default=256, help="width of the head MLPs")
     ap.add_argument("--dyn_lr", type=float, default=5e-5,
                     help="learning rate of the transformer being finetuned; 0 freezes it")
+    ap.add_argument("--dyn_warmup", type=int, default=0,
+                    help="steps over which the TRANSFORMER's learning rate ramps up from 0 (the "
+                         "heads train at their full rate from step 1)")
     ap.add_argument("--dyn_batch", type=int, default=32,
                     help="windows per video-prediction step (paper Eq. 7)")
     ap.add_argument("--dyn_weight", type=float, default=1.0,
@@ -389,7 +395,17 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
     if cfg.dyn_lr > 0:
         groups.append({"params": list(world.dyn.parameters()), "lr": cfg.dyn_lr})
     opt = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, cfg.steps)
+
+    def cosine(s):
+        return 0.5 * (1.0 + math.cos(math.pi * min(s, cfg.steps) / cfg.steps))
+
+    # Cosine decay for both groups; the transformer's rate additionally ramps in over
+    # --dyn_warmup steps. At step 1 the heads are random, so the gradient they send into the
+    # shared weights is noise with respect to everything the world model knows.
+    lambdas = [cosine]
+    if cfg.dyn_lr > 0:
+        lambdas.append(lambda s: cosine(s) * min(1.0, (s + 1) / max(1, cfg.dyn_warmup)))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambdas)
     # Paper Section 3: "we normalize all loss terms by running estimates of their root-mean-square
     # (RMS)". Order fixes the normaliser slots, so it must stay stable across a resume.
     combiner = LossCombiner({"policy": 1.0, "reward": cfg.reward_weight,
@@ -432,14 +448,22 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
                 # The video-prediction loss, unchanged from pretraining and applied to windows
                 # drawn from the WHOLE collection: "the dynamics loss is applied only on the
                 # uniform sequences to avoid optimistic generations" (Section 4.1).
+                # "Reuse the pretraining setting" means the WHOLE objective phase 1b ended with:
+                # the context-noise band and scheduled sampling are what make the model survive
+                # its own rollouts, and a finetune that drops them trains that robustness away.
+                obj = world.objective
                 image_batch = rng.random() < cfg.image_batch_prob
                 T_dyn = 1 if image_batch else world.window
                 batch = sample_windows(episodes[:n_train], cfg.dyn_batch, T_dyn, rng, dev,
                                        skip_terminal=image_batch)
+                do_sched = (not image_batch
+                            and rng.random() < float(obj.get("sched_sample_prob", 0.0)))
                 dyn_terms, dyn_aux = clean_context_loss(
                     world.dyn, batch["z"], align_actions(batch["actions"], T_dyn),
                     p=0 if image_batch else int(rng.integers(1, T_dyn)),
                     k_max=world.k_max, K=world.model_cfg["K"], tau_ctx=world.tau_ctx,
+                    ctx_noise_min=obj.get("ctx_noise_min") or None,
+                    ctx_noise_max=obj.get("ctx_noise_max") or None, do_sched=do_sched,
                     proprio=batch.get("proprio"), bootstrap_frac=cfg.boot_frac)
                 terms.update({k: v for k, v in dyn_terms.items() if v is not None})
             loss, raw = combiner(terms)
@@ -460,6 +484,8 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
             writer.add_scalar("train/loss_total", float(loss.detach()), s)
             writer.add_scalar("train/grad_norm", float(gn), s)
             writer.add_scalar("train/lr", sched.get_last_lr()[0], s)
+            if cfg.dyn_lr > 0:
+                writer.add_scalar("train/dyn_lr", sched.get_last_lr()[1], s)
             writer.add_scalar("train/steps_per_sec_inst", cfg.log_every / max(now - t_last, 1e-9), s)
             t_last = now
 
@@ -500,10 +526,15 @@ def main():
         raise ValueError("this world model was trained without a proprio stream; the agent reads "
                          "one (open the dataset with a proprio mode and retrain phase 1)")
     if cfg.clip_T <= 0:
-        # One slot short of the positional encoding's reach: imagination needs the spare position
-        # for the frame it is denoising, so this is the longest context all three of phase 2, the
-        # dream and the evaluator can share.
-        cfg.clip_T = world.max_T - 1
+        # The window the dynamics model was trained on. The policy's context is also the context
+        # imagination dreams with, and the flow head only follows the actions inside the window
+        # lengths it has seen: on the gridworld recipe (seq_len 4) a dream with 7 or more past
+        # frames puts the player in the wrong cell on >90 % of the steps. A longer policy context
+        # therefore needs a phase 1b trained with a longer --data.seq_len, not a larger --clip_T.
+        cfg.clip_T = world.window
+    if cfg.clip_T > world.window:
+        print(f"WARNING: --clip_T {cfg.clip_T} exceeds the {world.window}-frame windows the "
+              f"dynamics model was trained on; phase 3 will refuse this checkpoint", flush=True)
     if not 1 <= cfg.clip_T <= world.max_T:
         raise ValueError(f"--clip_T {cfg.clip_T} is outside [1, max_T={world.max_T}] of this "
                          "world model: its positional encoding does not reach that far")

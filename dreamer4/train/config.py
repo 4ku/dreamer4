@@ -17,8 +17,8 @@ same dict is embedded in every checkpoint, so a run is always reproducible
 from its artifacts.
 
 The defaults below ARE the reference phase-1a tokenizer recipe: a
-d256/depth-2 tokenizer, 16 latents x 16 dims, loss-normalized L1 +
-LPIPS(up128) w2, EMA 0.999, bf16 autocast.
+d256/depth-2 tokenizer, 16 latents x 16 dims, loss-normalized MSE +
+LPIPS(up128) w0.2 (the paper's weighting), EMA 0.999, bf16 autocast.
 """
 
 from __future__ import annotations
@@ -81,10 +81,15 @@ class ModelConfig:
 class LossConfig:
     """Reconstruction objective. Weights are RELATIVE when loss_norm is on."""
 
-    recon: str = "l1"           # l1 (crisper on flat content) | mse (paper)
+    # mse + 0.2 * LPIPS is the paper's weighting. The previous default here,
+    # l1 + 2.0 * LPIPS, left the decoder drawing a sprite one cell off at fixed
+    # grid positions (measured 2026-09-18, empty maze: player wrong in 8.2 % of
+    # all layouts, goal in 19.8 %, 32.5 dB) and 10 000 more steps did not move
+    # it; this loss: 0 % and 65 dB. Obstacles, from scratch: 60.8 vs 55.5 dB.
+    recon: str = "mse"          # mse (paper) | l1
     recon_weight: float = 1.0
     perceptual_backbone: str = "lpips"  # none|lpips|dinov3|hybrid
-    perceptual_weight: float = 2.0      # primary perceptual term weight
+    perceptual_weight: float = 0.2      # primary perceptual term weight (paper)
     perceptual_up: int = 128            # LPIPS upscale resolution
     lpips_net: str = "alex"
     dino_weight: float = 1.0            # DINOv3 weight in hybrid mode
@@ -102,9 +107,14 @@ class OptimConfig:
 
     lr: float = 3e-4
     warmup: int = 500           # linear LR warmup steps
-    lr_final: float = 0.0       # dynamics trainer: linearly decay `lr` to this across
-                                #   the bootstrap ramp (or the post-warmup steps when
-                                #   there is none); 0 = constant after warmup
+    lr_final: float = 0.0       # dynamics trainer: linearly decay `lr` to this; 0 =
+                                #   constant after warmup (its config sets 5e-5)
+    lr_decay_steps: int = 0     # dynamics trainer: WHERE that decay sits. > 0: over the
+                                #   last `lr_decay_steps` steps BEFORE the bootstrap ramp
+                                #   opens, so the first bootstrap row meets `lr_final`
+                                #   already (its config sets 1000). 0: across the ramp
+                                #   itself (diverges on the obstacle maze, 2026-09-18),
+                                #   or over the post-warmup steps when there is no ramp
     grad_clip: float = 1.0
     weight_decay: float = 0.01
     beta1: float = 0.9
@@ -146,12 +156,18 @@ class TokenizerTrainConfig:
 # Dynamics training config
 # ---------------------------------------------------------------------------
 #
-# The defaults ARE the reference world-model recipe minus the bootstrap term:
+# The defaults ARE the reference world-model recipe, ONE run of 30 000 steps:
 # clean-context objective with 1-step scheduled sampling (ramped to 0.7),
 # ctx-noise band 0.05-0.15, image batches 0.15 taken from episode frame 0,
-# joint proprio w0.3. The K=1-maker is the bootstrap term, ramped in over the
-# second half of the SAME run (objective.bootstrap_frac 0.5 with
-# bootstrap_start_frac 0.55 / bootstrap_ramp_frac 0.10, optim.lr_final 5e-5).
+# joint proprio w0.3 -- and the K=1-maker, the bootstrap term, switched on for
+# the last 20 %: fraction 0 until step 24 000, 0 -> 0.5 by 25 500, held. The LR
+# walks 3e-4 -> 5e-5 over the 1 000 steps BEFORE the ramp opens
+# (optim.lr_decay_steps), so the first bootstrap row already meets the low rate.
+# Decaying across the ramp instead -- the earlier recipe, 42 000 steps with
+# bootstrap_start_frac 0.55 / ramp 0.10 -- diverges on the obstacle maze
+# ~1 300 steps into the ramp and never recovers (2026-09-18). Measured on the
+# obstacle maze, H=39: latent MSE 3e-4 at K=1 and K=4, player error 0.03 / 0.07.
+# `--objective.bootstrap_frac 0` trains without the term (K=4 only).
 # See scripts/train_gridworld.sh for the end-to-end recipe.
 
 
@@ -210,12 +226,13 @@ class ObjectiveConfig:
     sched_warmup_frac: float = 0.4      # ramp sched prob 0 -> target over this frac
     image_batch_prob: float = 0.15      # prob of a T=1 no-context step (dream-from-
                                         #   scratch); 0.3 measured worse
-    bootstrap_frac: float = 0.0         # TARGET bootstrap batch fraction; >0 adds the
-                                        #   shortcut bootstrap term (the recipe uses 0.5
-                                        #   — makes K=1/2/4 inference all legal)
-    bootstrap_start_frac: float = 0.0   # hold the fraction at 0 for this frac of the
-                                        #   run before ramping (0 = target from step 1)
-    bootstrap_ramp_frac: float = 0.0    # ramp 0 -> bootstrap_frac over this frac of the
+    bootstrap_frac: float = 0.5         # TARGET bootstrap batch fraction; >0 adds the
+                                        #   shortcut bootstrap term (makes K=1/2/4
+                                        #   inference all legal); 0 = K=4 only
+    bootstrap_start_frac: float = 0.8   # hold the fraction at 0 for this frac of the
+                                        #   run before ramping (0 = target from step 1,
+                                        #   what a warm-started fine-tune wants)
+    bootstrap_ramp_frac: float = 0.05   # ramp 0 -> bootstrap_frac over this frac of the
                                         #   run, then hold to the end (0 = step change)
     boot_weight: float = 0.5            # relative weight of the bootstrap term
     proprio_weight: float = 0.3         # relative weight of the joint proprio term
@@ -241,11 +258,12 @@ class DynamicsTrainConfig:
     tokenizer: TokenizerRefConfig = field(default_factory=TokenizerRefConfig)
     objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
     optim: OptimConfig = field(default_factory=lambda: OptimConfig(
-        grad_clip=0.5, amp=False))      # the reference dynamics recipe is fp32
+        grad_clip=0.5, amp=False,       # the reference dynamics recipe is fp32
+        lr_final=5e-5, lr_decay_steps=1000))   # low LR BEFORE the bootstrap ramp
     eval: DynamicsEvalConfig = field(default_factory=DynamicsEvalConfig)
 
     out: str = "runs/dynamics"
-    steps: int = 24000
+    steps: int = 30000          # 24 000 plain + 6 000 with the bootstrap term
     seed: int = 0
     device: str = "cuda"
     log_every: int = 50

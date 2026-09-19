@@ -117,7 +117,7 @@ that slot's frame.
 
 | what | paper | here | why |
 |---|---|---|---|
-| context length | C = 192 frames | `--clip_T` = the world model's `max_T - 1` (11 on the gridworld recipe) | bounded by the positional encoding of the phase-1 checkpoint; imagination needs one slot spare for the frame being denoised |
+| context length | C = 192 frames | `--clip_T` = the window the dynamics model was trained on (`--data.seq_len`, 4 on the gridworld recipe) | the policy's context is the context imagination dreams with, and the dynamics only follows the actions inside window lengths it was trained on (with 7+ past frames the dreamed player is in the wrong cell on >90 % of the steps); imagination needs one slot spare for the frame being denoised |
 | tokenizer bottleneck | 512 latent tokens x 16 channels, masked autoencoding | 16 x 16, no masking | sized for a toy environment and one GPU |
 | proprio stream | not present | one token per frame, denoised jointly with the latents | the agent's own state (the player's position on the gridworld) |
 | bootstrap term | part of shortcut forcing | ramped in during phase 1b (`--objective.bootstrap_start_frac`, `--objective.bootstrap_ramp_frac`) | distilling two half-steps into one needs a model that can already take a half-step |
@@ -175,14 +175,15 @@ python -m dreamer4.train.train_tokenizer \
   --data.path data/gw_noobs_10k --out runs/gridworld/tok \
   --steps 16000 --seed 1 --resume True
 
-# 1b — world model; bootstrap fraction 0 until 55 % of training, 0 -> 0.5 by 65 %,
-#      LR 3e-4 -> 5e-5 across the same ramp
+# 1b — world model (these flags are the trainer defaults): bootstrap fraction 0
+#      until step 24 000, 0 -> 0.5 by 25 500; LR 3e-4 -> 5e-5 over the 1 000 steps
+#      BEFORE that ramp opens
 python -m dreamer4.train.train_dynamics \
   --data.path data/gw_noobs_10k \
   --tokenizer.ckpt runs/gridworld/tok/checkpoints/latest.pt \
-  --out runs/gridworld/dyn --steps 42000 --optim.lr 3e-4 --optim.lr_final 5e-5 \
-  --objective.bootstrap_frac 0.5 \
-  --objective.bootstrap_start_frac 0.55 --objective.bootstrap_ramp_frac 0.10 \
+  --out runs/gridworld/dyn --steps 30000 --optim.lr 3e-4 --optim.lr_final 5e-5 \
+  --optim.lr_decay_steps 1000 --objective.bootstrap_frac 0.5 \
+  --objective.bootstrap_start_frac 0.8 --objective.bootstrap_ramp_frac 0.05 \
   --seed 1 --resume True
 
 # 2 — agent finetuning
@@ -205,9 +206,27 @@ open-loop rollout at both K=4 and K=1.
 
 Empty maze, held-out evaluation over 2 000 episodes (seed 900000, disjoint from
 the training data), one training seed, one RTX 4090. 5 349 episodes are eligible
-as demonstrations. Measured with the goal position also in the proprio stream and hidden from
-the agent; the default proprio now carries the player position only.
+as demonstrations; the proprio stream carries the player position only, so the
+goal has to be seen in the latents. Success rate, and path length / shortest path
+over the solved episodes:
 
-| phase 2 (6 000 steps) | phase 3 (3 200 updates, K=1) | phase 3 sampled | path / optimal |
-|---|---|---|---|
-| 0.9935 | **0.9960** | 0.9960 | 1.078 |
+| | greedy | sampled |
+|---|---|---|
+| phase 2, 6 000 steps (7 min) | **1.000** / 1.003 | 0.995 / 1.54 |
+| phase 3, 400 updates (+4 min) | **1.000** / 1.002 | **1.000** / 1.028 |
+| phase 3, 3 200 updates | **1.000** / 1.002 | **1.000** / 1.018 |
+
+Measured 2026-09-19. The 0.9935 / 0.9960 (path 1.078) this table carried before
+came from a policy context of `max_T - 1 = 11` frames on a world model trained on
+4-frame windows -- which phase 3 also dreamed with (the dreamed player was in the
+wrong cell on 94 % of the steps) -- and from a PMPO term that included the action
+"taken" at a dream's terminal frame. With both fixed, the same recipe gives the
+numbers above.
+
+The obstacle maze is not solved by this recipe. There the phase-2 finetune costs
+the transformer its rollout accuracy (the dreamed player is in the wrong cell on
+63 % of the steps against 1 % before), so phase 3 has no usable simulator. Cloning
+alone reaches about 0.87 greedy (phase 2 run as `--dyn_weight 0 --dyn_lr 2e-4
+--batch 96`, which is not the paper's objective), and the remaining failures are a
+greedy policy pushing into a wall it does not see. The open problem is a phase 2
+that keeps the world model.
