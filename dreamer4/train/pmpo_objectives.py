@@ -79,6 +79,7 @@ def pmpo_coeffs(
     advantages: torch.Tensor,
     *,
     alpha: float = 0.5,
+    drop_frac: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Per-transition coefficients ``c_i`` such that
@@ -92,25 +93,46 @@ def pmpo_coeffs(
     ``(1 - alpha) / |D-|``. Advantages enter detached; the only gradient path
     is ``ln pi``.
 
+    ``drop_frac > 0`` is NOT in the paper: it removes, from each pool
+    separately, that fraction of transitions with the smallest ``|A|`` before
+    the weights are set. A sign split votes a coin-flip advantage exactly as
+    hard as a decisive one, and once the policy is mostly right nearly all of
+    D- is optimal actions whose advantage is zero plus critic noise (measured
+    on the empty maze: 86 % of D-). Dropping the least decisive ones removes
+    that vote. A quantile per pool, not an absolute cut: ``|A|`` shrinks as
+    the policy converges, and the two pools have different scales.
+
     Args:
         advantages: advantages of the transitions to score, any shape;
                     flattened and detached. Typically
                     ``lambda_return - value`` on the states acted in.
         alpha:      share of the total weight given to D+; D- gets
                     ``1 - alpha``.
+        drop_frac:  fraction of each pool dropped, smallest ``|A|`` first;
+                    0 = the paper's objective.
 
     Returns:
         (coeffs (N,) float32, info) -- ``info["pos_frac"]`` is the share of
-        transitions with a non-negative advantage.
+        transitions with a non-negative advantage, ``info["kept_frac"]`` the
+        share that kept a non-zero coefficient.
     """
     adv = advantages.detach().reshape(-1)
     pos, neg = adv >= 0, adv < 0
+    pos_frac = float(pos.float().mean()) if adv.numel() else 0.0
+    if drop_frac > 0 and adv.numel():
+        mag = adv.abs().float()
+        keep = torch.ones_like(pos)
+        for pool in (pos, neg):
+            if pool.any():
+                keep &= ~pool | (mag >= torch.quantile(mag[pool], drop_frac))
+        pos, neg = pos & keep, neg & keep
     coeff = torch.zeros(adv.shape, dtype=torch.float32, device=adv.device)
     if pos.any():
         coeff[pos] = -alpha / float(pos.sum())
     if neg.any():
         coeff[neg] = (1.0 - alpha) / float(neg.sum())
     info: Dict[str, float] = {
-        "pos_frac": float(pos.float().mean()) if adv.numel() else 0.0,
+        "pos_frac": pos_frac,
+        "kept_frac": float((pos | neg).float().mean()) if adv.numel() else 0.0,
     }
     return coeff, info

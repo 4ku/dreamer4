@@ -98,14 +98,24 @@ window, so phase 2 trains on clips.
 running on noisy representations, the agent loss (behavioral cloning and reward
 prediction, Eq. 9) is added to it, and every term is RMS-normalised. Half of each
 agent batch comes from demonstrations and half from all episodes; the cloning
-term applies only to the demonstration half (Section 4.1).
+term applies only to the demonstration half (Section 4.1). `--value_weight`
+(off by default, not in the paper) adds a critic-pretraining term: the value head
+regressed on the recorded return-to-go of every training episode, so phase 3
+starts from a critic, and from agent features, that already know how far the
+reward is.
 
 **Phase 3** freezes the transformer and trains only the policy and value heads.
 Imagined rollouts start from recorded contexts, one rollout per context. The
 value head is a symexp two-hot distribution trained by cross-entropy on the
 lambda-return (Eq. 10); the policy is trained with PMPO (Eq. 11) — the sign of
 the advantage, `alpha = 0.5` between the positive and negative sets, and a fixed
-`beta = 0.3` on the reverse KL to the behavioral prior.
+`beta = 0.3` on the reverse KL to the behavioral prior. Two options, both off by
+default and neither in the paper: `--adv_drop_frac` removes from each pool the
+transitions with the smallest `|A|` (near convergence almost all of D- is optimal
+actions whose advantage is zero plus critic noise), and `--reward_decode mode`
+pays a dream the two-hot mean around the reward head's most likely bin instead of
+the expectation over all bins (1 % of leaked mass on the +1 bin pays +0.01, which
+on the gridworld is the whole step cost).
 
 The same context-window convention is used by phase 2, by imagination and by the
 live evaluator: a `--clip_T`-slot window ending at the current frame, left-padded
@@ -129,7 +139,7 @@ unstated. Each line is what this implementation picked.
 
 | open point | choice here |
 |---|---|
-| number of agent tokens per frame | `--n_agent 1`; more are concatenated into `h_t` |
+| number of agent tokens per frame | `--n_agent 1`; more are concatenated into `h_t`. With all demonstrations one is enough; with few it is the decisive setting (see "Results, 214 demonstrations"): one token leaves the critic blind to anything finer than +-1 cell of distance |
 | position of the agent tokens in the block | last, so every world token keeps its phase-1 positional index and a phase-1 checkpoint loads unchanged |
 | which layer produces `h_t` | the final one |
 | which denoising pass supplies `h_t` in imagination | the pass that commits the finished frame at the context signal level `1 - tau_ctx` |
@@ -150,9 +160,12 @@ unstated. Each line is what this implementation picked.
 # empty maze — the whole chain on one RTX 4090
 COLLECT=1 ./scripts/train_gridworld.sh
 
-# fewer demonstrations
-BC_FRAC=0.2 HEADS_STEPS=2000 HEADS_EXTRA="--eval_every 250" \
-  OUT=runs/fifth ./scripts/train_gridworld.sh
+# few demonstrations (214 of the 5 349 eligible): cloning alone no longer solves the
+# maze, imagination training does -- see "Results, 214 demonstrations"
+BC_FRAC=0.04 HEADS_STEPS=4000 PMPO_STEPS=1000 OUT=runs/fewdemo \
+  HEADS_EXTRA="--n_agent 8 --value_weight 1.0 --eval_every 1000000" \
+  PMPO_EXTRA="--batch 256 --lr 1e-3 --lr_final 1e-4 --beta 0.03 --adv_drop_frac 0.1 --adv_drop_final 0.9 --adv_drop_steps 300 --reward_decode mode --compile 1 --eval_every 1000000" \
+  ./scripts/train_gridworld.sh
 
 # obstacles — 0 to 25 % of the cells are walls, drawn per episode
 COLLECT=1 DATA=data/gw_obs_10k OUT=runs/gw_obs DENSITY="0,0.25" \
@@ -222,6 +235,29 @@ came from a policy context of `max_T - 1 = 11` frames on a world model trained o
 wrong cell on 94 % of the steps) -- and from a PMPO term that included the action
 "taken" at a dream's terminal frame. With both fixed, the same recipe gives the
 numbers above.
+
+### Results, 214 demonstrations
+
+`--bc_frac 0.04` clones 214 of the 5 349 eligible demonstrations, so that phase 2
+does not solve the maze and phase 3 has to. Phase 2: `--n_agent 8 --value_weight 1.0
+--steps 4000`; phase 3: 1 000 updates of `--batch 256 --lr 1e-3 --lr_final 1e-4
+--beta 0.03 --adv_drop_frac 0.1 --adv_drop_final 0.9 --adv_drop_steps 300
+--reward_decode mode --compile 1`. No in-run evaluation, the final checkpoint is
+taken as is; held-out evaluation as above; each training seed also draws its own
+214 demonstrations; one RTX 4090 with nothing else on it:
+
+| | greedy | sampled | wall clock |
+|---|---|---|---|
+| phase 2 alone (5 seeds) | 0.69-0.82 / 1.52-1.55 | 0.80-0.90 / 1.8-2.0 | 4.6 min |
+| + phase 3 (5 seeds) | **1.000** / 1.003-1.010 (one seed 0.9995) | **1.000** / 1.006-1.013 | + 5.7 min = 10.3 min |
+| same with a 3 000-step phase 2 (4 seeds) | **1.000** / 1.004-1.010 | **1.000** / 1.005-1.012 | 9.3 min |
+
+With one agent token the same phase 3 stops at about 0.99 / 1.15 whatever else is
+tuned: the critic is then off by 0.045 of return on average against the 0.025 that
+one wrong move costs, and PMPO, which reads only the sign of the advantage, cannot
+tell a wrong move from an optimal one next to the goal. With eight tokens the
+critic error is 0.008. Dropping the video-prediction loss from phase 2 saves
+2.6 min and costs reliability (2 of 4 seeds miss the path or lose an episode).
 
 The obstacle maze is not solved by this recipe. There the phase-2 finetune costs
 the transformer its rollout accuracy (the dreamed player is in the wrong cell on

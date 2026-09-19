@@ -101,6 +101,23 @@ def demonstration_ids(episodes, n_train, bc_frac, bc_seed, log=print):
     return demos
 
 
+def add_returns(episodes, gamma):
+    """Attach ``ret``: the discounted return-to-go the RECORDED behaviour collected from each frame.
+
+    ``ret[t] = r_t + gamma * ret[t+1]`` with ``r_t`` the reward of the ``t -> t+1`` transition and
+    zero after the last frame. It is the value of the behaviour that produced the episode, not of
+    the policy being trained -- which is why it is only a pretraining target for the critic
+    (``--value_weight``): phase 3 starts from a value head, and from agent features, that already
+    know how far the reward is, instead of from uniform logits.
+    """
+    for ep in episodes:
+        r = np.asarray(ep["rewards"], np.float32)
+        g = np.zeros(len(r) + 1, np.float32)
+        for t in range(len(r) - 1, -1, -1):
+            g[t] = r[t] + gamma * g[t + 1]
+        ep["ret"] = g[:ep["z"].shape[0]] if len(g) >= ep["z"].shape[0] else np.pad(g, (0, ep["z"].shape[0] - len(g)))
+
+
 def sample_clips(episodes, ids, B, T, rng, device):
     """``B`` context windows of ``T`` slots, each ending at a uniformly chosen frame.
 
@@ -117,7 +134,9 @@ def sample_clips(episodes, ids, B, T, rng, device):
         ``z`` (B,T,Nz,Dz), ``proprio`` (B,T,Dp), ``actions`` (B,T,Da+1) aligned,
         ``a_id`` (B,T) long -- the action taken FROM the slot's frame (the policy target),
         ``valid_a`` (B,T), ``reward`` (B,T) -- the reward that ARRIVED WITH the slot's frame,
-        ``valid_r`` (B,T), ``task`` (B,) long -- the episode's task indicator.
+        ``valid_r`` (B,T), ``task`` (B,) long -- the episode's task indicator,
+        ``ret`` (B,T) -- the recorded discounted return-to-go from the slot's frame (zeros unless
+        :func:`add_returns` ran), ``valid_v`` (B,T) -- 0 on a padded slot.
     """
     pick = rng.choice(np.asarray(ids), size=B, replace=True)
     n_frames = np.array([episodes[int(i)]["z"].shape[0] for i in pick])
@@ -136,6 +155,7 @@ def sample_clips(episodes, ids, B, T, rng, device):
     valid_a = np.zeros((B, T), np.float32)
     reward = np.zeros((B, T), np.float32)
     valid_r = np.zeros((B, T), np.float32)
+    ret = np.zeros((B, T), np.float32)
     # The paper's one-hot task indicator. A collector that records one puts it in the episode's
     # metadata (``EpisodeVideoDataset.episode_meta``); a single-task dataset records none and every
     # clip is task 0.
@@ -158,10 +178,12 @@ def sample_clips(episodes, ids, B, T, rng, device):
         rew_here = (s >= 1) & (s - 1 < n_act)
         reward[b] = np.where(rew_here, ep["rewards"][np.maximum(s - 1, 0)], 0.0)
         valid_r[b] = (rew_here & fresh[b]).astype(np.float32)
+        if "ret" in ep:
+            ret[b] = ep["ret"][s]
     as_t = (lambda x: torch.as_tensor(x, device=device))
     return {"z": z, "proprio": as_t(proprio), "actions": as_t(actions), "a_id": as_t(a_id),
             "valid_a": as_t(valid_a), "reward": as_t(reward), "valid_r": as_t(valid_r),
-            "task": as_t(task)}
+            "task": as_t(task), "ret": as_t(ret), "valid_v": as_t(fresh.astype(np.float32))}
 
 
 def agent_forward(world, heads, clip, *, tau_ctx, ctx_signal, emax):
@@ -257,6 +279,13 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=5e-4, help="learning rate of the agent heads")
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--reward_weight", type=float, default=1.0)
+    ap.add_argument("--value_weight", type=float, default=0.0,
+                    help="NOT in the paper (there the value head is born in phase 3): weight of a "
+                         "critic-pretraining term, the value head regressed on the recorded "
+                         "return-to-go of ALL training episodes. It makes the agent features carry "
+                         "the distance to the reward and hands phase 3 a critic that is not blank")
+    ap.add_argument("--gamma", type=float, default=0.997,
+                    help="discount of the recorded returns for --value_weight; use phase 3's")
     ap.add_argument("--val_frac", type=float, default=0.05,
                     help="last fraction of the episodes, held out for the agent metrics")
     ap.add_argument("--bc_frac", type=float, default=1.0,
@@ -410,7 +439,7 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
     # (RMS)". Order fixes the normaliser slots, so it must stay stable across a resume.
     combiner = LossCombiner({"policy": 1.0, "reward": cfg.reward_weight,
                              "flow": cfg.dyn_weight, "proprio": cfg.dyn_weight * 0.3,
-                             "bootstrap": cfg.dyn_weight * 0.5},
+                             "bootstrap": cfg.dyn_weight * 0.5, "value": cfg.value_weight},
                             normalize=bool(cfg.loss_norm), device=dev)
 
     ctx_signal = min(int(round((1.0 - world.tau_ctx) * world.k_max)), world.k_max)
@@ -444,6 +473,9 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
             h = agent_forward(world, heads, clip, **fwd)
             pol, rew = agent_losses(heads, h.float(), clip, mtp=cfg.mtp, demo_mask=demo_mask)
             terms = {"policy": pol, "reward": rew}
+            if cfg.value_weight > 0:
+                terms["value"] = heads.value.loss(heads.value(h.float()), clip["ret"][..., None],
+                                                  clip["valid_v"][..., None])
             if cfg.dyn_weight > 0:
                 # The video-prediction loss, unchanged from pretraining and applied to windows
                 # drawn from the WHOLE collection: "the dynamics loss is applied only on the
@@ -478,7 +510,8 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
             now = time.time()
             for k, x in raw.items():
                 writer.add_scalar(("bc/cross_entropy" if k == "policy" else
-                                   "reward/loss" if k == "reward" else f"dyn/{k}"), x, s)
+                                   "reward/loss" if k == "reward" else
+                                   "critic/pretrain_loss" if k == "value" else f"dyn/{k}"), x, s)
             for k, x in dyn_aux.items():
                 writer.add_scalar(f"dyn/{k}", x, s)
             writer.add_scalar("train/loss_total", float(loss.detach()), s)
@@ -546,6 +579,8 @@ def main():
         raise ValueError("this dataset records no rewards/terminals, so the reward head cannot be "
                          "trained on it")
     n_train = int(round(len(ds) * (1.0 - cfg.val_frac)))
+    if cfg.value_weight > 0:
+        add_returns(episodes, cfg.gamma)
     demos = demonstration_ids(episodes, n_train, cfg.bc_frac, cfg.bc_seed)
     print(f"data {world.data_path} encoded in {time.time() - t0:.0f}s | batch {cfg.batch}",
           flush=True)

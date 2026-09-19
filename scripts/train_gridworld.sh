@@ -36,6 +36,15 @@
 #
 #   COLLECT=1 ./scripts/train_gridworld.sh
 #   COLLECT=1 OUT=runs/gw BC_FRAC=0.5 HEADS_STEPS=10000 ./scripts/train_gridworld.sh
+#
+# Few demonstrations (214 of them: cloning no longer solves the maze, phase 3 does;
+# 100 % success, path / shortest < 1.01, 10 min for phases 2-3 -- README, results):
+#
+#   BC_FRAC=0.04 HEADS_STEPS=4000 PMPO_STEPS=1000 OUT=runs/fewdemo \
+#     HEADS_EXTRA="--n_agent 8 --value_weight 1.0 --eval_every 1000000" \
+#     PMPO_EXTRA="--batch 256 --lr 1e-3 --lr_final 1e-4 --beta 0.03 --adv_drop_frac 0.1 \
+#       --adv_drop_final 0.9 --adv_drop_steps 300 --reward_decode mode --compile 1 \
+#       --eval_every 1000000" ./scripts/train_gridworld.sh
 #   COLLECT=1 DATA=data/gw_obs_10k OUT=runs/gw_obs DENSITY="0,0.25" \
 #     HEADS_STEPS=8000 ./scripts/train_gridworld.sh
 

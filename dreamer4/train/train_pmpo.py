@@ -187,6 +187,27 @@ class Imagination:
         self.value_params = list(heads.value.parameters())
         self.ckpt = ckpt
 
+    def decode_reward(self, probs):
+        """The scalar reward a dream pays, from the reward head's distribution over bins.
+
+        ``mean`` is the expectation over all bins. ``mode`` is the two-hot mean restricted to the
+        most likely bin and its two neighbours: a categorical head always leaks a little mass onto
+        far bins, and where one rare reward dwarfs the per-step one that leak IS the signal's size
+        -- on the gridworld 1 % of mass on the +1 bin pays +0.01, exactly the step cost, and it
+        concentrates near the goal (measured in dreams: a wrong move two cells from the goal had a
+        HIGHER mean return than the optimal one). A recorded reward is two-hot encoded onto two
+        adjacent bins, so the local mean decodes it exactly and ignores the leak.
+        """
+        if self.cfg.reward_decode == "mean":
+            return (probs * self.bins).sum(-1)
+        top = probs.argmax(-1, keepdim=True)
+        idx = (top + torch.arange(-1, 2, device=probs.device)).clamp(0, probs.shape[-1] - 1)
+        local = probs.gather(-1, idx)
+        # a clamped index repeats an edge bin; count it once
+        local = local * torch.cat([idx[..., :1] != idx[..., 1:2], torch.ones_like(idx[..., :1], dtype=torch.bool),
+                                   idx[..., 2:] != idx[..., 1:2]], -1)
+        return (local * self.bins[idx]).sum(-1) / local.sum(-1).clamp_min(1e-8)
+
     def eval_policy(self):
         return AgentPolicy(self.world.dyn, self.heads, window=self.clip_T,
                            tau_ctx=self.world.tau_ctx, k_max=self.world.k_max)
@@ -228,7 +249,7 @@ class Imagination:
                 # the t-1 -> t transition, and the terminal rule on the same distribution says
                 # whether this frame ends the episode.
                 probs = heads.reward.at(h, 0).float().softmax(-1)
-                tape.rewards[:, t - 1] = ((probs * self.bins).sum(-1)
+                tape.rewards[:, t - 1] = (self.decode_reward(probs)
                                           * torch.as_tensor(~tape.done, device=dev))
                 p_term = (probs * self.term_bin).sum(-1)
                 tape.terminate(t, (p_term > term_prob).cpu().numpy())
@@ -284,6 +305,10 @@ def parse_args():
     ap.add_argument("--K", type=int, default=4, help="shortcut denoising steps per imagined frame")
     ap.add_argument("--term_prob", type=float, default=0.5,
                     help="end a dream when the reward head puts this much mass on a terminal reward")
+    ap.add_argument("--reward_decode", choices=("mean", "mode"), default="mean",
+                    help="how a dream turns the reward head's distribution into a number: the "
+                         "expectation over all bins, or ('mode') the two-hot mean around the most "
+                         "likely bin, which ignores the mass a categorical head leaks onto far bins")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--value_lr", type=float, default=1e-3)
     ap.add_argument("--lr_final", type=float, default=0.0, help="both rates decay linearly to this")
@@ -295,6 +320,13 @@ def parse_args():
     ap.add_argument("--alpha", type=float, default=0.5, help="paper Eq. 11")
     ap.add_argument("--beta", type=float, default=0.3,
                     help="weight of the reverse KL to the behavioral prior (paper Eq. 11)")
+    ap.add_argument("--adv_drop_frac", type=float, default=0.0,
+                    help="NOT in the paper: drop this fraction of each PMPO pool, smallest |advantage| "
+                         "first, so coin-flip advantages do not vote (0 = the paper's pure sign split)")
+    ap.add_argument("--adv_drop_final", type=float, default=-1.0,
+                    help="ramp the dropped fraction linearly to this value over --adv_drop_steps "
+                         "updates; negative = keep --adv_drop_frac throughout")
+    ap.add_argument("--adv_drop_steps", type=int, default=0)
     ap.add_argument("--eval_every", type=int, default=3200)
     ap.add_argument("--eval_n", type=int, default=1000)
     ap.add_argument("--eval_seed", type=int, default=31337,
@@ -405,7 +437,10 @@ def main():
         # states adjacent to the goal, which is where the damage showed (greedy success 1.000 ->
         # 0.988 on the empty maze, every failure a loop one or two cells from the goal).
         keep = (alive[:, :H] > 0) & (roll["continues"][:, :H] > 0)
-        coeff, pinfo = pmpo_coeffs(adv[keep], alpha=cfg.alpha)
+        drop = cfg.adv_drop_frac
+        if cfg.adv_drop_final >= 0:
+            drop += (cfg.adv_drop_final - drop) * min(1.0, step / max(1, cfg.adv_drop_steps))
+        coeff, pinfo = pmpo_coeffs(adv[keep], alpha=cfg.alpha, drop_frac=drop)
         dist = torch.distributions.Categorical(logits=lg[:, :H])
         lp = dist.log_prob(roll["actions"])[keep]
         with torch.no_grad():
@@ -454,7 +489,9 @@ def main():
                 writer.add_scalar(f"eval/{k}", x, step + 1)
             writer.flush()
             agent.save(out / "checkpoints" / "latest.pt", last_eval)
-            if g[0] > best:
+            # best.pt: the highest greedy success rate, ties broken by the shorter path -- the first
+            # checkpoint to reach 100 % is rarely the best one (phase 2 selects the same way)
+            if (g[0], -g[2]) > (best, -best_eval.get("greedy_opt", float("inf"))):
                 best = g[0]
                 best_eval = last_eval
                 agent.save(out / "checkpoints" / "best.pt", last_eval)
