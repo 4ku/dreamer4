@@ -4,11 +4,12 @@
 # (two seeds, the better one on validation layouts) -> PMPO in imagination
 # (16 000 updates) -> held-out evaluation. Paper architecture throughout.
 #
-# Measured 2026-10-21, three seeds, held-out n = 2 000 (seeds 900000+, layouts no
-# phase has seen): success 0.957 / 0.944 / 0.953, path / shortest 1.070 / 1.099 /
-# 1.078; 3.05-3.10 h each (tokenizer 8 min, world model 26, phase 2 15, phase 3
-# 134). Those runs ended a dream when the reward head gave a terminal probability
-# above 0.3; this script keeps the trainer default 0.5. README, "Obstacle maze".
+# Measured 2026-10-21, four seeds, held-out n = 2 000 (seeds 900000+, layouts no
+# phase has seen): success 0.957 / 0.944 / 0.953 / 0.925 (mean 0.944), path /
+# shortest 1.07-1.10; 3.03-3.10 h each (tokenizer 8 min, world model 26, phase 2
+# 15, phase 3 133-135). Those runs ended a dream when the reward head gave a
+# terminal probability above 0.3; this script keeps the trainer default 0.5.
+# README, "Results, obstacles: the 3-hour recipe".
 #
 # Environment variables, with defaults:
 #   DATA=data/gw_obs_10k   dataset directory; COLLECT=1 collects it first if missing

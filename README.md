@@ -328,14 +328,17 @@ environment. It costs one point today and would cost more with better features.
 COLLECT=1 ./scripts/train_obstacles.sh          # one RTX 4090, about 3.1 h
 ```
 
-Same data and evaluation as above (held-out seeds 900000+, n = 2 000), three
-training seeds, each run alone on its GPU, measured 2026-10-21:
+Same data and evaluation as above (held-out seeds 900000+, n = 2 000), four
+training seeds, each run alone on its GPU, measured 2026-10-21 (mean **0.944** /
+1.084; the weakest seed is the one whose phase 2 cloned worst, 0.79 on the
+validation layouts against 0.82-0.87):
 
 | seed | success / path (greedy) | sampled | tokenizer | world model | phase 2 | phase 3 | total |
 |---|---|---|---|---|---|---|---|
 | 1 | **0.957** / 1.070 | 0.961 / 1.081 | 8 min | 26 min | 15 min | 134 min | 3.07 h |
 | 2 | **0.944** / 1.099 | 0.951 / 1.104 | 8 min | 26 min | 15 min | 135 min | 3.10 h |
 | 3 | **0.953** / 1.078 | 0.959 / 1.085 | 8 min | 26 min | 15 min | 134 min | 3.07 h |
+| 4 | **0.925** / 1.089 | 0.933 / 1.100 | 8 min | 26 min | 15 min | 133 min | 3.03 h |
 
 What it changes against the 12-minute recipe:
 
