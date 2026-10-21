@@ -3,11 +3,10 @@
 # tokenizer -> world model -> agent finetuning -> PMPO in imagination.
 # One RTX 4090; see the README results table.
 #
-# TWO RECIPES, same chain, two environment variables apart:
+# ONE RECIPE for both mazes -- only the data differs:
 #
-#   empty maze  DENSITY=0         HEADS_STEPS=4000
-#   obstacles   DENSITY="0,0.25"  HEADS_STEPS=8000   (not re-measured with the
-#                                                     current phase-2/3 defaults)
+#   empty maze  DENSITY=0          100 % success, path / shortest 1.000, 10 min for phases 2-3
+#   obstacles   DENSITY="0,0.25"   ~0.92 greedy / ~0.94 sampled, 12 min (README: what stops it there)
 #
 # Everything is an environment variable with a default, so a different
 # dataset, run dir, GPU or seed needs no edit:
@@ -46,8 +45,7 @@
 # Phases 2 and 3 evaluate in the real env only once, at their end (that is how
 # the README's wall-clock numbers were taken); for curves pass e.g.
 # HEADS_EXTRA="--eval_every 1000" PMPO_EXTRA="--eval_every 200".
-#   COLLECT=1 DATA=data/gw_obs_10k OUT=runs/gw_obs DENSITY="0,0.25" \
-#     HEADS_STEPS=8000 ./scripts/train_gridworld.sh
+#   COLLECT=1 DATA=data/gw_obs_10k OUT=runs/gw_obs DENSITY="0,0.25" ./scripts/train_gridworld.sh
 
 set -euo pipefail
 

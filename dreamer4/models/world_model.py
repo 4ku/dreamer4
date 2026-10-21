@@ -85,6 +85,8 @@ class WorldModel:
         # model prepends; the rollout builds the action vector itself, so it needs the dataset's.
         self.action_vec_dim = int(meta["action_dim"]) - 1
         self.latent_meta = dict(meta)
+        # Phase 1b's running loss scales (flow, proprio, bootstrap): phase 2 continues them.
+        self.loss_norm = ckpt.get("loss_norm")
         self.model_cfg = dict(config["model"])
 
     @staticmethod

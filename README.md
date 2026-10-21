@@ -134,6 +134,9 @@ that slot's frame.
 | PMPO pools | every transition votes with its sign | the 10 % -> 90 % of each pool with the smallest `|A|` are dropped (`--adv_drop_frac 0.1 --adv_drop_final 0.9 --adv_drop_steps 300`) | near convergence 99 % of D- is optimal actions with a coin-flip sign; path 1.003-1.005 with the drop, 1.007-1.016 without |
 | reward a dream pays | expectation of the two-hot distribution | two-hot mean around the most likely bin (`--reward_decode mode`) | leaked mass on the +1 bin cancels the -0.01 step cost; with the expectation the same recipe ends at 0.95-0.98 / 1.04-1.07 |
 | KL weight | `beta = 0.3` | `--beta 0.03` | the KL to a cloned prior is a brake when the prior is weak |
+| loss scales in phase 2 | every loss term RMS-normalised | the same, but the video-prediction terms CONTINUE the running scales phase 1b ended with (they are in its checkpoint) | a fresh normaliser divides the converged bootstrap term by its current RMS, while phase 1b ended dividing it by the floor of its peak; on the obstacle maze that makes the self-distillation term 4.3x heavier than phase 1b left it and the world model diverges within 200 steps, with every agent loss switched off too |
+| auxiliary forward model | not present | `train_heads --fwd_weight 1.0`: a small MLP on `[h_t, a_t]` predicts the change of the proprio vector over every recorded transition | cloning noisy demonstrations does not teach the agent tokens to see obstacles: a probe on the frozen `h_t` recalled 30-46 % of the blocked moves and half of the cloned episodes ended pushing into a wall; with the term 98 % |
+| phase-2 video loss | "reuse the pretraining setting" | flow and proprio terms at weight 3 (`--dyn_weight 3`), batch 64 as in phase 1b, WITHOUT the bootstrap rows (`--boot_frac 0`) | the agent losses reshape the world tokens' features and erode the rarest physics (a dreamed player walks through a wall after one push in 2.5-4 % of wall bumps at weight 1, 1 % at weight 3, 0.4 % after phase 1b); the bootstrap term at the transformer rate the agent needs (`--dyn_lr 2e-4`) destroys it altogether (94 %). K=1 dreams stay as good as K=4 ones without the bootstrap rows over a 4 000-step phase 2 |
 | bootstrap term | part of shortcut forcing | ramped in during phase 1b (`--objective.bootstrap_start_frac`, `--objective.bootstrap_ramp_frac`) | distilling two half-steps into one needs a model that can already take a half-step |
 
 ## Choices the paper leaves open
@@ -153,7 +156,7 @@ unstated. Each line is what this implementation picked.
 | how `c_t` is produced | the dataset's terminal rule applied to the reward head's distribution: `P(terminal) = sum_b softmax(logits)_b * (1 - continues(bin_b))` |
 | imagination horizon | the longest recorded episode (`--horizon 0`) |
 | whether the value head uses MTP | no |
-| optimisation | phase 2: AdamW, `--lr 5e-4` heads, `--dyn_lr 5e-5` transformer, cosine decay, grad clip 1.0. Phase 3: AdamW, `--lr 1e-3` policy and `--value_lr 1e-3` value, both decaying linearly to `--lr_final 1e-4`, `--batch 256` dreams per update (the rollout is latency-bound: 256 cost 10 % more than 32), grad clip 0.5, `--compile 1` |
+| optimisation | phase 2: AdamW, `--lr 5e-4` heads, `--dyn_lr 2e-4` transformer, `--batch 96` agent clips and `--dyn_batch 64` video windows per step, cosine decay, grad clip 1.0 (at 5e-5 / batch 32 the agent tokens do not learn the obstacles in 4 000 steps). Phase 3: AdamW, `--lr 1e-3` policy and `--value_lr 1e-3` value, both decaying linearly to `--lr_final 1e-4`, `--batch 256` dreams per update (the rollout is latency-bound: 256 cost 10 % more than 32), grad clip 0.5, `--compile 1` |
 | whether the behavioral prior is refreshed | no — a frozen copy taken at the start of phase 3 |
 
 ## Reproducing the gridworld run
@@ -168,9 +171,8 @@ COLLECT=1 ./scripts/train_gridworld.sh
 # maze, imagination training does -- see "Results, 214 demonstrations"
 BC_FRAC=0.04 OUT=runs/fewdemo ./scripts/train_gridworld.sh
 
-# obstacles — 0 to 25 % of the cells are walls, drawn per episode
-COLLECT=1 DATA=data/gw_obs_10k OUT=runs/gw_obs DENSITY="0,0.25" \
-  HEADS_STEPS=8000 ./scripts/train_gridworld.sh
+# obstacles — 0 to 25 % of the cells are walls, drawn per episode; same recipe
+COLLECT=1 DATA=data/gw_obs_10k OUT=runs/gw_obs DENSITY="0,0.25" ./scripts/train_gridworld.sh
 ```
 
 The script is resumable (a phase whose `<out>/final.json` exists is skipped),
@@ -228,12 +230,22 @@ training seeds:
 
 | | greedy | sampled | wall clock |
 |---|---|---|---|
-| phase 2, 4 000 steps | 0.998 / 1.010-1.012 | 0.989-0.994 / 1.61 | 4.6 min |
-| + phase 3, 1 000 updates | **1.000** / 1.0001-1.0002 | **1.000** / 1.0005-1.0013 | + 5.5 min = 10.1 min |
+| phase 2, 4 000 steps | **1.000** / 1.0002-1.0019 | 0.991-0.996 / 1.6 | 4.7 min |
+| + phase 3, 1 000 updates | **1.000** / 1.0000 | **1.000** / 1.0000-1.0012 | + 5.5 min = 10.2 min |
 
-Measured 2026-09-19. With the earlier defaults (one agent token, batch 32, `beta`
-0.3, no advantage drop, expectation decode, 6 000 + 3 200 steps) the same data
-gave 1.000 / 1.002 greedy and 1.000 / 1.018 sampled.
+Measured 2026-09-20 on the current defaults. The defaults of 2026-09-19 (phase 2
+at batch 32, transformer rate 5e-5, video loss at weight 1 with bootstrap rows, no
+forward model) gave 0.998 / 1.010-1.012 after phase 2 and 1.000 / 1.0001-1.0002
+after phase 3; the first defaults (one agent token, `beta` 0.3, no advantage drop,
+expectation decode, 6 000 + 3 200 steps) 1.000 / 1.002 greedy and 1.000 / 1.018
+sampled.
+
+Every success rate in this file is scored on exactly the first `n` seeds, each
+episode played to its end. Until 2026-09-20 the evaluator stopped at the `n`-th
+FINISHED episode, which leaves the long episodes — the failures — of the last
+batch of environments uncounted: at 14 % failures that read 0.951 instead of 0.865
+with `n = 200` and 0.860 instead of 0.851 with `n = 2 000`. A policy that solves
+everything is unaffected, so the empty-maze numbers did not move.
 
 ### Results, 214 demonstrations
 
@@ -247,6 +259,7 @@ above; each training seed also draws its own 214 demonstrations:
 | phase 2 alone (5 seeds) | 0.69-0.82 / 1.52-1.55 | 0.80-0.90 / 1.8-2.0 | 4.6 min |
 | + phase 3 (5 seeds) | **1.000** / 1.003-1.010 (one seed 0.9995) | **1.000** / 1.006-1.013 | + 5.7 min = 10.3 min |
 | same with a 3 000-step phase 2 (4 seeds) | **1.000** / 1.004-1.010 | **1.000** / 1.005-1.012 | 9.3 min |
+| current defaults, 2026-09-20 (4 seeds): phase 2 alone 0.77-0.91 / 1.5, then | **1.000** / 1.003-1.014 (one seed 0.9995; 3 of 4 under 1.01) | **1.000** / 1.004-1.009 | 10.3 min |
 
 What each default is worth on this task (seeds 1 and 2, greedy):
 
@@ -266,10 +279,44 @@ tell a wrong move from an optimal one next to the goal. With eight tokens the
 critic error is 0.008. Dropping the video-prediction loss from phase 2 saves
 2.6 min and costs reliability (2 of 4 seeds miss the path or lose an episode).
 
-The obstacle maze is not solved by this recipe. There the phase-2 finetune costs
-the transformer its rollout accuracy (the dreamed player is in the wrong cell on
-63 % of the steps against 1 % before), so phase 3 has no usable simulator. Cloning
-alone reaches about 0.87 greedy (phase 2 run as `--dyn_weight 0 --dyn_lr 2e-4
---batch 96`, which is not the paper's objective), and the remaining failures are a
-greedy policy pushing into a wall it does not see. The open problem is a phase 2
-that keeps the world model.
+(Except for the row dated 2026-09-20, the tables of this section were measured on
+the defaults of 2026-09-19. Those phase-2 settings -- `--batch 32 --dyn_lr 5e-5 --boot_frac 0.5
+--dyn_weight 1 --dyn_batch 32 --fwd_weight 0` -- still give 1.000 / 1.0014-1.0036 on
+the current code, two seeds; the current defaults trade a little of that path for
+the obstacle maze.)
+
+### Results, obstacles
+
+Obstacle density drawn per episode from U(0, 0.25); 5 365 of the 9 500 training
+episodes are eligible demonstrations (their own path is 1.60x the shortest: the
+collector's noise goes up to 0.6). Same defaults, same evaluation, three training
+seeds, each run alone on its GPU:
+
+| | greedy | sampled | wall clock |
+|---|---|---|---|
+| phase 2, 4 000 steps | 0.81-0.83 / 1.07 | 0.86 / 1.7 | 4.7 min |
+| + phase 3, 1 000 updates | **0.913-0.928** / 1.10 | **0.931-0.940** / 1.16 | + 7.5 min = 12.2 min |
+| + phase 3, 2 500 updates (1 seed) | 0.946 / 1.08 | 0.943 / 1.15 | + 19 min |
+
+With the defaults of 2026-09-19 the same data gave 0.09 after phase 2 and a
+collapsed phase 3; the three rows of the deviations table that mention the
+obstacle maze are what changed.
+
+**What stops it at about 0.94.** The remaining failures are dead-end pockets: the
+goal is two to four cells away behind a wall, and the way out starts by moving
+away from it for three to eight steps. Three measurements say this is a limit of
+the agent features, not of imagination or of phase 3's settings:
+
+- phase 3 unchanged but with the REAL environment supplying the next frame (a
+  perfect simulator) ends at 0.942 / 0.950 — one point above imagination;
+- a policy head fitted on the frozen `h_t` to perfect shortest-path labels plays
+  at 0.87; training the transformer in phase 3 as well ends at 0.946;
+- a 6-layer token transformer trained on perfect shortest-path labels for 230 000
+  recorded states memorises them and picks a shortest-path move in 93 % of
+  held-out states — and in 30 % of the states where no goal-ward move is free
+  (chance). Those states are 1.5-1.9 % of the data.
+
+Imagination is nevertheless optimistic exactly there: from the states where the
+real greedy policy fails, 19-24 % of the dreams cross a wall and 10-22 % end on a
+reward-head false positive, against 25-33 % honest successes in the real
+environment. It costs one point today and would cost more with better features.

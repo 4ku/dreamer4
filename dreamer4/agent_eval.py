@@ -84,8 +84,14 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
     obs_l, info_l, ln = [None] * B, [None] * B, [0] * B
     opt = [0] * B
     frames = [None] * B
+    # Exactly the episodes seed .. seed+n-1 are scored, every one of them to its end. Stopping at
+    # the n-th FINISHED episode instead leaves up to len(envs) episodes in flight, and those are
+    # mostly the long ones -- a failure runs to the step limit -- so the success rate comes out
+    # too high, by a lot when n is only a few times len(envs).
+    active = [False] * B
     for i in range(B):
-        obs_l[i], info_l[i] = envs[i].reset(seed=seed + nxt)
+        obs_l[i], info_l[i] = envs[i].reset(seed=seed + min(nxt, n - 1))
+        active[i] = nxt < n
         nxt += 1
         opt[i] = int(info_l[i].get("optimal_steps_from_start", 0))
         frames[i] = [obs_l[i]] * hist
@@ -101,6 +107,8 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
         prev_a = a
         restarted = []
         for i in range(B):
+            if not active[i]:
+                continue                                  # an idle row: no seed left for it
             obs_l[i], _, te, tr, info_l[i] = envs[i].step(int(a[i]))
             frames[i].append(obs_l[i])
             ln[i] += 1
@@ -112,13 +120,16 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
                     ratios.append(ln[i] / opt[i])
                 ln[i] = 0
                 done_n += 1
-                obs_l[i], info_l[i] = envs[i].reset(seed=seed + nxt)
-                nxt += 1
-                opt[i] = int(info_l[i].get("optimal_steps_from_start", 0))
-                frames[i] = [obs_l[i]] * hist
-                restarted.append(i)
+                if nxt < n:
+                    obs_l[i], info_l[i] = envs[i].reset(seed=seed + nxt)
+                    nxt += 1
+                    opt[i] = int(info_l[i].get("optimal_steps_from_start", 0))
+                    frames[i] = [obs_l[i]] * hist
+                    restarted.append(i)
+                else:
+                    active[i] = False
         if restarted:
-            # The rows that just started a new episode must not inherit the old one's context.
+            # The rows that just started a new episode must not inherit the context of the old one.
             net.reset_rows(restarted)
     net.train(was_training)
     return (float(np.mean(succ)), float(np.mean(steps)),

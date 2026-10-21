@@ -136,7 +136,10 @@ def sample_clips(episodes, ids, B, T, rng, device):
         ``valid_a`` (B,T), ``reward`` (B,T) -- the reward that ARRIVED WITH the slot's frame,
         ``valid_r`` (B,T), ``task`` (B,) long -- the episode's task indicator,
         ``ret`` (B,T) -- the recorded discounted return-to-go from the slot's frame (zeros unless
-        :func:`add_returns` ran), ``valid_v`` (B,T) -- 0 on a padded slot.
+        :func:`add_returns` ran), ``valid_v`` (B,T) -- 0 on a padded slot,
+        ``a_vec`` (B,T,Da) -- the recorded action taken FROM the slot's frame, ``d_prop`` (B,T,Dp)
+        -- how the proprio vector changed over that transition (both zero where ``valid_a`` is 0):
+        the auxiliary forward model's input and target.
     """
     pick = rng.choice(np.asarray(ids), size=B, replace=True)
     n_frames = np.array([episodes[int(i)]["z"].shape[0] for i in pick])
@@ -156,6 +159,8 @@ def sample_clips(episodes, ids, B, T, rng, device):
     reward = np.zeros((B, T), np.float32)
     valid_r = np.zeros((B, T), np.float32)
     ret = np.zeros((B, T), np.float32)
+    a_vec = np.zeros((B, T, d_act), np.float32)
+    d_prop_next = np.zeros((B, T, d_prop), np.float32)
     # The paper's one-hot task indicator. A collector that records one puts it in the episode's
     # metadata (``EpisodeVideoDataset.episode_meta``); a single-task dataset records none and every
     # clip is task 0.
@@ -175,6 +180,9 @@ def sample_clips(episodes, ids, B, T, rng, device):
         act_here = s < n_act
         a_id[b] = np.where(act_here, ep["actions"][np.minimum(s, n_act - 1)].argmax(-1), 0)
         valid_a[b] = (act_here & fresh[b]).astype(np.float32)
+        nxt = np.minimum(s + 1, n_act)                 # a recorded action always has a next frame
+        a_vec[b] = np.where(act_here[:, None], ep["actions"][np.minimum(s, n_act - 1)], 0.0)
+        d_prop_next[b] = np.where(act_here[:, None], ep["proprio"][nxt] - ep["proprio"][s], 0.0)
         rew_here = (s >= 1) & (s - 1 < n_act)
         reward[b] = np.where(rew_here, ep["rewards"][np.maximum(s - 1, 0)], 0.0)
         valid_r[b] = (rew_here & fresh[b]).astype(np.float32)
@@ -183,7 +191,34 @@ def sample_clips(episodes, ids, B, T, rng, device):
     as_t = (lambda x: torch.as_tensor(x, device=device))
     return {"z": z, "proprio": as_t(proprio), "actions": as_t(actions), "a_id": as_t(a_id),
             "valid_a": as_t(valid_a), "reward": as_t(reward), "valid_r": as_t(valid_r),
-            "task": as_t(task), "ret": as_t(ret), "valid_v": as_t(fresh.astype(np.float32))}
+            "task": as_t(task), "ret": as_t(ret), "valid_v": as_t(fresh.astype(np.float32)),
+            "a_vec": as_t(a_vec), "d_prop": as_t(d_prop_next)}
+
+
+class ForwardModel(torch.nn.Module):
+    """Auxiliary forward model on the agent features -- NOT in the paper.
+
+    From ``h_t`` and the recorded action ``a_t`` a small MLP predicts how the proprio vector changes
+    over the transition. The label is free -- every recorded transition of every episode has one --
+    and it depends on what surrounds the agent, which the cloning target reveals only in the few
+    states where the demonstrator had to go around something. On the obstacle maze the agent
+    features are blind to the walls without it (a probe on the frozen ``h_t`` recalls 30-46 % of the
+    blocked moves, and the cloned policy pushes into a wall forever in ~50 % of the episodes); with
+    it the recall is 98 %. The module is a training aid: it is not saved and nothing reads it later.
+    """
+
+    def __init__(self, d_in, d_act, d_prop, d_hidden=512, scale=7.5):
+        super().__init__()
+        # ``scale`` only keeps the regression target O(1) before the RMS normaliser has a history.
+        self.scale = scale
+        self.body = torch.nn.Linear(d_in, d_hidden)
+        self.act = torch.nn.Linear(d_act, d_hidden, bias=False)
+        self.out = torch.nn.Linear(d_hidden, d_prop)
+
+    def loss(self, h, clip):
+        pred = self.out(torch.nn.functional.silu(self.body(h) + self.act(clip["a_vec"])))
+        err = ((pred - clip["d_prop"] * self.scale) ** 2).sum(-1)
+        return (err * clip["valid_a"]).sum() / clip["valid_a"].sum().clamp_min(1.0)
 
 
 def agent_forward(world, heads, clip, *, tau_ctx, ctx_signal, emax):
@@ -275,7 +310,9 @@ def parse_args():
                     help="phase-1 dynamics checkpoint: tokenizer, dataset and env spec come from it")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=4000)
-    ap.add_argument("--batch", type=int, default=32, help="clips per agent step")
+    ap.add_argument("--batch", type=int, default=96,
+                    help="clips per agent step; 96 rather than 32 is what lets the agent features "
+                         "learn the obstacles within 4 000 steps")
     ap.add_argument("--lr", type=float, default=5e-4, help="learning rate of the agent heads")
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--reward_weight", type=float, default=1.0)
@@ -285,6 +322,10 @@ def parse_args():
                          "return-to-go of ALL training episodes. It makes the agent features carry "
                          "the distance to the reward and hands phase 3 a critic that is not blank; "
                          "without it a fast phase 3 can collapse. 0 = the paper's objective")
+    ap.add_argument("--fwd_weight", type=float, default=1.0,
+                    help="NOT in the paper: weight of an auxiliary forward model on the agent "
+                         "features (h_t, a_t -> change of the proprio vector, every recorded "
+                         "transition). It is what makes the agent tokens see obstacles; 0 disables it")
     ap.add_argument("--gamma", type=float, default=0.997,
                     help="discount of the recorded returns for --value_weight; use phase 3's")
     ap.add_argument("--val_frac", type=float, default=0.05,
@@ -313,19 +354,28 @@ def parse_args():
                          "was trained on (its data.seq_len), the longest context phase 3 can "
                          "dream with")
     ap.add_argument("--d_hidden", type=int, default=256, help="width of the head MLPs")
-    ap.add_argument("--dyn_lr", type=float, default=5e-5,
-                    help="learning rate of the transformer being finetuned; 0 freezes it")
+    ap.add_argument("--dyn_lr", type=float, default=2e-4,
+                    help="learning rate of the transformer being finetuned; 0 freezes it. At 5e-5 "
+                         "the agent tokens do not learn to see obstacles in 4 000 steps; 2e-4 needs "
+                         "--boot_frac 0 (the bootstrap term breaks the world model at that rate)")
     ap.add_argument("--dyn_warmup", type=int, default=0,
                     help="steps over which the TRANSFORMER's learning rate ramps up from 0 (the "
                          "heads train at their full rate from step 1)")
-    ap.add_argument("--dyn_batch", type=int, default=32,
-                    help="windows per video-prediction step (paper Eq. 7)")
-    ap.add_argument("--dyn_weight", type=float, default=1.0,
-                    help="weight of the video-prediction term; 0 drops it (and the paper's "
-                         "'preserve existing capabilities' with it)")
-    ap.add_argument("--boot_frac", type=float, default=0.5,
-                    help="bootstrap fraction of each video-prediction batch, as at the end of "
-                         "phase 1b: it keeps single-step (K=1) sampling legal for imagination")
+    ap.add_argument("--dyn_batch", type=int, default=64,
+                    help="windows per video-prediction step (paper Eq. 7); phase 1b's batch")
+    ap.add_argument("--dyn_weight", type=float, default=3.0,
+                    help="weight of the video-prediction term in the RMS-normalised sum; 0 drops it "
+                         "(and the paper's 'preserve existing capabilities' with it). The agent "
+                         "losses reshape the world tokens' features, and at weight 1 that erodes "
+                         "the rarest physics: a dreamed player then walks through a wall after ONE "
+                         "push in 2.5-4 %% of wall bumps (phase 1b: 0.4 %%); at 3 it stays at 1 %% "
+                         "with the cloning result unchanged, at 10 cloning suffers")
+    ap.add_argument("--boot_frac", type=float, default=0.0,
+                    help="bootstrap fraction of each video-prediction batch (0.5 at the end of "
+                         "phase 1b). 0: at --dyn_lr 2e-4 the self-distillation term destroys the "
+                         "wall physics of the obstacle world model (94 %% of wall pushes go "
+                         "through). Single-step (K=1) dreams stay as good as K=4 ones without it "
+                         "over a 4 000-step phase 2")
     ap.add_argument("--image_batch_prob", type=float, default=0.15,
                     help="share of video-prediction steps with no context at all")
     ap.add_argument("--loss_norm", type=int, default=1,
@@ -425,7 +475,11 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
                "latent_meta": world.latent_meta, "model": world.model_cfg},
               open(out / "config.json", "w"), indent=1)
 
-    groups = [{"params": list(heads.parameters()), "lr": cfg.lr}]
+    fwd_model = None
+    if cfg.fwd_weight > 0:
+        fwd_model = ForwardModel(heads.d_in, ds.action_dim, episodes[0]["proprio"].shape[-1]).to(dev)
+    groups = [{"params": list(heads.parameters())
+               + (list(fwd_model.parameters()) if fwd_model is not None else []), "lr": cfg.lr}]
     if cfg.dyn_lr > 0:
         groups.append({"params": list(world.dyn.parameters()), "lr": cfg.dyn_lr})
     opt = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
@@ -444,8 +498,27 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
     # (RMS)". Order fixes the normaliser slots, so it must stay stable across a resume.
     combiner = LossCombiner({"policy": 1.0, "reward": cfg.reward_weight,
                              "flow": cfg.dyn_weight, "proprio": cfg.dyn_weight * 0.3,
-                             "bootstrap": cfg.dyn_weight * 0.5, "value": cfg.value_weight},
+                             "bootstrap": cfg.dyn_weight * 0.5, "value": cfg.value_weight,
+                             "forward": cfg.fwd_weight},
                             normalize=bool(cfg.loss_norm), device=dev)
+    if combiner.normalizer is not None and world.loss_norm is not None:
+        # "Reuse the pretraining setting" includes the loss scales. A fresh normaliser divides each
+        # video-prediction term by its CURRENT rms, but phase 1b ended dividing the (converged,
+        # tiny) bootstrap term by the floor of its peak -- 4.3x larger on the obstacle maze. Started
+        # fresh, the self-distillation term is therefore 4.3x heavier than phase 1b left it, and the
+        # obstacle world model diverges within 200 steps (flow MSE 5e-4 -> 2e-2, with every agent
+        # loss switched off too). On the empty maze the floor is not active at the end of phase 1b,
+        # so nothing changes there.
+        src = world.loss_norm
+        for j, name in enumerate(("flow", "proprio", "bootstrap")):
+            if j < len(src["rms_ema"]) and bool(src["initialized"][j]):
+                i = combiner.slots[name]
+                combiner.normalizer.rms_ema[i] = src["rms_ema"][j].to(dev)
+                combiner.normalizer.rms_peak[i] = src["rms_peak"][j].to(dev)
+                combiner.normalizer.initialized[i] = True
+        print("video-prediction loss scales continued from phase 1b: " + ", ".join(
+            f"{n} {float(combiner.normalizer.rms_ema[combiner.slots[n]]):.2e}"
+            for n in ("flow", "proprio", "bootstrap")), flush=True)
 
     ctx_signal = min(int(round((1.0 - world.tau_ctx) * world.k_max)), world.k_max)
     emax = _log2_int(world.k_max)
@@ -481,6 +554,8 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
             if cfg.value_weight > 0:
                 terms["value"] = heads.value.loss(heads.value(h.float()), clip["ret"][..., None],
                                                   clip["valid_v"][..., None])
+            if fwd_model is not None:
+                terms["forward"] = fwd_model.loss(h.float(), clip)
             if cfg.dyn_weight > 0:
                 # The video-prediction loss, unchanged from pretraining and applied to windows
                 # drawn from the WHOLE collection: "the dynamics loss is applied only on the
@@ -516,7 +591,8 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
             for k, x in raw.items():
                 writer.add_scalar(("bc/cross_entropy" if k == "policy" else
                                    "reward/loss" if k == "reward" else
-                                   "critic/pretrain_loss" if k == "value" else f"dyn/{k}"), x, s)
+                                   "critic/pretrain_loss" if k == "value" else
+                                   "aux/forward_model_loss" if k == "forward" else f"dyn/{k}"), x, s)
             for k, x in dyn_aux.items():
                 writer.add_scalar(f"dyn/{k}", x, s)
             writer.add_scalar("train/loss_total", float(loss.detach()), s)
