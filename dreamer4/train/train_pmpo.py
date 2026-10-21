@@ -52,6 +52,7 @@ from dreamer4.models.agent_heads import build_agent_heads, terminal_bins
 from dreamer4.models.world_model import (AgentPolicy, WorldModel, dream_context,
                                          dream_step, window_frames)
 from dreamer4.train.pmpo_objectives import compute_lambda_returns, pmpo_coeffs
+from dreamer4.train.train_dynamics import encode_episodes
 
 
 class DemoStarts:
@@ -61,35 +62,37 @@ class DemoStarts:
     the earlier training phases. Unlike previous generations of Dreamer, we start only one rollout
     from each context." A context here is a whole window ending at a recorded frame, built by the
     convention in :mod:`dreamer4.models.world_model` -- so a dream begins with the same kind of
-    history the policy was trained on and will meet at evaluation. The window carries
-    ``tokenizer.history - 1`` extra leading frames, so the tokenizer encodes its first slot from the
-    frames that really preceded it. Contexts are drawn uniformly over all recorded frames.
+    history the policy was trained on and will meet at evaluation. Contexts are drawn uniformly
+    over all recorded frames.
+
+    The windows are cut from the latent cache of
+    :func:`~dreamer4.train.train_dynamics.encode_episodes` -- the cache phase 2 trained on, each
+    frame encoded with the tokenizer's sliding history window -- so no frame is kept or re-encoded
+    here, and the actions are the recorded action VECTORS (one-hot or continuous alike).
     """
 
-    def __init__(self, dataset, *, window, history, rng=None):
+    def __init__(self, episodes, *, window, rng=None):
         self.window = int(window)
-        self.span = int(window) + int(history) - 1
-        self.n_actions = int(dataset.action_dim)
-        frames, proprio, into, task, local = [], [], [], [], []
+        z, proprio, into, task, local = [], [], [], [], []
         offset = 0
-        for i in range(len(dataset)):
-            n = dataset.episode_frames(i)
-            clip = dataset.clip(i, 0, n)
+        for ep in episodes:
+            n = ep["z"].shape[0]
             # The last frame of an episode that ENDED is not a start: there is nothing left to do
             # from it.
-            keep = n - 1 if "terminals" in clip and bool(clip["terminals"][-1]) else n
+            ended = "terminals" in ep and len(ep["terminals"]) and bool(ep["terminals"][-1])
+            keep = n - 1 if ended else n
             if keep <= 0:
                 continue
-            frames.append(clip["video"][:n])
-            proprio.append(clip["proprio"][:n].astype(np.float32))
-            led = np.full(n, -1, np.int64)                  # action that led INTO each frame
-            led[1:] = clip["actions"][:n - 1].argmax(-1)
+            z.append(ep["z"])
+            proprio.append(np.asarray(ep["proprio"][:n], np.float32))
+            led = np.zeros((n, ep["actions"].shape[-1]), np.float32)   # action that led INTO each frame
+            led[1:] = ep["actions"][:n - 1]
             into.append(led)
             # The paper's task indicator, recorded per episode by a multi-task collector.
-            task.append(np.full(n, int(dataset.episode_meta(i).get("task", 0)), np.int64))
+            task.append(np.full(n, int(ep.get("meta", {}).get("task", 0)), np.int64))
             local.append((offset, keep))
             offset += n
-        self.frames = np.concatenate(frames)
+        self.z = torch.cat(z)
         self.proprio = np.concatenate(proprio)
         self.into = np.concatenate(into)
         self.task = np.concatenate(task)
@@ -100,22 +103,18 @@ class DemoStarts:
         self.rng = rng or np.random.default_rng(0)
 
     def sample(self, n):
-        """``n`` contexts. Returns the encode window, its proprio, its aligned actions and task."""
+        """``n`` contexts: their latents, proprio, aligned actions and task."""
         pick = self.rng.choice(len(self.index), n)
         end = self.index[pick]
         base = self.base[pick]
-        slots = window_frames(end - base, self.span) + base.reshape(-1, 1)
-        win = slots[:, -self.window:]
-        led = self.into[win]
-        aligned = np.zeros((n, self.window, self.n_actions + 1), np.float32)
+        win = window_frames(end - base, self.window) + base.reshape(-1, 1)
         fresh = np.ones_like(win, bool)
-        fresh[:, 1:] = win[:, 1:] != win[:, :-1]
+        fresh[:, 1:] = win[:, 1:] != win[:, :-1]       # False on a padded slot
         fresh[:, 0] = False                            # slot 0 always carries the start flag
-        fresh &= led >= 0
-        rows, cols = np.nonzero(fresh)
-        aligned[rows, cols, led[rows, cols]] = 1.0
+        aligned = np.zeros((n, self.window, self.into.shape[-1] + 1), np.float32)
+        aligned[..., :-1] = np.where(fresh[..., None], self.into[win], 0.0)
         aligned[~fresh, -1] = 1.0
-        return {"encode": self.frames[slots], "proprio": self.proprio[win],
+        return {"z": self.z[torch.as_tensor(win, device=self.z.device)], "proprio": self.proprio[win],
                 "actions": aligned, "task": self.task[end]}
 
 
@@ -231,12 +230,11 @@ class Imagination:
     @torch.no_grad()
     def rollout(self, starts_batch, *, horizon, K, term_prob):
         world, heads, dev = self.world, self.heads, self.device
-        B = len(starts_batch["encode"])
+        B = len(starts_batch["z"])
         D = world.action_vec_dim
-        hist = world.tok.history
 
         # The recorded context, encoded exactly as phase 2 encoded it.
-        z = world.tok.encode_frames(starts_batch["encode"])[:, hist - 1:].float().to(dev)
+        z = starts_batch["z"].float().to(dev)
         prop = torch.as_tensor(starts_batch["proprio"], device=dev)
         act_hist = torch.as_tensor(starts_batch["actions"], device=dev)
         task = torch.as_tensor(starts_batch["task"], device=dev)
@@ -437,7 +435,8 @@ def main():
     base_lrs = [cfg.lr, cfg.value_lr]
 
     rng = np.random.default_rng(cfg.seed)
-    starts = DemoStarts(world.dataset, window=agent.clip_T, history=world.tok.history, rng=rng)
+    starts = DemoStarts(encode_episodes(world.tok, world.dataset, range(len(world.dataset))),
+                        window=agent.clip_T, rng=rng)
     print(f"dream starts: {len(starts.index)} contexts of {agent.clip_T} frames from "
           f"{world.data_path} | horizon {cfg.horizon}", flush=True)
     eval_envs = make_eval_envs(world.env_spec, cfg.eval_envs) if world.env_spec else []
@@ -449,7 +448,8 @@ def main():
     # TensorBoard purges from step 0, so the two never disagree about which run they describe.
     mf = open(out / "metrics.jsonl", "w", buffering=1)
     writer = SummaryWriter(str(out / "tb"), purge_step=0)
-    tb_names = {"dream_success": "dream/success_rate", "value_loss": "critic/value_loss",
+    tb_names = {"dream_success": "dream/success_rate", "dream_return": "dream/return",
+                "value_loss": "critic/value_loss",
                 "grad_norm": "train/grad_norm", "entropy": "policy/entropy",
                 "kl_to_prior": "policy/kl_to_bc_prior", "pos_frac": "pmpo/positive_adv_frac",
                 "dreams": "dream/imagined_episodes", "it_s": "train/steps_per_sec_cumulative"}
@@ -515,7 +515,8 @@ def main():
             pinfo["entropy"] = float(pol.entropy(lg[:, :H])[keep].mean().detach())
             pinfo["kl_to_prior"] = float(kl.mean().detach())
             rec = {"step": step, "dreams": collected * B, "wall_s": round(time.time() - t0, 1),
-                   "dream_success": roll["success"], "value_loss": value_loss.item(),
+                   "dream_success": roll["success"],
+                   "dream_return": float(roll["rewards"].sum(1).mean()), "value_loss": value_loss.item(),
                    "grad_norm": float(gn), "it_s": (step + 1) / max(time.time() - t0, 1e-9),
                    **{k: float(x) for k, x in pinfo.items()}}
             mf.write(json.dumps(rec) + "\n")
@@ -528,7 +529,8 @@ def main():
                 writer.add_scalar("train/steps_per_sec_inst", (step - s_last) / (now - t_last), step)
             t_last, s_last = now, step
             print(f"[{time.strftime('%H:%M:%S')}] step {step}/{cfg.steps} "
-                  f"dreamSR {roll['success']:.2f} vloss {rec['value_loss']:.4f} "
+                  f"dreamSR {roll['success']:.2f} dreamR {rec['dream_return']:.2f} "
+                  f"vloss {rec['value_loss']:.4f} "
                   f"H {pinfo['entropy']:.2f} kl {pinfo['kl_to_prior']:.3f} "
                   f"gn {float(gn):.1f} {rec['it_s']:.2f}it/s", flush=True)
 
