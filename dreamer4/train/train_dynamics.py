@@ -211,7 +211,8 @@ def latent_cache_file(tokenizer: FrozenTokenizer,
     tokenizer: beside the tokenizer checkpoint, named by everything the
     latents depend on -- the dataset directory and its episode count, the
     checkpoint file (path, size, mtime), the history window and the packing.
-    None for a dataset without one directory (a merged set): never cached.
+    None for a dataset without a directory of its own (the gridworld shards):
+    never cached. A merged set is cached part by part (:func:`encode_episodes`).
     """
     root = getattr(dataset, "root", None)
     if root is None:
@@ -255,6 +256,21 @@ def encode_episodes(tokenizer: FrozenTokenizer, dataset: EpisodeVideoDataset,
     carries rewards, terminals, metadata and ``bc_weight`` that this trainer
     never reads.
     """
+    parts = getattr(dataset, "parts", None)
+    if parts:
+        # A merged set: each part is encoded (and cached) on its own, so adding a collection to a
+        # dataset only encodes the new collection.
+        offsets = np.cumsum([0] + [len(p) for p in parts])
+        out: List[Optional[dict]] = [None] * len(indices)
+        for k, part in enumerate(parts):
+            sel = [(j, int(i) - int(offsets[k])) for j, i in enumerate(indices)
+                   if offsets[k] <= int(i) < offsets[k + 1]]
+            if sel:
+                for (j, _), entry in zip(sel, encode_episodes(tokenizer, part, [i for _, i in sel],
+                                                              keep_video=keep_video, chunk=chunk)):
+                    out[j] = entry
+        return out
+
     episodes = []
     overlap = tokenizer.history - 1
     cache_file = latent_cache_file(tokenizer, dataset)
