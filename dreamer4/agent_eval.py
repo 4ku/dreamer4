@@ -76,7 +76,7 @@ def evaluate_lockstep(net, benv, *, tok, proprio_from_info, n, seed, greedy, dev
         alive, ok = np.ones(B, bool), np.zeros(B, bool)
         for t in range(benv.max_steps):
             vid = np.stack([np.stack(w[-hist:]) for w in window])
-            z = tok.encode_frames(vid)[:, -1].float().to(device)
+            z = tok.encode_last(vid).float().to(device)
             pr = torch.as_tensor(np.stack([proprio_from_info(i) for i in infos]),
                                  dtype=torch.float32, device=device)
             a = net.act(z, pr, greedy=greedy, prev_action=prev)
@@ -158,7 +158,7 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
     prev_a = None
     while done_n < n:
         vid = np.stack([np.stack(f[-hist:]) for f in frames])            # (B, hist, H, W, C)
-        z = tok.encode_frames(vid)[:, -1].float().to(device)             # (B, N, D)
+        z = tok.encode_last(vid).float().to(device)                      # (B, N, D)
         pr = torch.as_tensor(np.stack([proprio_from_info(i) for i in info_l]),
                              dtype=torch.float32, device=device)
         a = net.act(z, pr, greedy=greedy, prev_action=prev_a)

@@ -539,6 +539,26 @@ class FrozenTokenizer(nn.Module):
         return pack_bottleneck_to_spatial(z, n_spatial=self.n_spatial, k=self.pack_k)
 
     @torch.no_grad()
+    def encode_last(self, video) -> torch.Tensor:
+        """The latent of each clip's LAST frame, the clip being exactly one history window.
+
+        Args:
+            video: (B, history, H, W, C) uint8, numpy array or tensor.
+
+        Returns:
+            (B, n_spatial, d_spatial) -- what ``encode_frames(video)[:, -1]`` returns, at
+            1/history of the cost: that call encodes a window for every position of the clip.
+        """
+        if isinstance(video, np.ndarray):
+            video = torch.from_numpy(video)
+        assert video.shape[1] == self.history, "encode_last takes exactly one history window"
+        v = video.to(self.device).float() / 255.0
+        v = v.permute(0, 1, 4, 2, 3).contiguous()              # (B,w,C,H,W)
+        z = self.tok.encode(patchify(v, self.patch_size))[:, -1]
+        z = z.reshape(v.shape[0], 1, self.n_latents, self.d_bottleneck)
+        return pack_bottleneck_to_spatial(z, n_spatial=self.n_spatial, k=self.pack_k)[:, 0]
+
+    @torch.no_grad()
     def decode_latents(self, z: torch.Tensor) -> torch.Tensor:
         """Render packed dynamics latents (B, T, n_spatial, d_spatial) back to
         images (B, T, C, H, W) in [0, 1]."""
