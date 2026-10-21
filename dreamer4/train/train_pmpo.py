@@ -119,6 +119,15 @@ class DemoStarts:
                 "actions": aligned, "task": self.task[end]}
 
 
+def compact_cache(cache, B, keep):
+    """Keep batch rows ``keep`` of a KV cache whose tensors are ``(B * S, heads, T, d)`` (batch-major)."""
+    for store in (cache.k, cache.v):
+        for L, x in store.items():
+            if x is not None:
+                S = x.shape[0] // B
+                store[L] = x.reshape(B, S, *x.shape[1:])[keep].reshape(len(keep) * S, *x.shape[1:])
+
+
 class Tape:
     """The per-episode buffers a dream fills, and the masks the update reads them through.
 
@@ -209,8 +218,14 @@ class Imagination:
         return (local * self.bins[idx]).sum(-1) / local.sum(-1).clamp_min(1e-8)
 
     def eval_policy(self):
-        return AgentPolicy(self.world.dyn, self.heads, window=self.clip_T,
-                           tau_ctx=self.world.tau_ctx, k_max=self.world.k_max)
+        # The real-env evaluation gets the UNcompiled module and a policy already in eval mode.
+        # agent_eval.evaluate() restores the mode it found with net.train(was_training), and a fresh
+        # AgentPolicy reports training mode: the first in-run evaluation used to leave the frozen,
+        # compiled transformer in TRAIN mode, its graph guards failed, and every later dream step ran
+        # on a recompiled, slower graph (0.58 -> 0.86 s per update, measured 2026-10-21).
+        dyn = getattr(self.world.dyn, "_orig_mod", self.world.dyn)
+        return AgentPolicy(dyn, self.heads, window=self.clip_T,
+                           tau_ctx=self.world.tau_ctx, k_max=self.world.k_max).eval()
 
     @torch.no_grad()
     def rollout(self, starts_batch, *, horizon, K, term_prob):
@@ -237,31 +252,47 @@ class Imagination:
 
         tape = Tape(B, horizon, dev)
         H = torch.zeros(B, horizon + 1, self.d_in, device=dev)
+        # Batch rows still being simulated. With --compact, dreams that have ended leave the batch
+        # (and the KV cache) in blocks of 32: whatever they would produce after their end is masked
+        # out by `alive` / `continues` anyway, so the update is unchanged and only dead compute goes.
+        rows = torch.arange(B, device=dev)
         t = 0
         for t in range(horizon + 1):
             new = z.shape[1] if t == 0 else 1
             h = dream_context(world, heads, z_hist=z[:, -new:], prop_hist=prop[:, -new:],
                               act_hist=act_hist[:, -new:], tau_ctx=world.tau_ctx,
                               task_ids=task, cache=cache, commit=True)
-            H[:, t] = h.float()
+            H[rows, t] = h.float()
             if t > 0:
                 # The reward head reads the reward that ARRIVED with this frame, i.e. the reward of
                 # the t-1 -> t transition, and the terminal rule on the same distribution says
                 # whether this frame ends the episode.
                 probs = heads.reward.at(h, 0).float().softmax(-1)
-                tape.rewards[:, t - 1] = (self.decode_reward(probs)
-                                          * torch.as_tensor(~tape.done, device=dev))
+                rnp = rows.cpu().numpy()
+                tape.rewards[rows, t - 1] = (self.decode_reward(probs)
+                                             * torch.as_tensor(~tape.done[rnp], device=dev))
                 p_term = (probs * self.term_bin).sum(-1)
-                tape.terminate(t, (p_term > term_prob).cpu().numpy())
+                is_term = np.zeros(B, bool)
+                is_term[rnp] = (p_term > term_prob).cpu().numpy()
+                tape.terminate(t, is_term)
                 if tape.done.all():
                     break
+                if self.cfg.compact:
+                    live = ~tape.done[rnp]
+                    n_keep = min(len(rnp), int(np.ceil(live.sum() / 32.0)) * 32)
+                    if n_keep < len(rnp):
+                        keep = torch.as_tensor(np.sort(np.argsort(~live, kind="stable")[:n_keep]), device=dev)
+                        compact_cache(cache, len(rnp), keep)
+                        z, prop, act_hist, task, h = z[keep], prop[keep], act_hist[keep], task[keep], h[keep]
+                        rows = rows[keep]
             if t == horizon:
                 break
             logits = heads.policy.at(h, 0).float()
             a = torch.distributions.Categorical(logits=logits).sample()
-            tape.actions[:, t] = a
-            av = torch.zeros(B, 1, D + 1, device=dev)
-            av[torch.arange(B), 0, a.clamp(max=D - 1)] = 1.0
+            tape.actions[rows, t] = a
+            nb = len(rows)
+            av = torch.zeros(nb, 1, D + 1, device=dev)
+            av[torch.arange(nb), 0, a.clamp(max=D - 1)] = 1.0
             act_hist = torch.cat([act_hist, av], 1)
             z_new, prop_new = dream_step(world, z_hist=z, prop_hist=prop,
                                          act_hist=act_hist[:, -(z.shape[1] + 1):], K=K, cache=cache)
@@ -334,6 +365,12 @@ def parse_args():
                          "updates; negative = keep --adv_drop_frac throughout. 0.5-0.9 measured "
                          "alike; it needs a sharp critic (--n_agent >= 4), with a blunt one it hurts")
     ap.add_argument("--adv_drop_steps", type=int, default=300)
+    ap.add_argument("--compact", type=int, default=1,
+                    help="drop ended dreams from the rollout batch and KV cache in blocks of 32 (same update, "
+                         "less dead compute; 0.58 -> 0.50 s per update on the obstacle maze)")
+    ap.add_argument("--clip_split", type=int, default=0,
+                    help="clip the policy and the value gradients separately, each at --grad_clip (jointly, "
+                         "the value gradient dominates the norm and shrinks every policy step)")
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--eval_n", type=int, default=1000)
     ap.add_argument("--eval_seed", type=int, default=31337,
@@ -458,7 +495,11 @@ def main():
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        gn = torch.nn.utils.clip_grad_norm_(agent.policy_params + agent.value_params, cfg.grad_clip)
+        if cfg.clip_split:
+            gn = torch.nn.utils.clip_grad_norm_(agent.policy_params, cfg.grad_clip)
+            torch.nn.utils.clip_grad_norm_(agent.value_params, cfg.grad_clip)
+        else:
+            gn = torch.nn.utils.clip_grad_norm_(agent.policy_params + agent.value_params, cfg.grad_clip)
         opt.step()
 
         if do_log:
