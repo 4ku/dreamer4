@@ -40,8 +40,10 @@ GENERIC_PROPRIO_MODES = ("none", "auto")
 
 #: Dataset adapters in dispatch order. Each recognises its own storage format,
 #: declares the proprio modes it derives and constructs itself, so this module
-#: needs no knowledge of any particular environment or robot.
-ADAPTERS = (GridworldEpisodeDataset, AlohaEpisodeDataset, LeRobotVideoDataset)
+#: needs no knowledge of any particular environment or robot. The strictest
+#: test goes first: an aloha-npy manifest names its format, while the gridworld
+#: one is any manifest with an "episodes" list -- which aloha-npy also has.
+ADAPTERS = (AlohaEpisodeDataset, GridworldEpisodeDataset, LeRobotVideoDataset)
 
 #: Every mode accepted by open_video_dataset -- generic plus whatever the
 #: registered adapters contribute. Derived, not hand-maintained.
