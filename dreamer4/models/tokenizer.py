@@ -504,6 +504,11 @@ class FrozenTokenizer(nn.Module):
         self.tok = tok.eval()
         self.device = torch.device(device)
 
+    #: Windows per encoder / decoder call. The soft-capped attention materialises its logits, so one
+    #: call over every window of a large batch runs out of memory -- decoding a 64-episode, 39-step
+    #: dream of 128x256 frames in one call would need ~60 GB.
+    max_windows = 64
+
     def _slide(self, x: torch.Tensor) -> torch.Tensor:
         """(B, T, *) -> (B*T, w, *): the causal length-w window ending at each
         position, with the first entry replicated into the w-1 slots before the
@@ -533,8 +538,8 @@ class FrozenTokenizer(nn.Module):
         v = v.permute(0, 1, 4, 2, 3).contiguous()              # (B,T,C,H,W)
         B, T = v.shape[:2]
         windows = self._slide(v)                               # (B*T,w,C,H,W)
-        patches = patchify(windows, self.patch_size)
-        z = self.tok.encode(patches)[:, -1]                    # last frame per window
+        z = torch.cat([self.tok.encode(patchify(w, self.patch_size))[:, -1]   # last frame per window
+                       for w in windows.split(self.max_windows)])
         z = z.reshape(B, T, self.n_latents, self.d_bottleneck)
         return pack_bottleneck_to_spatial(z, n_spatial=self.n_spatial, k=self.pack_k)
 
@@ -554,7 +559,8 @@ class FrozenTokenizer(nn.Module):
         assert video.shape[1] == self.history, "encode_last takes exactly one history window"
         v = video.to(self.device).float() / 255.0
         v = v.permute(0, 1, 4, 2, 3).contiguous()              # (B,w,C,H,W)
-        z = self.tok.encode(patchify(v, self.patch_size))[:, -1]
+        z = torch.cat([self.tok.encode(patchify(w, self.patch_size))[:, -1]
+                       for w in v.split(self.max_windows)])
         z = z.reshape(v.shape[0], 1, self.n_latents, self.d_bottleneck)
         return pack_bottleneck_to_spatial(z, n_spatial=self.n_spatial, k=self.pack_k)[:, 0]
 
@@ -565,7 +571,8 @@ class FrozenTokenizer(nn.Module):
         B, T = z.shape[:2]
         latents = unpack_spatial_to_bottleneck(z.to(self.device), k=self.pack_k)
         windows = self._slide(latents)                         # (B*T,w,Nl,Db)
-        patches = self.tok.decoder(windows)[:, -1]             # last frame per window
+        patches = torch.cat([self.tok.decoder(w)[:, -1]       # last frame per window
+                             for w in windows.split(self.max_windows)])
         patches = patches.reshape(B, T, *patches.shape[-2:])
         img = unpatchify(patches, self.H, self.W, C=self.C,
                          patch_size=self.patch_size)
