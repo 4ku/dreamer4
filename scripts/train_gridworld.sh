@@ -106,9 +106,10 @@ fi
 # -- but it can only distill a model that already exists, so its batch fraction
 # stays 0 for the first 24 000 steps, ramps to 0.5 over the next 1 500 and is
 # held there to 30 000. The LR walks from 3e-4 down to 5e-5 over the 1 000
-# steps BEFORE the ramp opens, and the loss normalizer is re-seeded once where
-# it opens: decaying the LR across the ramp instead diverges on the obstacle
-# maze. These are the trainer defaults; they are spelled out to pin the recipe.
+# steps BEFORE the ramp opens (decaying it across the ramp diverges on the
+# obstacle maze); the bootstrap teacher is an EMA copy of the weights, and the
+# new term is scaled like the flow term where the ramp opens. These are the
+# trainer defaults; they are spelled out to pin the recipe.
 if done_phase "$OUT/dyn"; then
   echo "=== phase 1b: already done ==="
 else

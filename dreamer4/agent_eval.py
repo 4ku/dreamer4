@@ -134,3 +134,57 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
     net.train(was_training)
     return (float(np.mean(succ)), float(np.mean(steps)),
             float(np.mean(ratios)) if ratios else float("nan"))
+
+
+def main(argv=None):
+    """Score a phase-2 or phase-3 checkpoint, greedy and sampled.
+
+        python -m dreamer4.agent_eval --ckpt runs/x/rl/checkpoints/best.pt \\
+            --dyn runs/x/dyn/checkpoints/latest.pt --n 2000 --seed 900000 --json runs/x/heldout.json
+
+    The policy reads the transformer weights stored in the agent checkpoint (phase 2 finetunes
+    them) on top of the world model's tokenizer and config. Seeds 900000+ are layouts no phase
+    has seen.
+    """
+    import argparse
+    import json
+    import time
+    from pathlib import Path
+
+    from dreamer4.models.agent_heads import build_agent_heads
+    from dreamer4.models.world_model import AgentPolicy, WorldModel
+
+    ap = argparse.ArgumentParser(description="Score an agent checkpoint in the real environment.")
+    ap.add_argument("--ckpt", required=True, help="phase-2 or phase-3 checkpoint")
+    ap.add_argument("--dyn", required=True, help="the phase-1b world model it was trained on")
+    ap.add_argument("--n", type=int, default=2000, help="episodes (the first n seeds from --seed)")
+    ap.add_argument("--seed", type=int, default=900000)
+    ap.add_argument("--envs", type=int, default=64, help="environments played in parallel")
+    ap.add_argument("--json", default="", help="also write the result here")
+    cfg = ap.parse_args(argv)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    t0 = time.time()
+    ckpt = torch.load(cfg.ckpt, map_location="cpu", weights_only=False)
+    world = WorldModel(cfg.dyn, device=dev, n_agent=int(ckpt["n_agent"]))
+    world.load_dynamics_weights(ckpt["dyn"])
+    heads = build_agent_heads(ckpt["agent_cfg"]).to(dev)
+    heads.load_state_dict(ckpt["agent"])
+    policy = AgentPolicy(world.dyn.eval(), heads.eval(), window=int(ckpt["clip_T"]),
+                         tau_ctx=world.tau_ctx, k_max=world.k_max).eval()
+    envs = [make_env(world.env_spec) for _ in range(cfg.envs)]
+    kw = dict(tok=world.tok, proprio_from_info=world.proprio_from_info, n=cfg.n, seed=cfg.seed,
+              device=dev)
+    greedy = evaluate(policy, envs, greedy=True, **kw)
+    sampled = evaluate(policy, envs, greedy=False, **kw)
+    res = {"ckpt": cfg.ckpt, "n": cfg.n, "seed": cfg.seed, "train_step": ckpt.get("step"),
+           "greedy_sr": greedy[0], "greedy_opt": greedy[2],
+           "sampled_sr": sampled[0], "sampled_opt": sampled[2],
+           "wall_s": round(time.time() - t0, 1)}
+    print(json.dumps(res), flush=True)
+    if cfg.json:
+        Path(cfg.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(cfg.json).write_text(json.dumps(res, indent=1))
+
+
+if __name__ == "__main__":
+    main()

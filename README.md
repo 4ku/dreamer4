@@ -138,6 +138,7 @@ that slot's frame.
 | auxiliary forward model | not present | `train_heads --fwd_weight 1.0`: a small MLP on `[h_t, a_t]` predicts the change of the proprio vector over every recorded transition | cloning noisy demonstrations does not teach the agent tokens to see obstacles: a probe on the frozen `h_t` recalled 30-46 % of the blocked moves and half of the cloned episodes ended pushing into a wall; with the term 98 % |
 | phase-2 video loss | "reuse the pretraining setting" | flow and proprio terms at weight 3 (`--dyn_weight 3`), batch 64 as in phase 1b, WITHOUT the bootstrap rows (`--boot_frac 0`) | the agent losses reshape the world tokens' features and erode the rarest physics (a dreamed player walks through a wall after one push in 2.5-4 % of wall bumps at weight 1, 1 % at weight 3, 0.4 % after phase 1b); the bootstrap term at the transformer rate the agent needs (`--dyn_lr 2e-4`) destroys it altogether (94 %). K=1 dreams stay as good as K=4 ones without the bootstrap rows over a 4 000-step phase 2 |
 | bootstrap term | part of shortcut forcing | ramped in during phase 1b (`--objective.bootstrap_start_frac`, `--objective.bootstrap_ramp_frac`) | distilling two half-steps into one needs a model that can already take a half-step |
+| bootstrap teacher | the network itself under stop-gradient | an EMA copy of the weights (`--objective.boot_teacher_ema 0.999`); when the ramp opens only the new term gets a loss scale (the flow term's) | the target moves with every update of the network that defines it; that loop blew up every world model wider than 256 or 16 layers deep (K=1 dreams 3-10 cells off), and a lower rate only delayed it. Re-scaling the converged flow / proprio terms at the ramp cost the agent features 7-13 points of phase-2 cloning |
 
 ## Choices the paper leaves open
 
@@ -320,3 +321,44 @@ Imagination is nevertheless optimistic exactly there: from the states where the
 real greedy policy fails, 19-24 % of the dreams cross a wall and 10-22 % end on a
 reward-head false positive, against 25-33 % honest successes in the real
 environment. It costs one point today and would cost more with better features.
+
+### Results, obstacles: the 3-hour recipe
+
+```bash
+COLLECT=1 ./scripts/train_obstacles.sh          # one RTX 4090, about 3.1 h
+```
+
+Same data and evaluation as above (held-out seeds 900000+, n = 2 000), three
+training seeds, each run alone on its GPU, measured 2026-10-21:
+
+| seed | success / path (greedy) | sampled | tokenizer | world model | phase 2 | phase 3 | total |
+|---|---|---|---|---|---|---|---|
+| 1 | **0.957** / 1.070 | 0.961 / 1.081 | 8 min | 26 min | 15 min | 134 min | 3.07 h |
+| 2 | **0.944** / 1.099 | 0.951 / 1.104 | 8 min | 26 min | 15 min | 135 min | 3.10 h |
+| 3 | **0.953** / 1.078 | 0.959 / 1.085 | 8 min | 26 min | 15 min | 134 min | 3.07 h |
+
+What it changes against the 12-minute recipe:
+
+- **World model width 512** (8 heads; depth stays 8). Width is the one scale lever
+  that moved success here (+2.6 points); 768 and 1024 do not add more.
+- **A bootstrap stage that survives width** (deviations table, "bootstrap
+  teacher"): the one-run schedule now trains any width in one go with clean K=1
+  dreams, and phase 3 dreams at K=1.
+- **Phase 2**: video loss at weight 10 (`--dyn_weight 10`) and head MLPs 1024 wide
+  (`--d_hidden 1024`); run with two seeds, the better one on validation layouts is
+  kept (cloning alone varies by about 5 points between seeds).
+- **Phase 3**: 16 000 updates instead of 1 000, rates decaying to 3e-5, |A|-drop
+  ending at 0.5 (0.9 lengthens paths), policy and value gradients clipped
+  separately (`--clip_split 1`); the in-run evaluation picks `best.pt`. Two speed
+  fixes make it affordable: the in-run evaluation no longer leaves the compiled
+  transformer in train mode (that recompiled it and slowed every later update
+  1.5x), and dreams that have ended leave the batch (`--compact`, default on):
+  0.86 -> 0.50 s per update.
+- These runs ended a dream at a terminal probability above 0.3 (`--term_prob 0.3`);
+  the script keeps the default 0.5.
+
+Twenty thousand phase-3 updates instead of 16 000 (3.6 h) give the same result
+(seeds 1 / 2: 0.9625 / 0.9385 for the last checkpoint). The ceiling is the agent
+features, as above: a head fitted on the frozen `h_t` to perfect shortest-path
+labels, with DAgger on its own states, plays at 0.94; training the transformer on
+those labels too reaches 0.96; PMPO in imagination 0.95-0.97.
