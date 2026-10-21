@@ -338,6 +338,10 @@ def parse_args():
     ap.add_argument("--reward_bin_low", type=float, default=-1.0,
                     help="two-hot range in symlog space; must cover the environment's rewards")
     ap.add_argument("--reward_bin_high", type=float, default=1.0)
+    ap.add_argument("--value_bin_high", type=float, default=0.0,
+                    help="upper end of the value bins in symlog space; 0 = the reward's. A value is a "
+                         "discounted SUM of rewards, so a dense-reward task needs the room "
+                         "(symexp(6) = 402)")
     ap.add_argument("--term_prob", type=float, default=0.5,
                     help="terminal-rule threshold used by the held-out terminal metrics")
     ap.add_argument("--n_agent", type=int, default=8,
@@ -455,7 +459,8 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
                  "mtp": cfg.mtp, "d_hidden": cfg.d_hidden,
                  "reward_bins": cfg.reward_bins, "reward_bin_low": cfg.reward_bin_low,
                  "reward_bin_high": cfg.reward_bin_high, "value_bins": cfg.reward_bins,
-                 "value_bin_low": cfg.reward_bin_low, "value_bin_high": cfg.reward_bin_high}
+                 "value_bin_low": cfg.reward_bin_low,
+                 "value_bin_high": cfg.value_bin_high or cfg.reward_bin_high}
     heads = build_agent_heads(agent_cfg).to(dev)
     T = cfg.clip_T
     print(pretty_agent_summary(heads) + f" | clip {T} slots | tasks {sorted(tasks)}", flush=True)
