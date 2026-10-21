@@ -472,6 +472,7 @@ class FrozenTokenizer(nn.Module):
         # imports the model classes above — a top-level import would cycle
         from dreamer4.train.train_tokenizer import load_tokenizer_checkpoint
         tok, ckpt = load_tokenizer_checkpoint(ckpt_path, device=device)
+        self.ckpt_path = str(ckpt_path)
         if ckpt["frame_meta"]["d_proprio"] is not None:
             raise ValueError("proprio-decoding tokenizers are not supported as "
                              "a dynamics codec — train the tokenizer with "

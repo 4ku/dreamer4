@@ -50,7 +50,9 @@ horizon × K gate table); one line appended to ``../experiments.jsonl``.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -202,11 +204,35 @@ def load_dynamics_checkpoint(path, *, device: str | torch.device = "cpu",
 # ---------------------------------------------------------------------------
 
 
+def latent_cache_file(tokenizer: FrozenTokenizer,
+                      dataset: EpisodeVideoDataset) -> Optional[Path]:
+    """
+    Where :func:`encode_episodes` keeps a dataset's latents under one
+    tokenizer: beside the tokenizer checkpoint, named by everything the
+    latents depend on -- the dataset directory and its episode count, the
+    checkpoint file (path, size, mtime), the history window and the packing.
+    None for a dataset without one directory (a merged set): never cached.
+    """
+    root = getattr(dataset, "root", None)
+    if root is None:
+        return None
+    ckpt = Path(tokenizer.ckpt_path).resolve()
+    st = ckpt.stat()
+    key = "|".join(map(str, (Path(root).resolve(), len(dataset), ckpt, st.st_size,
+                             st.st_mtime_ns, tokenizer.history, tokenizer.pack_k)))
+    return ckpt.parent / "latent_cache" / f"{hashlib.sha1(key.encode()).hexdigest()[:16]}.pt"
+
+
 def encode_episodes(tokenizer: FrozenTokenizer, dataset: EpisodeVideoDataset,
                     indices, *, keep_video: bool = False,
                     chunk: int = 512) -> List[dict]:
     """
     Encode whole episodes ONCE into cached latents (fp16, on device).
+
+    Every phase encodes the same dataset with the same frozen tokenizer, so
+    the latents are also kept on disk (:func:`latent_cache_file`) and a later
+    call -- phase 2, phase 3, a rerun -- reads them instead of re-encoding (on
+    the AlohaPick mix: ~15 min of tokenizer time per phase).
 
     Args:
         indices:    Episode indices to encode.
@@ -231,16 +257,31 @@ def encode_episodes(tokenizer: FrozenTokenizer, dataset: EpisodeVideoDataset,
     """
     episodes = []
     overlap = tokenizer.history - 1
+    cache_file = latent_cache_file(tokenizer, dataset)
+    cached = {}
+    if cache_file is not None and cache_file.exists():
+        try:
+            cached = torch.load(cache_file, map_location="cpu")
+        except Exception as e:                  # unreadable: encode afresh and rewrite it
+            print(f"latent cache {cache_file} ignored: {e}", flush=True)
+    n_new = 0
     for i in indices:
         n = dataset.episode_frames(int(i))
         clip = dataset.clip(int(i), 0, n)
         video = clip["video"]
-        parts = []
-        for s in range(0, n, chunk):
-            lo = max(0, s - overlap)
-            z = tokenizer.encode_frames(video[None, lo : s + chunk])
-            parts.append(z[0, s - lo :].to(torch.float16))
-        entry = {"z": torch.cat(parts, 0), "actions": clip["actions"]}
+        z = cached.get(int(i))
+        if z is not None and z.shape[0] == n:
+            z = z.to(tokenizer.device)
+        else:
+            parts = []
+            for s in range(0, n, chunk):
+                lo = max(0, s - overlap)
+                zs = tokenizer.encode_frames(video[None, lo : s + chunk])
+                parts.append(zs[0, s - lo :].to(torch.float16))
+            z = torch.cat(parts, 0)
+            cached[int(i)] = z.cpu()
+            n_new += 1
+        entry = {"z": z, "actions": clip["actions"]}
         for key in ("proprio", "rewards", "terminals"):
             if key in clip:
                 entry[key] = clip[key]
@@ -251,6 +292,19 @@ def encode_episodes(tokenizer: FrozenTokenizer, dataset: EpisodeVideoDataset,
         if keep_video:
             entry["video"] = video
         episodes.append(entry)
+    if cache_file is not None:
+        print(f"latent cache {cache_file}: {len(episodes) - n_new} episodes read, "
+              f"{n_new} encoded", flush=True)
+        if n_new:
+            # write-then-rename through a per-process temp file: two phases starting together
+            # (e.g. the phase-2 seeds) may both write the cache
+            tmp = cache_file.with_name(f"{cache_file.name}.{os.getpid()}.tmp")
+            try:
+                cache_file.parent.mkdir(exist_ok=True)
+                torch.save(cached, tmp)
+                tmp.replace(cache_file)
+            except OSError as e:                  # a read-only tokenizer dir: just don't cache
+                print(f"latent cache not written: {e}", flush=True)
     return episodes
 
 
