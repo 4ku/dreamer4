@@ -46,6 +46,59 @@ def make_env(spec):
     return gym.make(spec["id"], **spec.get("kwargs", {}))
 
 
+def make_eval_envs(spec, k):
+    """``k`` environments for :func:`evaluate`: a list of Gymnasium envs, or -- when the spec says
+    ``"batched": True`` -- ONE object that steps ``k`` worlds in lockstep (``"id"`` is then
+    ``"module:Class"``, e.g. :class:`dreamer4.envs.aloha_pick.AlohaPickBatch`)."""
+    if spec.get("batched"):
+        import importlib
+        module, cls = spec["id"].split(":")
+        return getattr(importlib.import_module(module), cls)(k, **spec.get("kwargs", {}))
+    return [make_env(spec) for _ in range(k)]
+
+
+@torch.no_grad()
+def evaluate_lockstep(net, benv, *, tok, proprio_from_info, n, seed, greedy, device):
+    """:func:`evaluate` for a batched env whose worlds all run to the same step limit: rounds of
+    ``benv.n`` episodes (seeds ``seed .. seed+n-1``), every one scored at its end."""
+    was_training = net.training
+    net.eval()
+    hist, B = tok.history, benv.n
+    succ, steps, returns, done_n = [], [], [], 0
+    torch.manual_seed(seed)
+    while done_n < n:
+        m = min(B, n - done_n)
+        frames, infos = benv.reset([seed + done_n + i for i in range(B)])
+        window = [[f] * hist for f in frames]
+        net.reset_rows(None)
+        prev = None
+        ret, ln = np.zeros(B), np.zeros(B, np.int64)
+        alive, ok = np.ones(B, bool), np.zeros(B, bool)
+        for t in range(benv.max_steps):
+            vid = np.stack([np.stack(w[-hist:]) for w in window])
+            z = tok.encode_frames(vid)[:, -1].float().to(device)
+            pr = torch.as_tensor(np.stack([proprio_from_info(i) for i in infos]),
+                                 dtype=torch.float32, device=device)
+            a = net.act(z, pr, greedy=greedy, prev_action=prev)
+            prev = a
+            frames, r, term, infos = benv.step(net.env_action(a))
+            ret += np.where(alive, r, 0.0)
+            ln += alive
+            for i in range(B):
+                window[i].append(frames[i])
+            ended = alive & (np.asarray(term, bool) | (t == benv.max_steps - 1))
+            ok |= ended & np.array([inf["is_success"] for inf in infos])
+            alive &= ~ended
+            if not alive.any():
+                break
+        succ += ok[:m].tolist()
+        steps += ln[:m].tolist()
+        returns += ret[:m].tolist()
+        done_n += m
+    net.train(was_training)
+    return float(np.mean(succ)), float(np.mean(steps)), float("nan"), float(np.mean(returns))
+
+
 @torch.no_grad()
 def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
     """Play ``n`` episodes across ``envs`` in parallel (one batched policy forward per step).
@@ -76,6 +129,9 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
         The mean return is the env's own episode return -- what separates policies that all
         succeed (e.g. how long a picked object is held, on a dense-reward arm task).
     """
+    if getattr(envs, "batched", False):
+        return evaluate_lockstep(net, envs, tok=tok, proprio_from_info=proprio_from_info, n=n,
+                                 seed=seed, greedy=greedy, device=device)
     was_training = net.training
     # Eval mode first: anything the network does differently while training would silently score
     # a different network than the one being shipped. The training mode is restored on return.
@@ -177,7 +233,7 @@ def main(argv=None):
     heads.load_state_dict(ckpt["agent"])
     policy = AgentPolicy(world.dyn.eval(), heads.eval(), window=int(ckpt["clip_T"]),
                          tau_ctx=world.tau_ctx, k_max=world.k_max).eval()
-    envs = [make_env(world.env_spec) for _ in range(cfg.envs)]
+    envs = make_eval_envs(world.env_spec, cfg.envs)
     kw = dict(tok=world.tok, proprio_from_info=world.proprio_from_info, n=cfg.n, seed=cfg.seed,
               device=dev)
     greedy = evaluate(policy, envs, greedy=True, **kw)

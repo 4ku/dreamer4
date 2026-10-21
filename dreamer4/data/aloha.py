@@ -161,11 +161,12 @@ class AlohaEpisodeDataset(EpisodeVideoDataset):
         return self.standardise(info["state"])
 
     def env_spec(self) -> Optional[Dict]:
-        """The live env, built by :mod:`dreamer4.envs.aloha_pick` with the same cameras / scale."""
+        """The live env -- N worlds in lockstep (:class:`dreamer4.envs.aloha_pick.AlohaPickBatch`)
+        with the same cameras and scale as the clips."""
         env = self.manifest.get("env")
         if not env:
             return None
-        return {"id": "dreamer4.envs.aloha_pick:AlohaPickVision-v0",
+        return {"id": "dreamer4.envs.aloha_pick:AlohaPickBatch", "batched": True,
                 "kwargs": {**env, "cameras": self.cameras, "downscale": self.downscale}}
 
 

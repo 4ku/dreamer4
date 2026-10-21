@@ -39,7 +39,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from dreamer4.agent_eval import evaluate, make_env
+from dreamer4.agent_eval import evaluate, make_eval_envs
 from dreamer4.models.agent_heads import (agent_tokens_are_write_only, build_agent_heads,
                                          flatten_agent_out, mtp_targets, pretty_agent_summary,
                                          terminal_bins)
@@ -402,8 +402,7 @@ class Run:
 
     def __init__(self, cfg, world, out, writer):
         self.cfg, self.world, self.out, self.writer = cfg, world, out, writer
-        self.envs = ([make_env(world.env_spec) for _ in range(cfg.eval_envs)]
-                     if world.env_spec else [])
+        self.envs = make_eval_envs(world.env_spec, cfg.eval_envs) if world.env_spec else []
         if not self.envs:
             print("no env_spec in this dataset: real-env evaluation is skipped and no best.pt is "
                   "written (offline metrics only)", flush=True)

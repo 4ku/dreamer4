@@ -47,7 +47,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from dreamer4.agent_eval import evaluate, make_env
+from dreamer4.agent_eval import evaluate, make_eval_envs
 from dreamer4.models.agent_heads import build_agent_heads, terminal_bins
 from dreamer4.models.world_model import (AgentPolicy, WorldModel, dream_context,
                                          dream_step, window_frames)
@@ -440,7 +440,7 @@ def main():
     starts = DemoStarts(world.dataset, window=agent.clip_T, history=world.tok.history, rng=rng)
     print(f"dream starts: {len(starts.index)} contexts of {agent.clip_T} frames from "
           f"{world.data_path} | horizon {cfg.horizon}", flush=True)
-    eval_envs = [make_env(world.env_spec) for _ in range(cfg.eval_envs)] if world.env_spec else []
+    eval_envs = make_eval_envs(world.env_spec, cfg.eval_envs) if world.env_spec else []
     if not eval_envs:
         print("no env_spec in this dataset: real-env evaluation is skipped and no best.pt is "
               "written", flush=True)
