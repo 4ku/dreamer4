@@ -31,8 +31,9 @@ Usage (the defaults ARE the full phase, one run of 30 000 steps):
     # accurate is switched on for the last 20 % of the SAME run -- fraction 0
     # until step 24 000, 0 -> 0.5 by 25 500, held; the LR walks 3e-4 -> 5e-5
     # over the 1 000 steps BEFORE the ramp opens (decaying across the ramp
-    # diverges on the obstacle maze) and the loss normalizer is re-seeded where
-    # it opens. Spelled out:
+    # diverges on the obstacle maze), the bootstrap teacher is an EMA copy of
+    # the weights and the new term is scaled like the flow term where the ramp
+    # opens. Spelled out:
     ... --steps 30000 --optim.lr_final 5e-5 --optim.lr_decay_steps 1000 \\
         --objective.bootstrap_frac 0.5 \\
         --objective.bootstrap_start_frac 0.8 --objective.bootstrap_ramp_frac 0.05
@@ -48,6 +49,7 @@ horizon × K gate table); one line appended to ``../experiments.jsonl``.
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
@@ -427,6 +429,7 @@ def train(cfg: DynamicsTrainConfig) -> Dict[str, float]:
                             betas=(cfg.optim.beta1, cfg.optim.beta2),
                             weight_decay=cfg.optim.weight_decay)
     ema = EMA(dyn, cfg.optim.ema_decay) if cfg.optim.ema_decay > 0 else None
+    teacher = None      # the bootstrap teacher, an EMA copy of `dyn` (objective.boot_teacher_ema)
 
     latent_meta = {"n_spatial": tokenizer.n_spatial,
                    "d_spatial": tokenizer.d_spatial, "action_dim": action_dim,
@@ -516,20 +519,33 @@ def train(cfg: DynamicsTrainConfig) -> Dict[str, float]:
         for group in opt.param_groups:
             group["lr"] = lr
         boot_frac = bootstrap_frac_at(obj, step, cfg.steps)
-        if use_boot and boot_start > 0 and step == boot_start + 1:
-            # The ramp opens a NEW loss regime, and the RMS normalizer has to be
-            # told. By now the flow term sits far below the peak its running
-            # estimate remembers (`floor_frac` deliberately stops the divisor
-            # following it down), while the bootstrap term is normalized against
-            # its own first value and so arrives at O(1): left alone, the model
-            # spends the rest of the run optimizing the bootstrap term almost
-            # alone and the player vanishes from the rollout within ~2 000 steps
-            # (measured — rollout latent_mse 3e-4 -> 3e-1). Re-seeding every slot
-            # restores the 1 : 0.3 : 0.5 the weights ask for, which is what the
-            # separate warm-started fine-tune used to get for free.
-            combiner = LossCombiner(weights, normalize=normalize_losses,
-                                    decay=0.99, floor_frac=0.2, device=device)
-            log.info(f"step {step}: bootstrap ramp opens — loss normalizer re-seeded")
+        if (use_boot and boot_start > 0 and step == boot_start + 1
+                and combiner.normalizer is not None):
+            # The ramp opens a new loss term, and the RMS normalizer has to give it
+            # a scale. Left alone, the term would be normalized against its own
+            # first (untrained) value, arrive at O(1) and crowd out the flow term.
+            # So ONLY the bootstrap slot is seeded, at the flow term's current
+            # divisor: it arrives on the flow term's footing. The flow / proprio
+            # slots keep their state -- re-seeding them too (the earlier recipe)
+            # divides their converged ~1e-4 residuals by their current RMS instead
+            # of the floor, and 6 000 steps of that reshape the features the agent
+            # tokens later read (2026-10-21: phase-2 cloning 0.886 -> 0.840 from the
+            # re-seed alone, 0.76-0.82 together with the bootstrap term).
+            nz = combiner.normalizer
+            f, b = combiner.slots["flow"], combiner.slots["bootstrap"]
+            div = torch.maximum(nz.rms_ema[f], nz.floor_frac * nz.rms_peak[f])
+            nz.rms_ema[b] = div
+            nz.rms_peak[b] = div
+            nz.initialized[b] = True
+            log.info(f"step {step}: bootstrap ramp opens — bootstrap term scaled "
+                     f"like the flow term ({float(div):.2e})")
+        if obj.boot_teacher_ema > 0 and boot_frac > 0 and teacher is None:
+            # The teacher starts as the current network and then trails it, so the
+            # two half-steps that define the bootstrap target do not move with every
+            # update of the student (not checkpointed: a resume restarts it from the
+            # current weights).
+            teacher = copy.deepcopy(dyn).requires_grad_(False)
+            log.info(f"step {step}: bootstrap teacher = EMA copy, decay {obj.boot_teacher_ema:g}")
 
         clean = obj.objective == "clean_context"
         sched_p = obj.sched_sample_prob * min(
@@ -566,7 +582,7 @@ def train(cfg: DynamicsTrainConfig) -> Dict[str, float]:
                         ctx_noise_max=obj.ctx_noise_max or None,
                         do_sched=do_sched and not image_batch,
                         proprio=batch.get("proprio"),
-                        bootstrap_frac=boot_frac)
+                        bootstrap_frac=boot_frac, teacher=teacher)
                 loss, raw = combiner(terms)
             (loss / cfg.optim.accum_steps).backward()
             loss_value += float(loss.detach()) / cfg.optim.accum_steps
@@ -578,6 +594,10 @@ def train(cfg: DynamicsTrainConfig) -> Dict[str, float]:
         opt.step()
         if ema is not None:
             ema.update(dyn)
+        if teacher is not None:
+            with torch.no_grad():
+                for p_t, p in zip(teacher.parameters(), dyn.parameters()):
+                    p_t.lerp_(p, 1.0 - obj.boot_teacher_ema)
 
         loss_ema = loss_value if loss_ema is None else \
             0.98 * loss_ema + 0.02 * loss_value

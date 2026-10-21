@@ -264,6 +264,7 @@ def clean_context_loss(
     do_sched: bool = False,
     proprio: Optional[torch.Tensor] = None,
     bootstrap_frac: float = 0.0,
+    teacher: Optional[DynamicsModel] = None,
 ) -> Tuple[Dict[str, Optional[torch.Tensor]], Dict[str, float]]:
     """
     Predict frame ``p`` of ``z1`` from its (nearly) clean context.
@@ -293,6 +294,9 @@ def clean_context_loss(
                         noised with the SAME tau and denoised jointly.
         bootstrap_frac: Fraction of the rows whose target slot also carries
                         the bootstrap term (0 disables it).
+        teacher:        Network that takes the bootstrap teacher's two no-grad
+                        half-steps (an EMA copy of ``dynamics``); None =
+                        ``dynamics`` itself.
 
     Returns:
         ``(terms, aux)``. ``terms`` is {"flow": t, "proprio": t | None,
@@ -384,14 +388,15 @@ def clean_context_loss(
     # ---- bootstrap term on the target slot (teacher = two half-steps) -----
     if B_boot > 0:
         zt_b = ztilde[B_flow:]
+        tnet = dynamics if teacher is None else teacher
         with torch.no_grad():
             st1 = step_idx[B_flow:].clone()
             st1[:, p] = (step_b + 1).clamp(max=emax)            # one finer level
             si1 = signal_idx[B_flow:]
             act_b = act[B_flow:]
             pin1 = prop_in[B_flow:] if has_prop else None
-            out1 = dynamics(act_b, st1, si1, z_in[B_flow:],
-                            **({"proprio_noisy": pin1} if has_prop else {}))
+            out1 = tnet(act_b, st1, si1, z_in[B_flow:],
+                        **({"proprio_noisy": pin1} if has_prop else {}))
             b1 = velocity(out1[0][:, p].float(), zt_b.float(), tau_b)
             z_half = advance(zt_b.float(), b1, d_b / 2.0)
             si2 = si1.clone()
@@ -405,8 +410,8 @@ def clean_context_loss(
                 prop_half = advance(prop_tilde[B_flow:].float(), bp1, d_b / 2.0)
                 pin2 = prop_in[B_flow:].clone()
                 pin2[:, p] = prop_half.to(prop_in.dtype)
-            out2 = dynamics(act_b, st1, si2, zin2,
-                            **({"proprio_noisy": pin2} if has_prop else {}))
+            out2 = tnet(act_b, st1, si2, zin2,
+                        **({"proprio_noisy": pin2} if has_prop else {}))
             b2 = velocity(out2[0][:, p].float(), z_half, tau_b + d_b / 2.0)
             v_target = (b1 + b2) / 2.0
         v_hat = velocity(z1_hat[B_flow:, p].float(), zt_b.float(), tau_b)

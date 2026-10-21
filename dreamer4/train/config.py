@@ -235,6 +235,11 @@ class ObjectiveConfig:
     bootstrap_ramp_frac: float = 0.05   # ramp 0 -> bootstrap_frac over this frac of the
                                         #   run, then hold to the end (0 = step change)
     boot_weight: float = 0.5            # relative weight of the bootstrap term
+    boot_teacher_ema: float = 0.999     # the bootstrap teacher's two half-steps come from an
+                                        #   EMA copy of the weights at this decay. 0 = the
+                                        #   network being trained (the paper's sg(.)): its
+                                        #   target moves with every update, and that loop
+                                        #   blew up every model wider than 256 or 16 deep
     proprio_weight: float = 0.3         # relative weight of the joint proprio term
 
 
