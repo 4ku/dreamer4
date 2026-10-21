@@ -136,9 +136,10 @@ class Tape:
     from the per-row termination step in one place.
     """
 
-    def __init__(self, B, horizon, device):
+    def __init__(self, B, horizon, device, code_shape=()):
         self.B, self.H, self.device = B, horizon, device
-        self.actions = torch.zeros(B, horizon, dtype=torch.long, device=device)
+        # action codes: ids, or (n_dims,) bin indices for a binned continuous policy
+        self.actions = torch.zeros(B, horizon, *code_shape, dtype=torch.long, device=device)
         self.rewards = torch.zeros(B, horizon, device=device)
         self.done = np.zeros(B, bool)
         self.term_at = np.full(B, -1)
@@ -250,7 +251,7 @@ class Imagination:
         cache = world.dyn.transformer.make_kv_cache()
         cache.max_T = max(1, self.clip_T - 1)
 
-        tape = Tape(B, horizon, dev)
+        tape = Tape(B, horizon, dev, code_shape=(heads.policy.n_actions,) if heads.policy.bins else ())
         H = torch.zeros(B, horizon + 1, self.d_in, device=dev)
         # Batch rows still being simulated. With --compact, dreams that have ended leave the batch
         # (and the KV cache) in blocks of 32: whatever they would produce after their end is masked
@@ -287,12 +288,11 @@ class Imagination:
                         rows = rows[keep]
             if t == horizon:
                 break
-            logits = heads.policy.at(h, 0).float()
-            a = torch.distributions.Categorical(logits=logits).sample()
+            a = heads.policy.sample(heads.policy.at(h, 0).float())
             tape.actions[rows, t] = a
             nb = len(rows)
             av = torch.zeros(nb, 1, D + 1, device=dev)
-            av[torch.arange(nb), 0, a.clamp(max=D - 1)] = 1.0
+            av[:, 0, :D] = heads.policy.action_vector(a)
             act_hist = torch.cat([act_hist, av], 1)
             z_new, prop_new = dream_step(world, z_hist=z, prop_hist=prop,
                                          act_hist=act_hist[:, -(z.shape[1] + 1):], K=K, cache=cache)
@@ -320,6 +320,15 @@ class Imagination:
         torch.save({**{k: v for k, v in self.ckpt.items()
                        if k in ("agent_cfg", "dyn", "n_agent", "clip_T", "dyn_source")},
                     "agent": self.heads.state_dict(), "train_cfg": vars(self.cfg), **extra}, path)
+
+
+def select_key(ev):
+    """Checkpoint ranking: greedy success, then the shorter path (where the env has one), then the
+    higher return. An empty record ranks below every evaluation."""
+    if not ev:
+        return (-1.0, -float("inf"), -float("inf"))
+    opt = ev.get("greedy_opt", float("nan"))
+    return (ev["greedy"], -opt if opt == opt else 0.0, ev.get("greedy_return", 0.0))
 
 
 def parse_args():
@@ -486,11 +495,11 @@ def main():
         if cfg.adv_drop_final >= 0:
             drop += (cfg.adv_drop_final - drop) * min(1.0, step / max(1, cfg.adv_drop_steps))
         coeff, pinfo = pmpo_coeffs(adv[keep], alpha=cfg.alpha, drop_frac=drop)
-        dist = torch.distributions.Categorical(logits=lg[:, :H])
-        lp = dist.log_prob(roll["actions"])[keep]
+        pol = agent.heads.policy
+        lp = pol.log_prob(lg[:, :H], roll["actions"])[keep]
         with torch.no_grad():
             plg = agent.prior_logits(roll, H)
-        kl = torch.distributions.kl_divergence(dist, torch.distributions.Categorical(logits=plg))[keep]
+        kl = pol.kl(lg[:, :H], plg)[keep]
         loss = cfg.value_weight * value_loss + (coeff * lp).sum() + cfg.beta * kl.mean()
 
         opt.zero_grad(set_to_none=True)
@@ -503,7 +512,7 @@ def main():
         opt.step()
 
         if do_log:
-            pinfo["entropy"] = float(dist.entropy()[keep].mean().detach())
+            pinfo["entropy"] = float(pol.entropy(lg[:, :H])[keep].mean().detach())
             pinfo["kl_to_prior"] = float(kl.mean().detach())
             rec = {"step": step, "dreams": collected * B, "wall_s": round(time.time() - t0, 1),
                    "dream_success": roll["success"], "value_loss": value_loss.item(),
@@ -529,18 +538,21 @@ def main():
             g = evaluate(eval_policy, eval_envs, greedy=True, **kw)
             s = evaluate(eval_policy, eval_envs, greedy=False, **kw)
             last_eval = {"step": step + 1, "dreams": collected * B, "greedy": g[0], "sampled": s[0],
-                         "greedy_opt": g[2], "sampled_opt": s[2], "eval_n": cfg.eval_n}
+                         "greedy_opt": g[2], "sampled_opt": s[2], "greedy_return": g[3],
+                         "sampled_return": s[3], "eval_n": cfg.eval_n}
             print(f"PMPO-EVAL {out.name} step {step + 1} dreams {collected * B} "
                   f"greedy SR {g[0]:.4f} opt {g[2]:.4f} | sampled SR {s[0]:.4f} opt {s[2]:.4f} "
-                  f"| n={cfg.eval_n} | {(time.time() - t0) / 60:.1f} min", flush=True)
-            for k, x in (("greedy_sr", g[0]), ("greedy_opt", g[2]),
-                         ("sampled_sr", s[0]), ("sampled_opt", s[2])):
+                  f"| return {g[3]:.2f} / {s[3]:.2f} | n={cfg.eval_n} | "
+                  f"{(time.time() - t0) / 60:.1f} min", flush=True)
+            for k, x in (("greedy_sr", g[0]), ("greedy_opt", g[2]), ("greedy_return", g[3]),
+                         ("sampled_sr", s[0]), ("sampled_opt", s[2]), ("sampled_return", s[3])):
                 writer.add_scalar(f"eval/{k}", x, step + 1)
             writer.flush()
             agent.save(out / "checkpoints" / "latest.pt", last_eval)
-            # best.pt: the highest greedy success rate, ties broken by the shorter path -- the first
-            # checkpoint to reach 100 % is rarely the best one (phase 2 selects the same way)
-            if (g[0], -g[2]) > (best, -best_eval.get("greedy_opt", float("inf"))):
+            # best.pt: the highest greedy success rate, ties broken by the shorter path, then by the
+            # return (envs without a shortest path, e.g. a dense-reward arm task where every policy
+            # succeeds) -- the first checkpoint to reach 100 % is rarely the best one
+            if select_key(last_eval) > select_key(best_eval):
                 best = g[0]
                 best_eval = last_eval
                 agent.save(out / "checkpoints" / "best.pt", last_eval)

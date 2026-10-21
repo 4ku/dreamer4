@@ -134,54 +134,95 @@ class MTPHead(nn.Module):
 
 
 class PolicyHead(nn.Module):
-    """The policy: a categorical distribution over ``n_actions`` on the agent embedding.
+    """The policy on the agent embedding: categorical, or binned per dimension for continuous control.
 
     Paper Section 3.3 parameterizes it "as categorical or vectorized binary distribution, depending
-    on the action space of the dataset" -- the binary form is what its 23 Minecraft keyboard keys
-    need. Only the categorical form is built here: the dataset contract of
-    :mod:`dreamer4.data.base` carries one-hot action VECTORS, so no adapter can describe a
-    multi-key action space, and the imagination update's PMPO term is written against a single
-    categorical. A binary head is a small addition once the data layer can say it needs one.
+    on the action space of the dataset". Two forms are built here:
+
+    - ``action_bins = 0``: one categorical over ``n_actions`` discrete actions (one-hot vectors);
+    - ``action_bins = K``: a continuous action space of ``n_actions`` dimensions in [-1, 1], each
+      dimension an independent categorical over ``K`` evenly spaced values -- the same
+      discretisation the paper applies to Minecraft's mouse. A categorical per dimension can hold
+      several modes and has no mean to drift, which a Gaussian head does under PMPO.
+
+    The rest of the agent speaks in action CODES: ``(...)`` ids, or ``(..., n_actions)`` bin
+    indices. :meth:`action_vector` turns codes into the vector the world model and the environment
+    take; :meth:`encode` turns a recorded action vector back into codes (the cloning target).
     """
 
-    def __init__(self, d_in: int, *, n_actions: int, mtp: int = 8, d_hidden: int = 256):
+    def __init__(self, d_in: int, *, n_actions: int, mtp: int = 8, d_hidden: int = 256,
+                 action_bins: int = 0):
         super().__init__()
         self.n_actions = n_actions
+        self.bins = int(action_bins)
         self.mtp = mtp
-        self.net = MTPHead(d_in, n_actions, mtp=mtp, d_hidden=d_hidden)
+        self.net = MTPHead(d_in, n_actions * self.bins if self.bins else n_actions, mtp=mtp,
+                           d_hidden=d_hidden)
+        if self.bins:
+            self.register_buffer("bin_values", torch.linspace(-1.0, 1.0, self.bins),
+                                 persistent=False)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """``(..., d_in)`` -> ``(..., mtp+1, n_actions)`` logits."""
+        """``(..., d_in)`` -> ``(..., mtp+1, n_out)`` logits."""
         return self.net(h)
 
     def at(self, h: torch.Tensor, n: int = 0) -> torch.Tensor:
-        """``(..., d_in)`` -> ``(..., n_actions)`` logits at MTP distance ``n``."""
+        """``(..., d_in)`` -> ``(..., n_out)`` logits at MTP distance ``n``."""
         return self.net.at(h, n)
 
+    def _split(self, logits: torch.Tensor) -> torch.Tensor:
+        """Binned form: ``(..., n_actions * bins)`` -> ``(..., n_actions, bins)``."""
+        if not self.bins:
+            return logits
+        return logits.reshape(*logits.shape[:-1], self.n_actions, self.bins)
+
+    def _joint(self, per_dim: torch.Tensor) -> torch.Tensor:
+        """Binned form: a per-dimension quantity summed into the joint one."""
+        return per_dim.sum(-1) if self.bins else per_dim
+
     def dist(self, logits: torch.Tensor) -> torch.distributions.Categorical:
-        """Logits ``(..., n_actions)`` -> the distribution of ONE action."""
-        return torch.distributions.Categorical(logits=logits)
+        """Logits of ONE step -> its distribution (per dimension in the binned form)."""
+        return torch.distributions.Categorical(logits=self._split(logits))
 
     def sample(self, logits: torch.Tensor, *, greedy: bool = False,
                temperature: float = 1.0) -> torch.Tensor:
-        """Act. ``greedy`` takes the mode; ``temperature`` flattens the logits first."""
+        """Act, returning codes. ``greedy`` takes the mode; ``temperature`` flattens the logits."""
         if greedy:
-            return logits.argmax(-1)
+            return self._split(logits).argmax(-1)
         return self.dist(logits / temperature).sample()
 
-    def log_prob(self, logits: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """``ln pi(a | h)`` -- ``(..., n_actions)`` logits against ``(...)`` action ids."""
-        return self.dist(logits).log_prob(actions.long())
+    def log_prob(self, logits: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+        """``ln pi(a | h)`` of action codes."""
+        return self._joint(self.dist(logits).log_prob(codes.long()))
 
-    def clone_loss(self, logits: torch.Tensor, actions: torch.Tensor,
+    def entropy(self, logits: torch.Tensor) -> torch.Tensor:
+        return self._joint(self.dist(logits).entropy())
+
+    def kl(self, logits_p: torch.Tensor, logits_q: torch.Tensor) -> torch.Tensor:
+        """``KL(pi_p || pi_q)`` per step."""
+        return self._joint(torch.distributions.kl_divergence(self.dist(logits_p),
+                                                             self.dist(logits_q)))
+
+    def action_vector(self, codes: torch.Tensor) -> torch.Tensor:
+        """Codes -> the action vector the world model and the env take (one-hot, or bin values)."""
+        if self.bins:
+            return self.bin_values[codes.long()]
+        return nn.functional.one_hot(codes.long(), self.n_actions).float()
+
+    def encode(self, vectors: torch.Tensor) -> torch.Tensor:
+        """Recorded action vectors -> codes: the one-hot's index, or the nearest bin per dimension."""
+        if self.bins:
+            return torch.round((vectors.clamp(-1.0, 1.0) + 1.0) / 2.0 * (self.bins - 1)).long()
+        return vectors.argmax(-1)
+
+    def clone_loss(self, logits: torch.Tensor, codes: torch.Tensor,
                    mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The policy half of Eq. 9: ``- ln p(a | h)``, averaged over the valid entries of ``mask``.
 
-        ``logits`` ``(..., n_actions)``, ``actions`` ``(...)`` action ids, ``mask`` ``(...)``
-        float/bool -- 0 where the target does not exist (past the end of the clip or of the
-        episode), which is what keeps MTP from training on padding.
+        ``mask`` ``(...)`` float/bool is 0 where the target does not exist (past the end of the
+        clip or of the episode), which is what keeps MTP from training on padding.
         """
-        nll = -self.log_prob(logits, actions)
+        nll = -self.log_prob(logits, codes)
         return _masked_mean(nll, mask)
 
 
@@ -254,7 +295,7 @@ class AgentHeads(nn.Module):
     """
 
     def __init__(self, *, d_model: int, n_agent: int = 1, n_tasks: int = 1,
-                 n_actions: int, mtp: int = 8, d_hidden: int = 256,
+                 n_actions: int, action_bins: int = 0, mtp: int = 8, d_hidden: int = 256,
                  reward_bins: int = 255, reward_bin_low: float = -1.0,
                  reward_bin_high: float = 1.0, value_bins: int = 255,
                  value_bin_low: float = -1.0, value_bin_high: float = 1.0):
@@ -265,7 +306,8 @@ class AgentHeads(nn.Module):
         self.d_in = d_in
         self.mtp = mtp
         self.tokens = AgentTokenEncoder(d_model, n_agent=n_agent, n_tasks=n_tasks)
-        self.policy = PolicyHead(d_in, n_actions=n_actions, mtp=mtp, d_hidden=d_hidden)
+        self.policy = PolicyHead(d_in, n_actions=n_actions, mtp=mtp, d_hidden=d_hidden,
+                                 action_bins=action_bins)
         self.reward = TwoHotHead(d_in, mtp=mtp, d_hidden=d_hidden, num_bins=reward_bins,
                                  bin_low=reward_bin_low, bin_high=reward_bin_high)
         self.value = TwoHotHead(d_in, mtp=0, d_hidden=d_hidden, num_bins=value_bins,
@@ -393,8 +435,9 @@ def mtp_targets(values: torch.Tensor, valid: torch.Tensor, mtp: int, *,
 def pretty_agent_summary(heads: AgentHeads) -> str:
     """One line for the trainers' log: what was built, and how big it is."""
     n = sum(p.numel() for p in heads.parameters())
+    policy = (f"policy {heads.policy.n_actions} dims x {heads.policy.bins} bins"
+              if heads.policy.bins else f"policy categorical({heads.policy.n_actions})")
     return (f"agent heads {n / 1e6:.2f}M | h_t {heads.d_in} "
-            f"({heads.n_agent} x {heads.d_model}) | MTP L={heads.mtp} | "
-            f"policy categorical({heads.policy.n_actions}) | "
+            f"({heads.n_agent} x {heads.d_model}) | MTP L={heads.mtp} | {policy} | "
             f"reward {heads.reward.twohot.num_bins} bins | "
             f"value {heads.value.twohot.num_bins} bins")

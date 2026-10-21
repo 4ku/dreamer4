@@ -25,6 +25,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
+from dreamer4.data.aloha import AlohaEpisodeDataset
 from dreamer4.data.base import EpisodeVideoDataset, MergedEpisodeDataset
 from dreamer4.data.gridworld import GridworldEpisodeDataset
 from dreamer4.data.lerobot import LeRobotVideoDataset, compose_cameras
@@ -40,7 +41,7 @@ GENERIC_PROPRIO_MODES = ("none", "auto")
 #: Dataset adapters in dispatch order. Each recognises its own storage format,
 #: declares the proprio modes it derives and constructs itself, so this module
 #: needs no knowledge of any particular environment or robot.
-ADAPTERS = (GridworldEpisodeDataset, LeRobotVideoDataset)
+ADAPTERS = (GridworldEpisodeDataset, AlohaEpisodeDataset, LeRobotVideoDataset)
 
 #: Every mode accepted by open_video_dataset -- generic plus whatever the
 #: registered adapters contribute. Derived, not hand-maintained.
@@ -48,6 +49,7 @@ PROPRIO_MODES = GENERIC_PROPRIO_MODES + tuple(
     m for a in ADAPTERS for m in a.PROPRIO_MODES)
 
 __all__ = [
+    "AlohaEpisodeDataset",
     "ClipStreamDataset",
     "EpisodeVideoDataset",
     "GridworldEpisodeDataset",

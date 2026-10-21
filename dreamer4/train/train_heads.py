@@ -132,14 +132,14 @@ def sample_clips(episodes, ids, B, T, rng, device):
 
     Returns a dict of device tensors:
         ``z`` (B,T,Nz,Dz), ``proprio`` (B,T,Dp), ``actions`` (B,T,Da+1) aligned,
-        ``a_id`` (B,T) long -- the action taken FROM the slot's frame (the policy target),
         ``valid_a`` (B,T), ``reward`` (B,T) -- the reward that ARRIVED WITH the slot's frame,
         ``valid_r`` (B,T), ``task`` (B,) long -- the episode's task indicator,
         ``ret`` (B,T) -- the recorded discounted return-to-go from the slot's frame (zeros unless
         :func:`add_returns` ran), ``valid_v`` (B,T) -- 0 on a padded slot,
-        ``a_vec`` (B,T,Da) -- the recorded action taken FROM the slot's frame, ``d_prop`` (B,T,Dp)
-        -- how the proprio vector changed over that transition (both zero where ``valid_a`` is 0):
-        the auxiliary forward model's input and target.
+        ``a_vec`` (B,T,Da) -- the recorded action taken FROM the slot's frame (the policy target,
+        through ``PolicyHead.encode``), ``d_prop`` (B,T,Dp) -- how the proprio vector changed over
+        that transition (both zero where ``valid_a`` is 0): the auxiliary forward model's input and
+        target.
     """
     pick = rng.choice(np.asarray(ids), size=B, replace=True)
     n_frames = np.array([episodes[int(i)]["z"].shape[0] for i in pick])
@@ -154,7 +154,6 @@ def sample_clips(episodes, ids, B, T, rng, device):
     z = torch.empty(B, T, n_lat, d_lat, dtype=torch.float32, device=device)
     proprio = np.zeros((B, T, d_prop), np.float32)
     actions = np.zeros((B, T, d_act + 1), np.float32)
-    a_id = np.zeros((B, T), np.int64)
     valid_a = np.zeros((B, T), np.float32)
     reward = np.zeros((B, T), np.float32)
     valid_r = np.zeros((B, T), np.float32)
@@ -178,7 +177,6 @@ def sample_clips(episodes, ids, B, T, rng, device):
             else:
                 actions[b, j, d_act] = 1.0
         act_here = s < n_act
-        a_id[b] = np.where(act_here, ep["actions"][np.minimum(s, n_act - 1)].argmax(-1), 0)
         valid_a[b] = (act_here & fresh[b]).astype(np.float32)
         nxt = np.minimum(s + 1, n_act)                 # a recorded action always has a next frame
         a_vec[b] = np.where(act_here[:, None], ep["actions"][np.minimum(s, n_act - 1)], 0.0)
@@ -189,7 +187,7 @@ def sample_clips(episodes, ids, B, T, rng, device):
         if "ret" in ep:
             ret[b] = ep["ret"][s]
     as_t = (lambda x: torch.as_tensor(x, device=device))
-    return {"z": z, "proprio": as_t(proprio), "actions": as_t(actions), "a_id": as_t(a_id),
+    return {"z": z, "proprio": as_t(proprio), "actions": as_t(actions),
             "valid_a": as_t(valid_a), "reward": as_t(reward), "valid_r": as_t(valid_r),
             "task": as_t(task), "ret": as_t(ret), "valid_v": as_t(fresh.astype(np.float32)),
             "a_vec": as_t(a_vec), "d_prop": as_t(d_prop_next)}
@@ -250,7 +248,7 @@ def agent_losses(heads, h, clip, *, mtp, demo_mask):
     (Section 4.1); the reward sum runs over the whole batch, because a state that pays nothing is
     exactly what the failures teach.
     """
-    a_tgt, a_msk = mtp_targets(clip["a_id"], clip["valid_a"], mtp)
+    a_tgt, a_msk = mtp_targets(heads.policy.encode(clip["a_vec"]), clip["valid_a"], mtp)
     r_tgt, r_msk = mtp_targets(clip["reward"], clip["valid_r"], mtp)
     a_msk = a_msk * demo_mask.reshape(-1, 1, 1)
     return (heads.policy.clone_loss(heads.policy(h), a_tgt, a_msk),
@@ -278,8 +276,11 @@ def paper_metrics(world, heads, episodes, ids, *, T, batch, n_batches, rng, devi
         h = agent_forward(world, heads, clip, tau_ctx=tau_ctx,
                           ctx_signal=ctx_signal, emax=emax)
         va = clip["valid_a"] > 0
-        pred = heads.policy.at(h, 0).argmax(-1)
-        hits += int(((pred == clip["a_id"]) & va).sum())
+        pred = heads.policy.sample(heads.policy.at(h, 0), greedy=True)
+        match = (pred == heads.policy.encode(clip["a_vec"])).float()
+        if heads.policy.bins:
+            match = match.mean(-1)                  # the share of dimensions in the right bin
+        hits += float((match * va).sum())
         seen += int(va.sum())
         vr = clip["valid_r"] > 0
         pr = heads.reward.at(h, 0).float().softmax(-1)
@@ -354,6 +355,9 @@ def parse_args():
                          "was trained on (its data.seq_len), the longest context phase 3 can "
                          "dream with")
     ap.add_argument("--d_hidden", type=int, default=256, help="width of the head MLPs")
+    ap.add_argument("--action_bins", type=int, default=0,
+                    help="0: a categorical over discrete (one-hot) actions; K > 0: continuous actions "
+                         "in [-1, 1], one categorical over K evenly spaced values per dimension")
     ap.add_argument("--dyn_lr", type=float, default=2e-4,
                     help="learning rate of the transformer being finetuned; 0 freezes it. At 5e-5 "
                          "the agent tokens do not learn to see obstacles in 4 000 steps; 2e-4 needs "
@@ -413,8 +417,8 @@ class Run:
                   seed=self.cfg.eval_seed, device=device)
         g = evaluate(policy, self.envs, n=n, greedy=True, **kw)
         s = evaluate(policy, self.envs, n=n, greedy=False, **kw)
-        return {"greedy": g[0], "greedy_opt": g[2], "sampled": s[0], "sampled_opt": s[2],
-                "eval_n": n}
+        return {"greedy": g[0], "greedy_opt": g[2], "greedy_return": g[3],
+                "sampled": s[0], "sampled_opt": s[2], "sampled_return": s[3], "eval_n": n}
 
     def record(self, step, metrics, save):
         """Log one evaluation, write ``latest.pt``, and keep ``best.pt`` by greedy success."""
@@ -448,7 +452,7 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
     tasks = {int(ep.get("meta", {}).get("task", 0)) for ep in episodes}
     n_tasks = max(cfg.n_tasks, max(tasks) + 1)
     agent_cfg = {"d_model": world.model_cfg["d_model"], "n_agent": cfg.n_agent,
-                 "n_tasks": n_tasks, "n_actions": ds.action_dim,
+                 "n_tasks": n_tasks, "n_actions": ds.action_dim, "action_bins": cfg.action_bins,
                  "mtp": cfg.mtp, "d_hidden": cfg.d_hidden,
                  "reward_bins": cfg.reward_bins, "reward_bin_low": cfg.reward_bin_low,
                  "reward_bin_high": cfg.reward_bin_high, "value_bins": cfg.reward_bins,
@@ -618,7 +622,8 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
             if run.envs:
                 line += (f" greedy SR {metrics['greedy']:.4f} opt {metrics['greedy_opt']:.4f}"
                          f" | sampled SR {metrics['sampled']:.4f} "
-                         f"opt {metrics['sampled_opt']:.4f} | n={n_ev}")
+                         f"opt {metrics['sampled_opt']:.4f} | return {metrics['greedy_return']:.2f}"
+                         f" / {metrics['sampled_return']:.2f} | n={n_ev}")
             print(f"{line} | acc_heldout {m['acc']:.4f} | reward mae {m['mae']:.4f} "
                   f"term_f1 {m['term_f1']:.4f} | {(time.time() - run.t0) / 60:.1f} min", flush=True)
     run.finish({"demonstrations": len(demos)})

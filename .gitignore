@@ -5,4 +5,4 @@
 __pycache__
 *.egg-info/
 runs/
-data/
+/data/

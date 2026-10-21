@@ -67,12 +67,14 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
         device:            device the policy runs on.
 
     Returns:
-        ``(success_rate, mean_steps, steps_over_optimal)``. The third is the metric to read: mean
+        ``(success_rate, mean_steps, steps_over_optimal, mean_return)``. The third is the metric to read: mean
         episode length is not comparable across policies, because a policy that fails more has its
         failures capped at the env's step limit while a policy that succeeds more pays the real
         path length -- the two move in opposite directions and the mean hides both. Optimality is
         steps / the shortest solution, over SOLVED episodes only, taken from the env's own
         ``optimal_steps_from_start``; 1.000 is perfect, and NaN when no solved episode carried one.
+        The mean return is the env's own episode return -- what separates policies that all
+        succeed (e.g. how long a picked object is held, on a dense-reward arm task).
     """
     was_training = net.training
     # Eval mode first: anything the network does differently while training would silently score
@@ -80,8 +82,8 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
     net.eval()
     B = len(envs)
     hist = tok.history
-    succ, steps, ratios, done_n, nxt = [], [], [], 0, 0
-    obs_l, info_l, ln = [None] * B, [None] * B, [0] * B
+    succ, steps, ratios, returns, done_n, nxt = [], [], [], [], 0, 0
+    obs_l, info_l, ln, ret = [None] * B, [None] * B, [0] * B, [0.0] * B
     opt = [0] * B
     frames = [None] * B
     # Exactly the episodes seed .. seed+n-1 are scored, every one of them to its end. Stopping at
@@ -105,20 +107,24 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
                              dtype=torch.float32, device=device)
         a = net.act(z, pr, greedy=greedy, prev_action=prev_a)
         prev_a = a
+        env_a = net.env_action(a)
         restarted = []
         for i in range(B):
             if not active[i]:
                 continue                                  # an idle row: no seed left for it
-            obs_l[i], _, te, tr, info_l[i] = envs[i].step(int(a[i]))
+            obs_l[i], r, te, tr, info_l[i] = envs[i].step(env_a[i])
             frames[i].append(obs_l[i])
             ln[i] += 1
+            ret[i] += float(r)
             if te or tr:
                 ok = bool(info_l[i].get("is_success", te))
                 succ.append(ok)
                 steps.append(ln[i])
+                returns.append(ret[i])
                 if ok and opt[i] > 0:
                     ratios.append(ln[i] / opt[i])
                 ln[i] = 0
+                ret[i] = 0.0
                 done_n += 1
                 if nxt < n:
                     obs_l[i], info_l[i] = envs[i].reset(seed=seed + nxt)
@@ -133,7 +139,7 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
             net.reset_rows(restarted)
     net.train(was_training)
     return (float(np.mean(succ)), float(np.mean(steps)),
-            float(np.mean(ratios)) if ratios else float("nan"))
+            float(np.mean(ratios)) if ratios else float("nan"), float(np.mean(returns)))
 
 
 def main(argv=None):
@@ -177,8 +183,8 @@ def main(argv=None):
     greedy = evaluate(policy, envs, greedy=True, **kw)
     sampled = evaluate(policy, envs, greedy=False, **kw)
     res = {"ckpt": cfg.ckpt, "n": cfg.n, "seed": cfg.seed, "train_step": ckpt.get("step"),
-           "greedy_sr": greedy[0], "greedy_opt": greedy[2],
-           "sampled_sr": sampled[0], "sampled_opt": sampled[2],
+           "greedy_sr": greedy[0], "greedy_opt": greedy[2], "greedy_return": greedy[3],
+           "sampled_sr": sampled[0], "sampled_opt": sampled[2], "sampled_return": sampled[3],
            "wall_s": round(time.time() - t0, 1)}
     print(json.dumps(res), flush=True)
     if cfg.json:

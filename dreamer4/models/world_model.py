@@ -185,9 +185,9 @@ class AgentPolicy(nn.Module):
     def observe(self, z, proprio, prev_action=None):
         """Append frame ``z`` (and its proprio) to every row's window.
 
-        ``prev_action`` is the action that produced this frame: ``(B,)`` ids for a categorical
-        policy, ``(B, D_a)`` vectors otherwise. Rows whose window was just reset ignore it and
-        start a fresh (left-padded) window instead.
+        ``prev_action`` is the action that produced this frame, as the codes the policy samples
+        (:class:`dreamer4.models.agent_heads.PolicyHead`). Rows whose window was just reset ignore
+        it and start a fresh (left-padded) window instead.
         """
         if self.Z is None or self.Z.shape[0] != z.shape[0]:
             self._allocate(z, proprio)
@@ -201,12 +201,7 @@ class AgentPolicy(nn.Module):
             self.P[~fresh, -1] = proprio[~fresh].float()
             self.A[~fresh, -1] = 0.0
             if prev_action is not None:
-                act = prev_action[~fresh]
-                if act.dim() == 1:
-                    self.A[~fresh, -1, :D] = torch.nn.functional.one_hot(
-                        act.long().clamp(max=D - 1), D).float()
-                else:
-                    self.A[~fresh, -1, :D] = act.float()
+                self.A[~fresh, -1, :D] = self.heads.policy.action_vector(prev_action[~fresh])
             else:
                 self.A[~fresh, -1, D] = 1.0
         if fresh.any():
@@ -242,10 +237,16 @@ class AgentPolicy(nn.Module):
         return flatten_agent_out(out[-1][:, -1])
 
     def act(self, z, proprio, *, greedy=False, temperature=1.0, prev_action=None):
-        """Observe a frame and return the action to take from it."""
+        """Observe a frame and return the action (codes) to take from it."""
         self.observe(z, proprio, prev_action)
         logits = self.heads.policy.at(self.h(), 0)
         return self.heads.policy.sample(logits, greedy=greedy, temperature=temperature)
+
+    def env_action(self, codes):
+        """Codes -> what each environment's ``step`` takes: an int id, or a float vector."""
+        if self.heads.policy.bins:
+            return self.heads.policy.action_vector(codes).cpu().numpy()
+        return [int(c) for c in codes.cpu()]
 
 
 def dream_context(world, heads, *, z_hist, prop_hist, act_hist, tau_ctx, task_ids,
