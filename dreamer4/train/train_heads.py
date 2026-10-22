@@ -109,6 +109,23 @@ def demonstration_ids(episodes, n_train, bc_frac, bc_seed, log=print, min_return
     return demos
 
 
+def demonstration_weights(episodes, demos, temp, log=print):
+    """How often each demonstration is drawn for cloning: uniform, or -- with ``temp`` > 0 (NOT in the
+    paper) -- in proportion to ``exp((return - best) / temp)`` of its recorded episode return, so the fast
+    successes dominate the cloning target while every demonstration still contributes (filtering by
+    return alone leaves too few of them to clone reliably). Returns ``None`` for uniform sampling."""
+    if not temp or temp <= 0:
+        return None
+    ret = np.array([episodes[i].get("meta", {}).get("return", np.nan) for i in demos], np.float64)
+    if np.isnan(ret).any():
+        raise ValueError("--bc_return_temp needs a recorded return for every demonstration")
+    w = np.exp((ret - ret.max()) / temp)
+    p = w / w.sum()
+    log(f"demonstration weights: exp(return / {temp:g}) -> effective {1.0 / (p ** 2).sum():.0f} of "
+        f"{len(demos)} demonstrations, weighted mean return {float((p * ret).sum()):.1f}", flush=True)
+    return p
+
+
 def add_returns(episodes, gamma):
     """Attach ``ret``: the discounted return-to-go the RECORDED behaviour collected from each frame.
 
@@ -126,7 +143,7 @@ def add_returns(episodes, gamma):
         ep["ret"] = g[:ep["z"].shape[0]] if len(g) >= ep["z"].shape[0] else np.pad(g, (0, ep["z"].shape[0] - len(g)))
 
 
-def sample_clips(episodes, ids, B, T, rng, device):
+def sample_clips(episodes, ids, B, T, rng, device, p=None):
     """``B`` context windows of ``T`` slots, each ending at a uniformly chosen frame.
 
     The window convention is :mod:`dreamer4.models.world_model`'s, and it is the same one imagination and
@@ -149,7 +166,7 @@ def sample_clips(episodes, ids, B, T, rng, device):
         that transition (both zero where ``valid_a`` is 0): the auxiliary forward model's input and
         target.
     """
-    pick = rng.choice(np.asarray(ids), size=B, replace=True)
+    pick = rng.choice(np.asarray(ids), size=B, replace=True, p=p)
     n_frames = np.array([episodes[int(i)]["z"].shape[0] for i in pick])
     ends = (rng.random(B) * n_frames).astype(np.int64).clip(max=n_frames - 1)
     slots = window_frames(ends, T)                                        # (B, T)
@@ -345,6 +362,9 @@ def parse_args():
     ap.add_argument("--bc_min_return", type=float, default=None,
                     help="clone only demonstrations whose recorded episode return reaches this "
                          "(episodes without a recorded return are kept). NOT in the paper")
+    ap.add_argument("--bc_return_temp", type=float, default=0.0,
+                    help="draw demonstrations in proportion to exp(return / T) instead of uniformly "
+                         "(0 = uniform). NOT in the paper")
     ap.add_argument("--reward_bins", type=int, default=255)
     ap.add_argument("--reward_bin_low", type=float, default=-1.0,
                     help="two-hot range in symlog space; must cover the environment's rewards")
@@ -555,12 +575,13 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
                     "clip_T": T, "dyn_source": cfg.dyn,
                     "train_cfg": vars(cfg), **extra}, path)
 
+    demo_p = demonstration_weights(episodes, demos, cfg.bc_return_temp)
     run = Run(cfg, world, out, writer)
     half = max(1, cfg.batch // 2)
     t_last = time.time()
     for s in range(1, cfg.steps + 1):
         # 50 % relevant (demonstrations), 50 % uniform -- paper Section 4.1.
-        rel = sample_clips(episodes, demos, half, T, rng, dev)
+        rel = sample_clips(episodes, demos, half, T, rng, dev, p=demo_p)
         uni = sample_clips(episodes, train_ids, cfg.batch - half, T, rng, dev)
         clip = {k: torch.cat([rel[k], uni[k]], 0) for k in rel}
         demo_mask = torch.cat([torch.ones(half, device=dev),
