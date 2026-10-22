@@ -77,14 +77,19 @@ def check_memory_budget(dataset, tokenizer, device, log=print):
             f"free on {device}: train on a subset of the episodes, or stream clips from CPU")
 
 
-def demonstration_ids(episodes, n_train, bc_frac, bc_seed, log=print):
+def demonstration_ids(episodes, n_train, bc_frac, bc_seed, log=print, min_return=None):
     """Which episodes may be imitated -- the DATASET's criterion, optionally thinned by ``bc_frac``.
 
-    ``bc_weight(i) > 0`` is the dataset's own judgement of what a demonstration is; the trainer
-    never inspects episode quality itself. The seeded subset exists because cloning every
-    demonstration can already solve an easy task outright and leave phase 3 nothing to improve.
+    ``bc_weight(i) > 0`` is the dataset's own judgement of what a demonstration is. The seeded
+    subset exists because cloning every demonstration can already solve an easy task outright and
+    leave phase 3 nothing to improve. ``min_return`` (NOT in the paper) keeps only demonstrations
+    whose recorded return reaches it -- on a dense-reward task, where every success counts as a
+    demonstration, this is what lets a collection round clone its FAST successes rather than all.
     """
     demos = [i for i in range(n_train) if episodes[i]["bc_weight"] > 0]
+    if min_return is not None:
+        demos = [i for i in demos
+                 if episodes[i].get("meta", {}).get("return", float("inf")) >= min_return]
     if bc_frac < 1.0:
         rng = np.random.default_rng(bc_seed)
         pick = rng.choice(len(demos), int(round(bc_frac * len(demos))), replace=False)
@@ -96,8 +101,11 @@ def demonstration_ids(episodes, n_train, bc_frac, bc_seed, log=print):
               for i in demos
               if episodes[i].get("meta", {}).get("optimal_steps", 0) > 0]
     quality = f" | their path / shortest: mean {np.mean(ratios):.3f}" if ratios else ""
-    log(f"demonstrations {len(demos)} of {n_train} training episodes (bc_frac {bc_frac})"
-        f"{quality}", flush=True)
+    returns = [episodes[i]["meta"]["return"] for i in demos if "return" in episodes[i].get("meta", {})]
+    if returns:
+        quality += f" | their return: mean {np.mean(returns):.1f}, min {np.min(returns):.1f}"
+    log(f"demonstrations {len(demos)} of {n_train} training episodes (bc_frac {bc_frac}"
+        f"{'' if min_return is None else f', min return {min_return:g}'}){quality}", flush=True)
     return demos
 
 
@@ -334,6 +342,9 @@ def parse_args():
     ap.add_argument("--bc_frac", type=float, default=1.0,
                     help="fraction of the dataset's demonstrations to clone")
     ap.add_argument("--bc_seed", type=int, default=0)
+    ap.add_argument("--bc_min_return", type=float, default=None,
+                    help="clone only demonstrations whose recorded episode return reaches this "
+                         "(episodes without a recorded return are kept). NOT in the paper")
     ap.add_argument("--reward_bins", type=int, default=255)
     ap.add_argument("--reward_bin_low", type=float, default=-1.0,
                     help="two-hot range in symlog space; must cover the environment's rewards")
@@ -671,7 +682,8 @@ def main():
     n_train = int(round(len(ds) * (1.0 - cfg.val_frac)))
     if cfg.value_weight > 0:
         add_returns(episodes, cfg.gamma)
-    demos = demonstration_ids(episodes, n_train, cfg.bc_frac, cfg.bc_seed)
+    demos = demonstration_ids(episodes, n_train, cfg.bc_frac, cfg.bc_seed,
+                              min_return=cfg.bc_min_return)
     print(f"data {world.data_path} encoded in {time.time() - t0:.0f}s | batch {cfg.batch}",
           flush=True)
 
