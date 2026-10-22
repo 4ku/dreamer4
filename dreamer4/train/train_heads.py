@@ -372,6 +372,11 @@ def parse_args():
                     help="continue from a phase-2 or phase-3 checkpoint: its finetuned transformer "
                          "and its heads replace the fresh ones (head-shape flags are ignored) -- the "
                          "world-model refresh of an online loop. NOT in the paper")
+    ap.add_argument("--dyn_online_frac", type=float, default=0.0,
+                    help="> 0: that fraction of the video-prediction windows comes from the episodes "
+                         "collected online (every data dir after the first) -- uniform sampling over a "
+                         "small new collection next to a large pretraining set replays each new "
+                         "transition ~0.1 times per refresh. NOT in the paper")
     ap.add_argument("--bc_last_part", type=int, default=0,
                     help="1: the demonstrations are ALL training episodes of the last data dir (the "
                          "newest collection, failures included), so the policy is distilled on its "
@@ -608,6 +613,13 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
         dyn_w = np.where(failed, cfg.dyn_fail_weight, 1.0)
         print(f"video prediction: {int(failed.sum())} of {n_train} episodes failed, sampled "
               f"x{cfg.dyn_fail_weight:g} -> {dyn_w[failed].sum() / dyn_w.sum():.0%} of the windows", flush=True)
+    parts = getattr(world.dataset, "parts", None) or [world.dataset]
+    online = np.arange(n_train) >= len(parts[0])
+    if cfg.dyn_online_frac > 0 and online.any() and not online.all():
+        w = np.where(online, cfg.dyn_online_frac / online.sum(), (1.0 - cfg.dyn_online_frac) / (~online).sum())
+        dyn_w = w if dyn_w is None else dyn_w * w
+        print(f"video prediction: {cfg.dyn_online_frac:.0%} of the windows from the {int(online.sum())} "
+              f"episodes collected online (data dirs after the first)", flush=True)
     run = Run(cfg, world, out, writer)
     half = max(1, cfg.batch // 2)
     t_last = time.time()

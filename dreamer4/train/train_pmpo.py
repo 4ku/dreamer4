@@ -71,11 +71,14 @@ class DemoStarts:
     here, and the actions are the recorded action VECTORS (one-hot or continuous alike).
     """
 
-    def __init__(self, episodes, *, window, rng=None):
+    def __init__(self, episodes, *, window, rng=None, online_from=None, online_frac=0.0):
+        """``online_frac`` > 0 draws that fraction of the starts from episodes ``online_from`` onwards
+        (the ones an online loop collected with recent policies), the rest from the earlier ones."""
         self.window = int(window)
         z, proprio, into, task, local = [], [], [], [], []
         offset = 0
-        for ep in episodes:
+        late = []
+        for e_idx, ep in enumerate(episodes):
             n = ep["z"].shape[0]
             # The last frame of an episode that ENDED is not a start: there is nothing left to do
             # from it.
@@ -91,6 +94,7 @@ class DemoStarts:
             # The paper's task indicator, recorded per episode by a multi-task collector.
             task.append(np.full(n, int(ep.get("meta", {}).get("task", 0)), np.int64))
             local.append((offset, keep))
+            late.append(online_from is not None and e_idx >= online_from)
             offset += n
         self.z = torch.cat(z)
         self.proprio = np.concatenate(proprio)
@@ -101,10 +105,14 @@ class DemoStarts:
         self.index = np.concatenate([np.arange(o, o + k) for o, k in local])
         self.base = np.concatenate([np.full(k, o) for o, k in local])
         self.rng = rng or np.random.default_rng(0)
+        self.p = None
+        is_late = np.concatenate([np.full(k, flag) for (o, k), flag in zip(local, late)])
+        if online_frac > 0 and is_late.any() and not is_late.all():
+            self.p = np.where(is_late, online_frac / is_late.sum(), (1.0 - online_frac) / (~is_late).sum())
 
     def sample(self, n):
         """``n`` contexts: their latents, proprio, aligned actions and task."""
-        pick = self.rng.choice(len(self.index), n)
+        pick = self.rng.choice(len(self.index), n, p=self.p)
         end = self.index[pick]
         base = self.base[pick]
         win = window_frames(end - base, self.window) + base.reshape(-1, 1)
@@ -419,6 +427,10 @@ def parse_args():
     ap.add_argument("--data", default="",
                     help="dataset dir(s), comma-separated, the dreams start from instead of the world "
                          "model's own -- e.g. its data plus episodes collected since. NOT in the paper")
+    ap.add_argument("--start_online_frac", type=float, default=0.0,
+                    help="> 0: that fraction of the dream starts comes from the episodes collected online "
+                         "(every --data dir after the first): the recent policies' own states. NOT in "
+                         "the paper")
     ap.add_argument("--real_env", type=int, default=0,
                     help="> 0: learn from that many REAL episodes per update instead of dreams -- the "
                          "same PMPO update and heads, model-free (the control for imagination)")
@@ -488,8 +500,10 @@ def main():
         print(f"REAL-ENV rollouts: {cfg.real_env} episodes of {cfg.horizon} steps per update "
               f"(no imagination)", flush=True)
     else:
+        parts = getattr(world.dataset, "parts", None) or [world.dataset]
         starts = DemoStarts(encode_episodes(world.tok, world.dataset, range(len(world.dataset))),
-                            window=agent.clip_T, rng=rng)
+                            window=agent.clip_T, rng=rng, online_from=len(parts[0]),
+                            online_frac=cfg.start_online_frac)
         print(f"dream starts: {len(starts.index)} contexts of {agent.clip_T} frames from "
               f"{world.data_path} | horizon {cfg.horizon}", flush=True)
     eval_envs = make_eval_envs(world.env_spec, cfg.eval_envs) if world.env_spec else []
