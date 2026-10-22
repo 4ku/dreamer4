@@ -416,6 +416,9 @@ def parse_args():
     ap.add_argument("--clip_split", type=int, default=0,
                     help="clip the policy and the value gradients separately, each at --grad_clip (jointly, "
                          "the value gradient dominates the norm and shrinks every policy step)")
+    ap.add_argument("--data", default="",
+                    help="dataset dir(s), comma-separated, the dreams start from instead of the world "
+                         "model's own -- e.g. its data plus episodes collected since. NOT in the paper")
     ap.add_argument("--real_env", type=int, default=0,
                     help="> 0: learn from that many REAL episodes per update instead of dreams -- the "
                          "same PMPO update and heads, model-free (the control for imagination)")
@@ -436,7 +439,8 @@ def parse_args():
 def load_agent(cfg, dev):
     """Open the phase-2 (or phase-3) checkpoint and rebuild the world model and heads from it."""
     ckpt = torch.load(cfg.init_from, map_location="cpu", weights_only=False)
-    world = WorldModel(cfg.dyn, device=cfg.device, n_agent=int(ckpt["n_agent"]))
+    world = WorldModel(cfg.dyn, device=cfg.device, n_agent=int(ckpt["n_agent"]),
+                       data=getattr(cfg, "data", "") or None)
     # The transformer phase 2 finetuned IS the world model from here on.
     world.load_dynamics_weights(ckpt["dyn"])
     world.dyn.eval()

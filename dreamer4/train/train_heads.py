@@ -365,6 +365,17 @@ def parse_args():
     ap.add_argument("--bc_return_temp", type=float, default=0.0,
                     help="draw demonstrations in proportion to exp(return / T) instead of uniformly "
                          "(0 = uniform). NOT in the paper")
+    ap.add_argument("--data", default="",
+                    help="dataset dir(s), comma-separated, instead of the world model's own -- e.g. "
+                         "its data plus episodes the policy collected since. NOT in the paper")
+    ap.add_argument("--init_from", default="",
+                    help="continue from a phase-2 or phase-3 checkpoint: its finetuned transformer "
+                         "and its heads replace the fresh ones (head-shape flags are ignored) -- the "
+                         "world-model refresh of an online loop. NOT in the paper")
+    ap.add_argument("--bc_last_part", type=int, default=0,
+                    help="1: the demonstrations are ALL training episodes of the last data dir (the "
+                         "newest collection, failures included), so the policy is distilled on its "
+                         "own behaviour while the transformer moves. NOT in the paper")
     ap.add_argument("--reward_bins", type=int, default=255)
     ap.add_argument("--reward_bin_low", type=float, default=-1.0,
                     help="two-hot range in symlog space; must cover the environment's rewards")
@@ -485,8 +496,9 @@ class Run:
               f"{wall / 60:.1f} min", flush=True)
 
 
-def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
-    """Phase 2 as the paper writes it: agent tokens, MTP heads, the transformer finetuned."""
+def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None):
+    """Phase 2 as the paper writes it: agent tokens, MTP heads, the transformer finetuned.
+    ``init`` (a phase-2/3 checkpoint) supplies the heads instead of fresh ones."""
     ds = world.dataset
     tasks = {int(ep.get("meta", {}).get("task", 0)) for ep in episodes}
     n_tasks = max(cfg.n_tasks, max(tasks) + 1)
@@ -497,7 +509,11 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
                  "reward_bin_high": cfg.reward_bin_high, "value_bins": cfg.reward_bins,
                  "value_bin_low": cfg.reward_bin_low,
                  "value_bin_high": cfg.value_bin_high or cfg.reward_bin_high}
+    if init is not None:
+        agent_cfg = dict(init["agent_cfg"])
     heads = build_agent_heads(agent_cfg).to(dev)
+    if init is not None:
+        heads.load_state_dict(init["agent"])
     T = cfg.clip_T
     print(pretty_agent_summary(heads) + f" | clip {T} slots | tasks {sorted(tasks)}", flush=True)
     print(f"dynamics {param_count(world.dyn) / 1e6:.2f}M finetuned at lr {cfg.dyn_lr:g}",
@@ -685,8 +701,15 @@ def main():
     out = Path(cfg.out)
     (out / "checkpoints").mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(out / "tb"), purge_step=0)
+    init = None
+    if cfg.init_from:
+        init = torch.load(cfg.init_from, map_location="cpu", weights_only=False)
+        cfg.n_agent, cfg.clip_T = int(init["n_agent"]), int(init["clip_T"])
     world = WorldModel(cfg.dyn, device=cfg.device, n_agent=cfg.n_agent,
-                             train=cfg.dyn_lr > 0)
+                             train=cfg.dyn_lr > 0, data=cfg.data or None)
+    if init is not None:
+        world.load_dynamics_weights(init["dyn"])
+        print(f"continuing from {cfg.init_from}: its transformer and heads", flush=True)
     ds = world.dataset
     if ds.proprio_dim is None:
         raise ValueError("this world model was trained without a proprio stream; the agent reads "
@@ -714,13 +737,22 @@ def main():
     n_train = int(round(len(ds) * (1.0 - cfg.val_frac)))
     if cfg.value_weight > 0:
         add_returns(episodes, cfg.gamma)
-    demos = demonstration_ids(episodes, n_train, cfg.bc_frac, cfg.bc_seed,
-                              min_return=cfg.bc_min_return)
+    if cfg.bc_last_part:
+        parts = getattr(ds, "parts", None) or [ds]
+        demos = list(range(len(ds) - len(parts[-1]), n_train))
+        if not demos:
+            raise ValueError("--bc_last_part: the last data dir has no training episode (it fell into "
+                             "the held-out tail; use --val_frac 0)")
+        print(f"demonstrations: all {len(demos)} training episodes of the last data dir "
+              f"(distillation of the policy that collected them)", flush=True)
+    else:
+        demos = demonstration_ids(episodes, n_train, cfg.bc_frac, cfg.bc_seed,
+                                  min_return=cfg.bc_min_return)
     print(f"data {world.data_path} encoded in {time.time() - t0:.0f}s | batch {cfg.batch}",
           flush=True)
 
     rng = np.random.default_rng(cfg.seed)
-    train(cfg, world, out, writer, episodes, demos, n_train, dev, rng)
+    train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=init)
     writer.close()
 
 

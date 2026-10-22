@@ -53,9 +53,12 @@ class WorldModel:
             column. The state dict therefore still loads strictly.
         train: leave the dynamics parameters trainable. Phase 2 finetunes the transformer, so it
             asks for this; phases 3 and the evaluators do not.
+        data:  dataset dir(s), comma-separated, instead of the one the checkpoint was trained on
+            (e.g. that data plus episodes collected since). The first dir's conventions (cameras,
+            proprio standardisation) must match the checkpoint's.
     """
 
-    def __init__(self, path, device="cuda", *, n_agent=0, train=False):
+    def __init__(self, path, device="cuda", *, n_agent=0, train=False, data=None):
         dyn, ckpt = load_dynamics_checkpoint(path, device=device)
         config, meta = ckpt["config"], ckpt["latent_meta"]
         tok = config["tokenizer"]
@@ -68,7 +71,7 @@ class WorldModel:
                 p.requires_grad_(False)
         self.tok = FrozenTokenizer(tok["ckpt"], history=tok["history"], pack_k=tok["pack_k"],
                                    decoder_ckpt=(tok["decoder_ckpt"] or None), device=device)
-        self.data_path = config["data"]["path"]
+        self.data_path = data or config["data"]["path"]
         self.dataset = open_video_dataset(self.data_path, proprio=config["data"]["proprio"],
                                           actions=True)
         self.env_spec = self.dataset.env_spec()                  # None for offline-only datasets
