@@ -372,6 +372,10 @@ def parse_args():
                     help="continue from a phase-2 or phase-3 checkpoint: its finetuned transformer "
                          "and its heads replace the fresh ones (head-shape flags are ignored) -- the "
                          "world-model refresh of an online loop. NOT in the paper")
+    ap.add_argument("--bc_online_top", type=float, default=0.0,
+                    help="> 0: the demonstrations are the online episodes (data dirs after the first) in "
+                         "the top fraction by recorded return -- self-imitation of the policies' best "
+                         "real episodes, with no task-specific threshold. NOT in the paper")
     ap.add_argument("--dyn_online_frac", type=float, default=0.0,
                     help="> 0: that fraction of the video-prediction windows comes from the episodes "
                          "collected online (every data dir after the first) -- uniform sampling over a "
@@ -762,6 +766,16 @@ def main():
                              "the held-out tail; use --val_frac 0)")
         print(f"demonstrations: all {len(demos)} training episodes of the last data dir "
               f"(distillation of the policy that collected them)", flush=True)
+    elif cfg.bc_online_top > 0:
+        parts = getattr(ds, "parts", None) or [ds]
+        online = list(range(len(parts[0]), n_train))
+        if not online:
+            raise ValueError("--bc_online_top: no online data dir (dirs after the first) in training")
+        rets = np.array([episodes[i].get("meta", {}).get("return", -np.inf) for i in online])
+        thr = np.quantile(rets, 1.0 - cfg.bc_online_top)
+        demos = [i for i, r in zip(online, rets) if r >= thr]
+        print(f"demonstrations: the top {cfg.bc_online_top:.0%} of the {len(online)} online episodes by return "
+              f"({len(demos)}, return >= {thr:.1f}; self-imitation)", flush=True)
     else:
         demos = demonstration_ids(episodes, n_train, cfg.bc_frac, cfg.bc_seed,
                                   min_return=cfg.bc_min_return)
