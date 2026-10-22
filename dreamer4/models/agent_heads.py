@@ -199,9 +199,11 @@ class PolicyHead(nn.Module):
         return self._joint(self.dist(logits).entropy())
 
     def kl(self, logits_p: torch.Tensor, logits_q: torch.Tensor) -> torch.Tensor:
-        """``KL(pi_p || pi_q)`` per step."""
-        return self._joint(torch.distributions.kl_divergence(self.dist(logits_p),
-                                                             self.dist(logits_q)))
+        """``KL(pi_p || pi_q)`` per step, from the normalised log-probabilities.
+        ``torch.distributions.kl_divergence`` returns inf wherever ``pi_q`` underflows to zero in
+        float32 and drops that bin's gradient (real-env PMPO on AlohaPick logged an inf KL)."""
+        lp, lq = self.dist(logits_p).logits, self.dist(logits_q).logits
+        return self._joint((lp.exp() * (lp - lq)).sum(-1))
 
     def action_vector(self, codes: torch.Tensor) -> torch.Tensor:
         """Codes -> the action vector the world model and the env take (one-hot, or bin values)."""
