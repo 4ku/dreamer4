@@ -299,6 +299,44 @@ class Imagination:
         H[:, t + 1:] = H[:, t:t + 1]                  # freeze the tail of finished episodes
         return tape.finish({"H": H})
 
+    @torch.no_grad()
+    def real_rollout(self, env, *, seed):
+        """One batch of REAL episodes played with the current (sampled) policy -- what the same PMPO
+        update learns from in ``--real_env`` mode, the model-free control for imagination: every state,
+        action and reward is the environment's. Episodes all run to the time limit, where the λ-return
+        bootstraps from the value, as a dream does at its horizon. Same keys as :meth:`rollout`."""
+        world, heads, dev = self.world, self.heads, self.device
+        policy = self.eval_policy()
+        hist, B, steps = world.tok.history, env.n, env.max_steps
+        frames, infos = env.reset([seed + i for i in range(B)])
+        window = [[f] * hist for f in frames]
+        policy.reset_rows(None)
+        H = torch.zeros(B, steps + 1, self.d_in, device=dev)
+        code_shape = (heads.policy.n_actions,) if heads.policy.bins else ()
+        actions = torch.zeros(B, steps, *code_shape, dtype=torch.long, device=dev)
+        rewards = torch.zeros(B, steps, device=dev)
+        prev = None
+        for t in range(steps + 1):
+            z = world.tok.encode_last(np.stack([np.stack(w[-hist:]) for w in window])).float().to(dev)
+            pr = torch.as_tensor(np.stack([world.proprio_from_info(i) for i in infos]),
+                                 dtype=torch.float32, device=dev)
+            policy.observe(z, pr, prev)
+            h = policy.h().float()
+            H[:, t] = h
+            if t == steps:
+                break
+            a = heads.policy.sample(heads.policy.at(h, 0))
+            actions[:, t] = a
+            prev = a
+            frames, r, _, infos = env.step(policy.env_action(a))
+            rewards[:, t] = torch.as_tensor(np.array(r, np.float32), device=dev)
+            for w, f in zip(window, frames):
+                w.append(f)
+        ones = torch.ones(B, steps + 1, device=dev)
+        return {"H": H, "actions": actions, "rewards": rewards, "continues": ones, "alive": ones.clone(),
+                "terminated": torch.zeros(B, dtype=torch.bool, device=dev),
+                "success": float(np.mean([i["is_success"] for i in infos]))}
+
     def score(self, roll):
         """Policy logits, the value distribution and its decoded mean -- all with gradients."""
         h = roll["H"]
@@ -378,6 +416,9 @@ def parse_args():
     ap.add_argument("--clip_split", type=int, default=0,
                     help="clip the policy and the value gradients separately, each at --grad_clip (jointly, "
                          "the value gradient dominates the norm and shrinks every policy step)")
+    ap.add_argument("--real_env", type=int, default=0,
+                    help="> 0: learn from that many REAL episodes per update instead of dreams -- the "
+                         "same PMPO update and heads, model-free (the control for imagination)")
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--eval_n", type=int, default=1000)
     ap.add_argument("--eval_seed", type=int, default=31337,
@@ -435,10 +476,18 @@ def main():
     base_lrs = [cfg.lr, cfg.value_lr]
 
     rng = np.random.default_rng(cfg.seed)
-    starts = DemoStarts(encode_episodes(world.tok, world.dataset, range(len(world.dataset))),
-                        window=agent.clip_T, rng=rng)
-    print(f"dream starts: {len(starts.index)} contexts of {agent.clip_T} frames from "
-          f"{world.data_path} | horizon {cfg.horizon}", flush=True)
+    real_env, starts = None, None
+    if cfg.real_env > 0:
+        # Model-free control: real episodes instead of dreams, seeds clear of every evaluation's.
+        real_env = make_eval_envs(world.env_spec, cfg.real_env)
+        cfg.horizon = real_env.max_steps
+        print(f"REAL-ENV rollouts: {cfg.real_env} episodes of {cfg.horizon} steps per update "
+              f"(no imagination)", flush=True)
+    else:
+        starts = DemoStarts(encode_episodes(world.tok, world.dataset, range(len(world.dataset))),
+                            window=agent.clip_T, rng=rng)
+        print(f"dream starts: {len(starts.index)} contexts of {agent.clip_T} frames from "
+              f"{world.data_path} | horizon {cfg.horizon}", flush=True)
     eval_envs = make_eval_envs(world.env_spec, cfg.eval_envs) if world.env_spec else []
     if not eval_envs:
         print("no env_spec in this dataset: real-env evaluation is skipped and no best.pt is "
@@ -455,7 +504,7 @@ def main():
                 "dreams": "dream/imagined_episodes", "it_s": "train/steps_per_sec_cumulative"}
     t_last = s_last = None
 
-    B, H = cfg.batch, cfg.horizon
+    B, H = (cfg.real_env or cfg.batch), cfg.horizon
     # best starts BELOW every reachable success rate, so a policy that never succeeds still writes
     # best.pt and the script's resume check cannot mark the phase done with a missing artifact.
     collected, best = 0, -1.0
@@ -467,9 +516,12 @@ def main():
         for group, lr0 in zip(opt.param_groups, base_lrs):
             group["lr"] = lr0 * (1.0 - frac) + cfg.lr_final * frac
 
-        # On-policy: one fresh batch of dreams per update.
+        # On-policy: one fresh batch of dreams (or real episodes) per update.
         with torch.autocast("cuda", torch.bfloat16, enabled=bool(cfg.amp)):
-            roll = agent.rollout(starts.sample(B), horizon=H, K=cfg.K, term_prob=cfg.term_prob)
+            if real_env is not None:
+                roll = agent.real_rollout(real_env, seed=10_000_000 + step * real_env.n)
+            else:
+                roll = agent.rollout(starts.sample(B), horizon=H, K=cfg.K, term_prob=cfg.term_prob)
         collected += 1
 
         alive = roll["alive"]
@@ -529,7 +581,8 @@ def main():
                 writer.add_scalar("train/steps_per_sec_inst", (step - s_last) / (now - t_last), step)
             t_last, s_last = now, step
             print(f"[{time.strftime('%H:%M:%S')}] step {step}/{cfg.steps} "
-                  f"dreamSR {roll['success']:.2f} dreamR {rec['dream_return']:.2f} "
+                  f"{'real' if real_env is not None else 'dream'}SR {roll['success']:.2f} "
+                  f"{'real' if real_env is not None else 'dream'}R {rec['dream_return']:.2f} "
                   f"vloss {rec['value_loss']:.4f} "
                   f"H {pinfo['entropy']:.2f} kl {pinfo['kl_to_prior']:.3f} "
                   f"gn {float(gn):.1f} {rec['it_s']:.2f}it/s", flush=True)
