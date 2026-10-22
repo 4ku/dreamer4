@@ -550,9 +550,14 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
     # Cosine decay for both groups; the transformer's rate additionally ramps in over
     # --dyn_warmup steps. At step 1 the heads are random, so the gradient they send into the
     # shared weights is noise with respect to everything the world model knows.
-    lambdas = [cosine]
+    def warm(s):
+        return cosine(s) * min(1.0, (s + 1) / max(1, cfg.dyn_warmup))
+
+    # Continuing trained heads (--init_from), their fresh Adam state makes the first steps full-size
+    # jolts too: they ramp in with the transformer.
+    lambdas = [warm if init is not None else cosine]
     if cfg.dyn_lr > 0:
-        lambdas.append(lambda s: cosine(s) * min(1.0, (s + 1) / max(1, cfg.dyn_warmup)))
+        lambdas.append(warm)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambdas)
     # Paper Section 3: "we normalize all loss terms by running estimates of their root-mean-square
     # (RMS)". Order fixes the normaliser slots, so it must stay stable across a resume.
