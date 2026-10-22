@@ -25,6 +25,9 @@ def read_msg(stream):
     if len(head) < 8:
         return None
     (n,) = struct.unpack("<Q", head)
+    if n > 1 << 31:
+        raise RuntimeError(f"AlohaPick worker protocol out of sync (message length {n}): something "
+                           f"other than the protocol wrote to the stream")
     return pickle.loads(stream.read(n))
 
 
@@ -36,6 +39,12 @@ def write_msg(stream, obj):
 
 
 def main():
+    # The protocol owns the real stdout. Keep a private copy of it and point fd 1 at stderr BEFORE any
+    # library loads, so nothing they print -- from Python or from C (XLA, warp) -- lands in the message
+    # stream; a stray line there once desynchronised the parent mid-evaluation.
+    outp = os.fdopen(os.dup(1), "wb")
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
     nworld, res, cameras = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].split(",")
     import jax
     import jax.numpy as jp
@@ -54,8 +63,7 @@ def main():
             out[c] = u8(state.obs[f"pixels/{c}"])
         return out
 
-    inp, outp = sys.stdin.buffer, sys.stdout.buffer
-    sys.stdout = sys.stderr                     # nothing else may write to the protocol stream
+    inp = sys.stdin.buffer
     state = None
     while True:
         msg = read_msg(inp)
