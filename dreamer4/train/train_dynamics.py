@@ -327,7 +327,8 @@ def encode_episodes(tokenizer: FrozenTokenizer, dataset: EpisodeVideoDataset,
 def sample_windows(episodes: List[dict], B: int, T: int,
                    rng: np.random.Generator, device: torch.device, *,
                    start_only: bool = False, skip_terminal: bool = False,
-                   with_video: bool = False, replace: bool = True) -> Dict[str, torch.Tensor]:
+                   with_video: bool = False, replace: bool = True,
+                   weights=None) -> Dict[str, torch.Tensor]:
     """
     Draw B random length-T windows from the latent cache.
 
@@ -345,6 +346,8 @@ def sample_windows(episodes: List[dict], B: int, T: int,
         replace:    Sample episodes with replacement. With False the batch is
                     capped at the number of eligible episodes, which keeps a
                     validation batch free of duplicates.
+        weights:    Per-episode sampling weights aligned with ``episodes``
+                    (with ``replace`` only); None draws episodes uniformly.
 
     Returns:
         {"z": (B, T, Nz, Dz) float32 on device, "actions": (B, T-1, Da),
@@ -354,12 +357,17 @@ def sample_windows(episodes: List[dict], B: int, T: int,
         return bool(skip_terminal and "terminals" in e and len(e["terminals"])
                     and e["terminals"][-1])
 
-    eligible = [e for e in episodes if e["z"].shape[0] - ends_terminal(e) >= T]
+    keep = [i for i, e in enumerate(episodes) if e["z"].shape[0] - ends_terminal(e) >= T]
+    eligible = [episodes[i] for i in keep]
     if not eligible:
         raise ValueError(f"no episode has >= {T} frames")
     if not replace and len(eligible) < B:
         B = len(eligible)
-    picks = (rng.choice(len(eligible), size=B, replace=replace)
+    p = None
+    if weights is not None:
+        p = np.asarray(weights, np.float64)[keep]
+        p = p / p.sum()
+    picks = (rng.choice(len(eligible), size=B, replace=replace, p=p)
              if replace else rng.permutation(len(eligible))[:B])
     zs, acts, props, vids = [], [], [], []
     for j in picks:

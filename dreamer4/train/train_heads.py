@@ -409,6 +409,11 @@ def parse_args():
                          "the rarest physics: a dreamed player then walks through a wall after ONE "
                          "push in 2.5-4 %% of wall bumps (phase 1b: 0.4 %%); at 3 it stays at 1 %% "
                          "with the cloning result unchanged, at 10 cloning suffers")
+    ap.add_argument("--dyn_fail_weight", type=float, default=1.0,
+                    help="sampling weight of FAILED episodes (manifest success false) in the video-"
+                         "prediction windows; > 1 oversamples them. On AlohaPick (~10 %% failures per "
+                         "policy round) a dream started before the grasp drifts to the common outcome "
+                         "and turns half of the real failures into successes")
     ap.add_argument("--boot_frac", type=float, default=0.0,
                     help="bootstrap fraction of each video-prediction batch (0.5 at the end of "
                          "phase 1b). 0: at --dyn_lr 2e-4 the self-distillation term destroys the "
@@ -576,6 +581,12 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
                     "train_cfg": vars(cfg), **extra}, path)
 
     demo_p = demonstration_weights(episodes, demos, cfg.bc_return_temp)
+    dyn_w = None
+    if cfg.dyn_fail_weight != 1.0:
+        failed = np.array([not e.get("meta", {}).get("success", True) for e in episodes[:n_train]])
+        dyn_w = np.where(failed, cfg.dyn_fail_weight, 1.0)
+        print(f"video prediction: {int(failed.sum())} of {n_train} episodes failed, sampled "
+              f"x{cfg.dyn_fail_weight:g} -> {dyn_w[failed].sum() / dyn_w.sum():.0%} of the windows", flush=True)
     run = Run(cfg, world, out, writer)
     half = max(1, cfg.batch // 2)
     t_last = time.time()
@@ -607,7 +618,7 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng):
                 image_batch = rng.random() < cfg.image_batch_prob
                 T_dyn = 1 if image_batch else world.window
                 batch = sample_windows(episodes[:n_train], cfg.dyn_batch, T_dyn, rng, dev,
-                                       skip_terminal=image_batch)
+                                       skip_terminal=image_batch, weights=dyn_w)
                 do_sched = (not image_batch
                             and rng.random() < float(obj.get("sched_sample_prob", 0.0)))
                 dyn_terms, dyn_aux = clean_context_loss(
