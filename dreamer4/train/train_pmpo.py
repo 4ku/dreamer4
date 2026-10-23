@@ -48,6 +48,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from dreamer4.agent_eval import evaluate, make_eval_envs
+from dreamer4.data import open_video_dataset
 from dreamer4.models.agent_heads import build_agent_heads, terminal_bins
 from dreamer4.models.world_model import (AgentPolicy, WorldModel, dream_context,
                                          dream_step, window_frames)
@@ -345,6 +346,34 @@ class Imagination:
                 "terminated": torch.zeros(B, dtype=torch.bool, device=dev),
                 "success": float(np.mean([i["is_success"] for i in infos]))}
 
+    @torch.no_grad()
+    def recorded_rollout(self, episodes):
+        """RECORDED episodes of a recent policy as a PMPO batch: h_t from the frozen transformer reading the
+        recorded frames as the policy read them while playing, the recorded actions as codes, the real
+        rewards. The newest collection of an online loop is (nearly) on-policy, and its failures carry
+        their true, low return -- the signal the dreams of a failure miss. Same keys as :meth:`rollout`."""
+        heads, dev = self.heads, self.device
+        policy = self.eval_policy()
+        B, steps = len(episodes), min(e["z"].shape[0] for e in episodes) - 1
+        H = torch.zeros(B, steps + 1, self.d_in, device=dev)
+        vec = torch.as_tensor(np.stack([e["actions"][:steps] for e in episodes]), dtype=torch.float32, device=dev)
+        actions = heads.policy.encode(vec)
+        rewards = torch.as_tensor(np.stack([e["rewards"][:steps] for e in episodes]), dtype=torch.float32,
+                                  device=dev)
+        policy.reset_rows(None)
+        prev = None
+        for t in range(steps + 1):
+            z = torch.stack([e["z"][t] for e in episodes]).float().to(dev)
+            pr = torch.as_tensor(np.stack([e["proprio"][t] for e in episodes]), dtype=torch.float32, device=dev)
+            policy.observe(z, pr, prev)
+            H[:, t] = policy.h().float()
+            if t < steps:
+                prev = actions[:, t]
+        ones = torch.ones(B, steps + 1, device=dev)
+        return {"H": H, "actions": actions, "rewards": rewards, "continues": ones, "alive": ones.clone(),
+                "terminated": torch.zeros(B, dtype=torch.bool, device=dev),
+                "success": float(np.mean([e.get("meta", {}).get("success", False) for e in episodes]))}
+
     def score(self, roll):
         """Policy logits, the value distribution and its decoded mean -- all with gradients."""
         h = roll["H"]
@@ -427,6 +456,11 @@ def parse_args():
     ap.add_argument("--data", default="",
                     help="dataset dir(s), comma-separated, the dreams start from instead of the world "
                          "model's own -- e.g. its data plus episodes collected since. NOT in the paper")
+    ap.add_argument("--real_data", default="",
+                    help="dataset dir of episodes a recent policy recorded (e.g. an online loop's newest "
+                         "collection): every --real_every-th update learns from them instead of a dream "
+                         "batch. NOT in the paper")
+    ap.add_argument("--real_every", type=int, default=5)
     ap.add_argument("--start_online_frac", type=float, default=0.0,
                     help="> 0: that fraction of the dream starts comes from the episodes collected online "
                          "(every --data dir after the first): the recent policies' own states. NOT in "
@@ -506,6 +540,13 @@ def main():
                             online_frac=cfg.start_online_frac)
         print(f"dream starts: {len(starts.index)} contexts of {agent.clip_T} frames from "
               f"{world.data_path} | horizon {cfg.horizon}", flush=True)
+    recorded = None
+    if cfg.real_data:
+        rds = open_video_dataset(cfg.real_data, proprio=world.proprio_mode, actions=True)
+        with torch.autocast("cuda", torch.bfloat16, enabled=bool(cfg.amp)):
+            recorded = agent.recorded_rollout(encode_episodes(world.tok, rds, range(len(rds))))
+        print(f"recorded batch: {len(rds)} episodes of {cfg.real_data} (success {recorded['success']:.2f}), "
+              f"every {cfg.real_every}th update", flush=True)
     eval_envs = make_eval_envs(world.env_spec, cfg.eval_envs) if world.env_spec else []
     if not eval_envs:
         print("no env_spec in this dataset: real-env evaluation is skipped and no best.pt is "
@@ -538,11 +579,14 @@ def main():
         with torch.autocast("cuda", torch.bfloat16, enabled=bool(cfg.amp)):
             if real_env is not None:
                 roll = agent.real_rollout(real_env, seed=10_000_000 + step * real_env.n)
+            elif recorded is not None and step % cfg.real_every == cfg.real_every - 1:
+                roll = recorded
             else:
                 roll = agent.rollout(starts.sample(B), horizon=H, K=cfg.K, term_prob=cfg.term_prob)
         collected += 1
 
         alive = roll["alive"]
+        Hr = roll["actions"].shape[1]          # the batch's own horizon (a recorded batch is longer)
         with torch.autocast("cuda", torch.bfloat16, enabled=bool(cfg.amp)):
             lg, vlogits, v = agent.score(roll)
         rewards_in = torch.cat([roll["rewards"], torch.zeros_like(roll["rewards"][:, :1])], 1)
@@ -552,7 +596,7 @@ def main():
         value_loss = agent.value_loss(vlogits, targets, alive)
 
         # PMPO (Eq. 11): sign-of-advantage policy term plus the reverse KL to the frozen prior.
-        adv = targets[:, :H] - v.detach()[:, :H]
+        adv = targets[:, :Hr] - v.detach()[:, :Hr]
         # States the policy really ACTED from. The frame a dream ends on is occupied (its value,
         # zero, is a legitimate critic target) but nothing is done from it: the action the rollout
         # samples there is never executed, and its advantage is just -v(terminal). Eq. 11 only uses
@@ -560,16 +604,16 @@ def main():
         # real action up or down at full weight -- in features that sit next to those of the
         # states adjacent to the goal, which is where the damage showed (greedy success 1.000 ->
         # 0.988 on the empty maze, every failure a loop one or two cells from the goal).
-        keep = (alive[:, :H] > 0) & (roll["continues"][:, :H] > 0)
+        keep = (alive[:, :Hr] > 0) & (roll["continues"][:, :Hr] > 0)
         drop = cfg.adv_drop_frac
         if cfg.adv_drop_final >= 0:
             drop += (cfg.adv_drop_final - drop) * min(1.0, step / max(1, cfg.adv_drop_steps))
         coeff, pinfo = pmpo_coeffs(adv[keep], alpha=cfg.alpha, drop_frac=drop)
         pol = agent.heads.policy
-        lp = pol.log_prob(lg[:, :H], roll["actions"])[keep]
+        lp = pol.log_prob(lg[:, :Hr], roll["actions"])[keep]
         with torch.no_grad():
-            plg = agent.prior_logits(roll, H)
-        kl = pol.kl(lg[:, :H], plg)[keep]
+            plg = agent.prior_logits(roll, Hr)
+        kl = pol.kl(lg[:, :Hr], plg)[keep]
         loss = cfg.value_weight * value_loss + (coeff * lp).sum() + cfg.beta * kl.mean()
 
         opt.zero_grad(set_to_none=True)

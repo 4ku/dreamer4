@@ -72,8 +72,8 @@ class WorldModel:
         self.tok = FrozenTokenizer(tok["ckpt"], history=tok["history"], pack_k=tok["pack_k"],
                                    decoder_ckpt=(tok["decoder_ckpt"] or None), device=device)
         self.data_path = data or config["data"]["path"]
-        self.dataset = open_video_dataset(self.data_path, proprio=config["data"]["proprio"],
-                                          actions=True)
+        self.proprio_mode = config["data"]["proprio"]
+        self.dataset = open_video_dataset(self.data_path, proprio=self.proprio_mode, actions=True)
         self.env_spec = self.dataset.env_spec()                  # None for offline-only datasets
         self.continues_from_reward = self.dataset.continues_from_reward   # the terminal rule
         self.proprio_from_info = self.dataset.proprio_from_info  # live env state -> proprio vector
