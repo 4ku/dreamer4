@@ -486,6 +486,11 @@ def parse_args():
                          "really met); --steps counts both kinds of update. NOT in the paper")
     ap.add_argument("--dream_horizon", type=int, default=32,
                     help="imagined steps of the --dream_per_real dreams (dreams stay faithful for ~40 steps)")
+    ap.add_argument("--epochs", type=int, default=1,
+                    help="with --real_env: updates per real batch (the PPO-style reuse of an expensive batch); "
+                         "NOT in the paper")
+    ap.add_argument("--kl_old", type=float, default=1.0,
+                    help="weight of KL(batch policy || policy) on the 2nd and later --epochs updates of a batch")
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--eval_n", type=int, default=1000)
     ap.add_argument("--eval_seed", type=int, default=31337,
@@ -619,16 +624,8 @@ def main():
 
         alive = roll["alive"]
         Hr = roll["actions"].shape[1]          # the batch's own horizon (a recorded batch is longer)
-        with torch.autocast("cuda", torch.bfloat16, enabled=bool(cfg.amp)):
-            lg, vlogits, v = agent.score(roll)
         rewards_in = torch.cat([roll["rewards"], torch.zeros_like(roll["rewards"][:, :1])], 1)
         gates_in = torch.cat([roll["continues"][:, 1:], torch.ones_like(roll["continues"][:, :1])], 1)
-        targets = compute_lambda_returns(rewards_in, v.detach(), gates_in, gamma=cfg.gamma,
-                                         lam=cfg.lam)
-        value_loss = agent.value_loss(vlogits, targets, alive)
-
-        # PMPO (Eq. 11): sign-of-advantage policy term plus the reverse KL to the frozen prior.
-        adv = targets[:, :Hr] - v.detach()[:, :Hr]
         # States the policy really ACTED from. The frame a dream ends on is occupied (its value,
         # zero, is a legitimate critic target) but nothing is done from it: the action the rollout
         # samples there is never executed, and its advantage is just -v(terminal). Eq. 11 only uses
@@ -640,22 +637,39 @@ def main():
         drop = cfg.adv_drop_frac
         if cfg.adv_drop_final >= 0:
             drop += (cfg.adv_drop_final - drop) * min(1.0, step / max(1, cfg.adv_drop_steps))
-        coeff, pinfo = pmpo_coeffs(adv[keep], alpha=cfg.alpha, drop_frac=drop)
         pol = agent.heads.policy
-        lp = pol.log_prob(lg[:, :Hr], roll["actions"])[keep]
         with torch.no_grad():
             plg = agent.prior_logits(roll, Hr)
-        kl = pol.kl(lg[:, :Hr], plg)[keep]
-        loss = cfg.value_weight * value_loss + (coeff * lp).sum() + cfg.beta * kl.mean()
 
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        if cfg.clip_split:
-            gn = torch.nn.utils.clip_grad_norm_(agent.policy_params, cfg.grad_clip)
-            torch.nn.utils.clip_grad_norm_(agent.value_params, cfg.grad_clip)
-        else:
-            gn = torch.nn.utils.clip_grad_norm_(agent.policy_params + agent.value_params, cfg.grad_clip)
-        opt.step()
+        # --epochs > 1 (real batches only): several updates on one batch, each later one held near the
+        # policy that played it by a KL of weight --kl_old.
+        old_lg = None
+        for _ in range(cfg.epochs if is_real else 1):
+            with torch.autocast("cuda", torch.bfloat16, enabled=bool(cfg.amp)):
+                lg, vlogits, v = agent.score(roll)
+            targets = compute_lambda_returns(rewards_in, v.detach(), gates_in, gamma=cfg.gamma,
+                                             lam=cfg.lam)
+            value_loss = agent.value_loss(vlogits, targets, alive)
+
+            # PMPO (Eq. 11): sign-of-advantage policy term plus the reverse KL to the frozen prior.
+            adv = targets[:, :Hr] - v.detach()[:, :Hr]
+            coeff, pinfo = pmpo_coeffs(adv[keep], alpha=cfg.alpha, drop_frac=drop)
+            lp = pol.log_prob(lg[:, :Hr], roll["actions"])[keep]
+            kl = pol.kl(lg[:, :Hr], plg)[keep]
+            loss = cfg.value_weight * value_loss + (coeff * lp).sum() + cfg.beta * kl.mean()
+            if old_lg is None:
+                old_lg = lg[:, :Hr].detach()
+            else:
+                loss = loss + cfg.kl_old * pol.kl(old_lg, lg[:, :Hr])[keep].mean()
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if cfg.clip_split:
+                gn = torch.nn.utils.clip_grad_norm_(agent.policy_params, cfg.grad_clip)
+                torch.nn.utils.clip_grad_norm_(agent.value_params, cfg.grad_clip)
+            else:
+                gn = torch.nn.utils.clip_grad_norm_(agent.policy_params + agent.value_params, cfg.grad_clip)
+            opt.step()
 
         if do_log:
             pinfo["entropy"] = float(pol.entropy(lg[:, :Hr])[keep].mean().detach())
