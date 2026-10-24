@@ -193,6 +193,12 @@ class Imagination:
         self.bins = heads.reward.twohot.bin_values.detach().to(device)
         self.term_bin = terminal_bins(heads.reward, world.continues_from_reward, device)
         self.prior = copy.deepcopy(heads.policy).eval()
+        if getattr(cfg, "prior_from", ""):
+            # A FIXED behavioural prior (e.g. the phase-2 clone) instead of the warm-start policy: an online
+            # loop warm-starts every PMPO stage from its newest policy, and a prior that moves with it lets the
+            # entropy collapse round after round.
+            agent = torch.load(cfg.prior_from, map_location="cpu", weights_only=False)["agent"]
+            self.prior.load_state_dict({k[len("policy."):]: v for k, v in agent.items() if k.startswith("policy.")})
         for p in self.prior.parameters():
             p.requires_grad_(False)
         # Only the policy and the value head move (Section 3.3). The agent-token encoder is an
@@ -422,6 +428,9 @@ def parse_args():
                     help="phase-1 dynamics checkpoint: it names the dataset and the tokenizer")
     ap.add_argument("--init_from", required=True,
                     help="phase-2 checkpoint: warm start, KL prior and the frozen reward head")
+    ap.add_argument("--prior_from", default="",
+                    help="take the KL prior's policy from THIS checkpoint instead (e.g. the phase-2 clone, fixed across "
+                         "an online loop's PMPO stages)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--batch", type=int, default=256,
@@ -542,7 +551,7 @@ def main():
     json.dump({**vars(cfg), "data": world.data_path}, open(out / "config.json", "w"), indent=1)
     if cfg.compile:
         world.dyn = torch.compile(world.dyn, dynamic=True)
-    print(f"warm start + KL prior from {cfg.init_from}", flush=True)
+    print(f"warm start from {cfg.init_from}, KL prior from {cfg.prior_from or cfg.init_from}", flush=True)
 
     opt = torch.optim.AdamW([{"params": agent.policy_params, "lr": cfg.lr},
                              {"params": agent.value_params, "lr": cfg.value_lr}], weight_decay=0.0)

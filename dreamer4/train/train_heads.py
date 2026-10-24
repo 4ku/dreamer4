@@ -356,6 +356,10 @@ def parse_args():
                     help="discount of the recorded returns for --value_weight; use phase 3's")
     ap.add_argument("--val_frac", type=float, default=0.05,
                     help="last fraction of the episodes, held out for the agent metrics")
+    ap.add_argument("--bc_loss_weight", type=float, default=1.0,
+                    help="weight of the cloning loss among the RMS-normalised terms (an online loop's refresh only "
+                         "needs the policy to follow the finetuned transformer; heavy cloning sharpens it). NOT in "
+                         "the paper")
     ap.add_argument("--bc_frac", type=float, default=1.0,
                     help="fraction of the dataset's demonstrations to clone")
     ap.add_argument("--bc_seed", type=int, default=0)
@@ -570,7 +574,7 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambdas)
     # Paper Section 3: "we normalize all loss terms by running estimates of their root-mean-square
     # (RMS)". Order fixes the normaliser slots, so it must stay stable across a resume.
-    combiner = LossCombiner({"policy": 1.0, "reward": cfg.reward_weight,
+    combiner = LossCombiner({"policy": cfg.bc_loss_weight, "reward": cfg.reward_weight,
                              "flow": cfg.dyn_weight, "proprio": cfg.dyn_weight * 0.3,
                              "bootstrap": cfg.dyn_weight * 0.5, "value": cfg.value_weight,
                              "forward": cfg.fwd_weight},

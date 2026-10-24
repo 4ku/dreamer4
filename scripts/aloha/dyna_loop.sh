@@ -27,6 +27,9 @@ BC_TOP=${BC_TOP:-}                         # refresh cloning: empty = distil the
 if [ -n "$BC_TOP" ]; then BCARGS="--bc_online_top $BC_TOP"; else BCARGS="--bc_last_part 1"; fi
 REAL_EVERY=${REAL_EVERY:-}                 # N: every N-th PMPO update learns from the previous collection
 COLLECT_T=${COLLECT_T:-1.0}                # sampling temperature of the real collections (> 1: more varied)
+PRIOR=${PRIOR:-}                           # FIXED KL-prior checkpoint for every PMPO stage (empty = its warm start)
+PLR=${PLR:-1e-3}                           # PMPO learning rate (policy and value) at the start of every stage
+BC_LOSS_W=${BC_LOSS_W:-1}                  # weight of the cloning loss in the refresh
 START_ITER=${START_ITER:-1}                # resume: collections 1 .. START_ITER-1 are reused; a stage whose output
                                            # already exists (rl_i, the collection, wm_i) is skipped
 export CUDA_VISIBLE_DEVICES=$GPU
@@ -51,7 +54,8 @@ for i in $(seq "$START_ITER" "$ITERS"); do
   fi
   if [ ! -f "$R/rl_$i/checkpoints/latest.pt" ]; then
     $PY -m dreamer4.train.train_pmpo --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/rl_$i" --seed "$i" $REALARGS \
-      --steps "$U" --K 1 --lr_final 3e-5 --adv_drop_final 0.5 --clip_split 1 --eval_every 1000000 --eval_n 64 \
+      --steps "$U" --K 1 --lr "$PLR" --value_lr "$PLR" --lr_final 3e-5 --adv_drop_final 0.5 --clip_split 1 \
+      --eval_every 1000000 --eval_n 64 ${PRIOR:+--prior_from "$PRIOR"} \
       --eval_envs 64 --beta "$BETA" ${HORIZON:+--horizon "$HORIZON"} --start_online_frac "$START_FRAC" \
       || fail "PMPO $i"
   fi
@@ -74,8 +78,9 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
 
   stamp "iteration $i: refresh the world model and heads, $K steps"
   [ -f "$R/wm_$i/checkpoints/latest.pt" ] || $PY -m dreamer4.train.train_heads --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/wm_$i" --seed 1 \
-    --steps "$K" --val_frac 0 $BCARGS --dyn_weight 10 --fwd_weight 0 --lr "$RLR" --dyn_lr "$RDLR" \
-    --dyn_warmup "$WARM" --dyn_online_frac "$ONLINE_FRAC" --eval_every 1000000 --final_eval_n 64 --eval_envs 64 \
+    --steps "$K" --val_frac 0 $BCARGS --bc_loss_weight "$BC_LOSS_W" --dyn_weight 10 --fwd_weight 0 --lr "$RLR" \
+    --dyn_lr "$RDLR" --dyn_warmup "$WARM" --dyn_online_frac "$ONLINE_FRAC" --eval_every 1000000 --final_eval_n 64 \
+    --eval_envs 64 \
     || fail "refresh $i"
   CK=$R/wm_$i/checkpoints/latest.pt
 done
