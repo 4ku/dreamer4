@@ -26,6 +26,7 @@ BC_TOP=${BC_TOP:-}                         # refresh cloning: empty = distil the
                                            # top Q of all online episodes by return (self-imitation)
 if [ -n "$BC_TOP" ]; then BCARGS="--bc_online_top $BC_TOP"; else BCARGS="--bc_last_part 1"; fi
 REAL_EVERY=${REAL_EVERY:-}                 # N: every N-th PMPO update learns from the previous collection
+COLLECT_T=${COLLECT_T:-1.0}                # sampling temperature of the real collections (> 1: more varied)
 START_ITER=${START_ITER:-1}                # resume: collections 1 .. START_ITER-1 are reused; a stage whose output
                                            # already exists (rl_i, the collection, wm_i) is skipped
 export CUDA_VISIBLE_DEVICES=$GPU
@@ -60,7 +61,8 @@ for i in $(seq "$START_ITER" "$ITERS"); do
   OUT=$A/data/dyna_${TAG}_$i
   if [ ! -f "$OUT/manifest.json" ]; then
     PYTHONPATH=. $PY "$HERE/collect_policy.py" --ckpt "$CK" --dyn "$WM" --base "$FIRST" --out "$OUT" --n "$M" \
-      --envs 64 --seed $((SEED + 1000 * i)) | tee "$R/collect_$i.log" || fail "collection $i"
+      --envs 64 --seed $((SEED + 1000 * i)) --temperature "$COLLECT_T" | tee "$R/collect_$i.log" \
+      || fail "collection $i"
   fi
   if ! cut -f1 "$R/progress.tsv" | grep -qx "$i"; then
     $PY -c "import json, sys; e = json.load(open(sys.argv[1] + '/manifest.json'))['episodes']

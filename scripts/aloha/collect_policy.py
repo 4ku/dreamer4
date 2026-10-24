@@ -1,7 +1,7 @@
 """Collect AlohaPick episodes with a trained Dreamer4 policy, in the aloha-npy layout of a base dataset.
 
     ALOHA_PYTHON=... python collect_policy.py --ckpt <phase-3 ckpt> --dyn <world model> --base <base dataset dir> \
-        --out <new dir> --n 1000 [--envs 64] [--seed 500000] [--greedy]
+        --out <new dir> --n 1000 [--envs 64] [--seed 500000] [--greedy | --temperature T]
 
 The manifest copies the base dataset's cameras, env spec and proprio standardisation (so a merged dataset reads
 one convention); each episode records source = "policy", the checkpoint, success and return. "noise" is set to
@@ -28,6 +28,8 @@ ap.add_argument("--n", type=int, default=1000)
 ap.add_argument("--envs", type=int, default=64)
 ap.add_argument("--seed", type=int, default=500000)
 ap.add_argument("--greedy", action="store_true", help="argmax actions (default: sample the policy)")
+ap.add_argument("--temperature", type=float, default=1.0,
+                help="sampling temperature (> 1: more varied episodes for the world model and the self-imitation)")
 cfg = ap.parse_args()
 
 dev = torch.device("cuda")
@@ -77,7 +79,7 @@ with torch.no_grad():
             z = tok.encode_last(vid).float().to(dev)
             pr = torch.as_tensor(np.stack([world.proprio_from_info(i) for i in infos]), dtype=torch.float32,
                                  device=dev)
-            a = policy.act(z, pr, greedy=cfg.greedy, prev_action=prev)
+            a = policy.act(z, pr, greedy=cfg.greedy, temperature=cfg.temperature, prev_action=prev)
             prev = a
             env_a = np.asarray(policy.env_action(a), np.float32)
             frames, r, _, infos = env.step(env_a)
@@ -90,7 +92,7 @@ with torch.no_grad():
         ok = np.array([i["is_success"] for i in infos])
         for i in range(m):
             episodes.append({"source": "policy", "ckpt": cfg.ckpt, "greedy": bool(cfg.greedy),
-                             "seed": cfg.seed + done + i, "speed": 1.0, "noise": 1.0,
+                             "temperature": cfg.temperature, "seed": cfg.seed + done + i, "speed": 1.0, "noise": 1.0,
                              "success": bool(ok[i]), "return": round(float(ret[i]), 3)})
         done += m
         print(f"{done}/{N}: round success {ok[:m].mean():.2f} return {ret[:m].mean():.1f} | "
@@ -100,8 +102,8 @@ for a in (state, action, reward, *pix.values()):
     a.flush()
 manifest = {k: base[k] for k in ("format", "cameras", "downscale", "env", "state_mean", "state_std")}
 manifest.update({"n_episodes": N, "episodes": episodes,
-                 "collector": {"policy": cfg.ckpt, "greedy": bool(cfg.greedy), "seed": cfg.seed,
-                               "proprio_stats_from": str(cfg.base)}})
+                 "collector": {"policy": cfg.ckpt, "greedy": bool(cfg.greedy), "temperature": cfg.temperature,
+                               "seed": cfg.seed, "proprio_stats_from": str(cfg.base)}})
 (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
 succ = np.mean([e["success"] for e in episodes])
 rets = np.array([e["return"] for e in episodes])
