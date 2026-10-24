@@ -58,7 +58,7 @@ def make_eval_envs(spec, k):
 
 
 @torch.no_grad()
-def evaluate_lockstep(net, benv, *, tok, proprio_from_info, n, seed, greedy, device):
+def evaluate_lockstep(net, benv, *, tok, proprio_from_info, n, seed, greedy, device, temperature=1.0):
     """:func:`evaluate` for a batched env whose worlds all run to the same step limit: rounds of
     ``benv.n`` episodes (seeds ``seed .. seed+n-1``), every one scored at its end."""
     was_training = net.training
@@ -79,7 +79,7 @@ def evaluate_lockstep(net, benv, *, tok, proprio_from_info, n, seed, greedy, dev
             z = tok.encode_last(vid).float().to(device)
             pr = torch.as_tensor(np.stack([proprio_from_info(i) for i in infos]),
                                  dtype=torch.float32, device=device)
-            a = net.act(z, pr, greedy=greedy, prev_action=prev)
+            a = net.act(z, pr, greedy=greedy, temperature=temperature, prev_action=prev)
             prev = a
             frames, r, term, infos = benv.step(net.env_action(a))
             ret += np.where(alive, r, 0.0)
@@ -100,7 +100,7 @@ def evaluate_lockstep(net, benv, *, tok, proprio_from_info, n, seed, greedy, dev
 
 
 @torch.no_grad()
-def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
+def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device, temperature=1.0):
     """Play ``n`` episodes across ``envs`` in parallel (one batched policy forward per step).
 
     Episodes are seeded consecutively from ``seed``, so two checkpoints scored with the same seed
@@ -131,7 +131,7 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
     """
     if getattr(envs, "batched", False):
         return evaluate_lockstep(net, envs, tok=tok, proprio_from_info=proprio_from_info, n=n,
-                                 seed=seed, greedy=greedy, device=device)
+                                 seed=seed, greedy=greedy, device=device, temperature=temperature)
     was_training = net.training
     # Eval mode first: anything the network does differently while training would silently score
     # a different network than the one being shipped. The training mode is restored on return.
@@ -161,7 +161,7 @@ def evaluate(net, envs, *, tok, proprio_from_info, n, seed, greedy, device):
         z = tok.encode_last(vid).float().to(device)                      # (B, N, D)
         pr = torch.as_tensor(np.stack([proprio_from_info(i) for i in info_l]),
                              dtype=torch.float32, device=device)
-        a = net.act(z, pr, greedy=greedy, prev_action=prev_a)
+        a = net.act(z, pr, greedy=greedy, temperature=temperature, prev_action=prev_a)
         prev_a = a
         env_a = net.env_action(a)
         restarted = []
@@ -223,6 +223,8 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=900000)
     ap.add_argument("--envs", type=int, default=64, help="environments played in parallel")
     ap.add_argument("--json", default="", help="also write the result here")
+    ap.add_argument("--temperature", type=float, default=1.0,
+                    help="temperature of the SAMPLED evaluation (< 1 sharpens the policy toward greedy)")
     cfg = ap.parse_args(argv)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     t0 = time.time()
@@ -237,8 +239,9 @@ def main(argv=None):
     kw = dict(tok=world.tok, proprio_from_info=world.proprio_from_info, n=cfg.n, seed=cfg.seed,
               device=dev)
     greedy = evaluate(policy, envs, greedy=True, **kw)
-    sampled = evaluate(policy, envs, greedy=False, **kw)
+    sampled = evaluate(policy, envs, greedy=False, temperature=cfg.temperature, **kw)
     res = {"ckpt": cfg.ckpt, "n": cfg.n, "seed": cfg.seed, "train_step": ckpt.get("step"),
+           "temperature": cfg.temperature,
            "greedy_sr": greedy[0], "greedy_opt": greedy[2], "greedy_return": greedy[3],
            "sampled_sr": sampled[0], "sampled_opt": sampled[2], "sampled_return": sampled[3],
            "wall_s": round(time.time() - t0, 1)}
