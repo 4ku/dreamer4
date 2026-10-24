@@ -309,11 +309,13 @@ class Imagination:
         return tape.finish({"H": H})
 
     @torch.no_grad()
-    def real_rollout(self, env, *, seed):
+    def real_rollout(self, env, *, seed, keep=False):
         """One batch of REAL episodes played with the current (sampled) policy -- what the same PMPO
         update learns from in ``--real_env`` mode, the model-free control for imagination: every state,
         action and reward is the environment's. Episodes all run to the time limit, where the λ-return
-        bootstraps from the value, as a dream does at its horizon. Same keys as :meth:`rollout`."""
+        bootstraps from the value, as a dream does at its horizon. Same keys as :meth:`rollout`.
+        ``keep`` also returns the played episodes as ``episodes`` (latents, proprio, action vectors) in
+        the form :class:`DemoStarts` reads, so dreams can start from the states the policy really met."""
         world, heads, dev = self.world, self.heads, self.device
         policy = self.eval_policy()
         hist, B, steps = world.tok.history, env.n, env.max_steps
@@ -324,6 +326,7 @@ class Imagination:
         code_shape = (heads.policy.n_actions,) if heads.policy.bins else ()
         actions = torch.zeros(B, steps, *code_shape, dtype=torch.long, device=dev)
         rewards = torch.zeros(B, steps, device=dev)
+        zs, props, vecs = [], [], []
         prev = None
         for t in range(steps + 1):
             z = world.tok.encode_last(np.stack([np.stack(w[-hist:]) for w in window])).float().to(dev)
@@ -332,19 +335,28 @@ class Imagination:
             policy.observe(z, pr, prev)
             h = policy.h().float()
             H[:, t] = h
+            if keep:
+                zs.append(z.half())
+                props.append(pr.cpu().numpy())
             if t == steps:
                 break
             a = heads.policy.sample(heads.policy.at(h, 0))
             actions[:, t] = a
             prev = a
+            if keep:
+                vecs.append(heads.policy.action_vector(a).float().cpu().numpy())
             frames, r, _, infos = env.step(policy.env_action(a))
             rewards[:, t] = torch.as_tensor(np.array(r, np.float32), device=dev)
             for w, f in zip(window, frames):
                 w.append(f)
         ones = torch.ones(B, steps + 1, device=dev)
-        return {"H": H, "actions": actions, "rewards": rewards, "continues": ones, "alive": ones.clone(),
+        roll = {"H": H, "actions": actions, "rewards": rewards, "continues": ones, "alive": ones.clone(),
                 "terminated": torch.zeros(B, dtype=torch.bool, device=dev),
                 "success": float(np.mean([i["is_success"] for i in infos]))}
+        if keep:
+            z_all, p_all, v_all = torch.stack(zs, 1), np.stack(props, 1), np.stack(vecs, 1)
+            roll["episodes"] = [{"z": z_all[b], "proprio": p_all[b], "actions": v_all[b]} for b in range(B)]
+        return roll
 
     @torch.no_grad()
     def recorded_rollout(self, episodes):
@@ -468,6 +480,12 @@ def parse_args():
     ap.add_argument("--real_env", type=int, default=0,
                     help="> 0: learn from that many REAL episodes per update instead of dreams -- the "
                          "same PMPO update and heads, model-free (the control for imagination)")
+    ap.add_argument("--dream_per_real", type=int, default=0,
+                    help="with --real_env: after every real batch, this many updates on --batch dreams that "
+                         "start from that batch's own frames (short dreams from states the current policy "
+                         "really met); --steps counts both kinds of update. NOT in the paper")
+    ap.add_argument("--dream_horizon", type=int, default=32,
+                    help="imagined steps of the --dream_per_real dreams (dreams stay faithful for ~40 steps)")
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--eval_n", type=int, default=1000)
     ap.add_argument("--eval_seed", type=int, default=31337,
@@ -531,8 +549,9 @@ def main():
         # Model-free control: real episodes instead of dreams, seeds clear of every evaluation's.
         real_env = make_eval_envs(world.env_spec, cfg.real_env)
         cfg.horizon = real_env.max_steps
-        print(f"REAL-ENV rollouts: {cfg.real_env} episodes of {cfg.horizon} steps per update "
-              f"(no imagination)", flush=True)
+        mix = (f", each batch followed by {cfg.dream_per_real} updates on {cfg.dream_horizon}-step dreams "
+               f"that start from its frames" if cfg.dream_per_real else " (no imagination)")
+        print(f"REAL-ENV rollouts: {cfg.real_env} episodes of {cfg.horizon} steps per update{mix}", flush=True)
     else:
         parts = getattr(world.dataset, "parts", None) or [world.dataset]
         starts = DemoStarts(encode_episodes(world.tok, world.dataset, range(len(world.dataset))),
@@ -566,7 +585,11 @@ def main():
     B, H = (cfg.real_env or cfg.batch), cfg.horizon
     # best starts BELOW every reachable success rate, so a policy that never succeeds still writes
     # best.pt and the script's resume check cannot mark the phase done with a missing artifact.
-    collected, best = 0, -1.0
+    collected, n_real, best = 0, 0, -1.0
+
+    def used():
+        """Episodes learned from so far, as the logs report them: REAL ones whenever there are any."""
+        return n_real if real_env is not None else collected * B
     last_eval, best_eval = {}, {}
     t0 = time.time()
     for step in range(cfg.steps):
@@ -575,10 +598,19 @@ def main():
         for group, lr0 in zip(opt.param_groups, base_lrs):
             group["lr"] = lr0 * (1.0 - frac) + cfg.lr_final * frac
 
-        # On-policy: one fresh batch of dreams (or real episodes) per update.
+        # On-policy: one fresh batch of dreams (or real episodes) per update. With --dream_per_real the
+        # real batches alternate with short dreams that start from the newest batch's own frames.
+        is_real = real_env is not None and step % (cfg.dream_per_real + 1) == 0
         with torch.autocast("cuda", torch.bfloat16, enabled=bool(cfg.amp)):
-            if real_env is not None:
-                roll = agent.real_rollout(real_env, seed=10_000_000 + step * real_env.n)
+            if is_real:
+                roll = agent.real_rollout(real_env, seed=10_000_000 + step * real_env.n,
+                                          keep=cfg.dream_per_real > 0)
+                n_real += real_env.n
+                if cfg.dream_per_real:
+                    starts = DemoStarts(roll.pop("episodes"), window=agent.clip_T, rng=rng)
+            elif real_env is not None:
+                roll = agent.rollout(starts.sample(cfg.batch), horizon=cfg.dream_horizon, K=cfg.K,
+                                     term_prob=cfg.term_prob)
             elif recorded is not None and step % cfg.real_every == cfg.real_every - 1:
                 roll = recorded
             else:
@@ -626,9 +658,9 @@ def main():
         opt.step()
 
         if do_log:
-            pinfo["entropy"] = float(pol.entropy(lg[:, :H])[keep].mean().detach())
+            pinfo["entropy"] = float(pol.entropy(lg[:, :Hr])[keep].mean().detach())
             pinfo["kl_to_prior"] = float(kl.mean().detach())
-            rec = {"step": step, "dreams": collected * B, "wall_s": round(time.time() - t0, 1),
+            rec = {"step": step, "dreams": used(), "wall_s": round(time.time() - t0, 1),
                    "dream_success": roll["success"],
                    "dream_return": float(roll["rewards"].sum(1).mean()), "value_loss": value_loss.item(),
                    "grad_norm": float(gn), "it_s": (step + 1) / max(time.time() - t0, 1e-9),
@@ -643,8 +675,8 @@ def main():
                 writer.add_scalar("train/steps_per_sec_inst", (step - s_last) / (now - t_last), step)
             t_last, s_last = now, step
             print(f"[{time.strftime('%H:%M:%S')}] step {step}/{cfg.steps} "
-                  f"{'real' if real_env is not None else 'dream'}SR {roll['success']:.2f} "
-                  f"{'real' if real_env is not None else 'dream'}R {rec['dream_return']:.2f} "
+                  f"{'real' if is_real else 'dream'}SR {roll['success']:.2f} "
+                  f"{'real' if is_real else 'dream'}R {rec['dream_return']:.2f} "
                   f"vloss {rec['value_loss']:.4f} "
                   f"H {pinfo['entropy']:.2f} kl {pinfo['kl_to_prior']:.3f} "
                   f"gn {float(gn):.1f} {rec['it_s']:.2f}it/s", flush=True)
@@ -654,10 +686,10 @@ def main():
                       seed=cfg.eval_seed, device=dev)
             g = evaluate(eval_policy, eval_envs, greedy=True, **kw)
             s = evaluate(eval_policy, eval_envs, greedy=False, **kw)
-            last_eval = {"step": step + 1, "dreams": collected * B, "greedy": g[0], "sampled": s[0],
+            last_eval = {"step": step + 1, "dreams": used(), "greedy": g[0], "sampled": s[0],
                          "greedy_opt": g[2], "sampled_opt": s[2], "greedy_return": g[3],
                          "sampled_return": s[3], "eval_n": cfg.eval_n}
-            print(f"PMPO-EVAL {out.name} step {step + 1} dreams {collected * B} "
+            print(f"PMPO-EVAL {out.name} step {step + 1} dreams {used()} "
                   f"greedy SR {g[0]:.4f} opt {g[2]:.4f} | sampled SR {s[0]:.4f} opt {s[2]:.4f} "
                   f"| return {g[3]:.2f} / {s[3]:.2f} | n={cfg.eval_n} | "
                   f"{(time.time() - t0) / 60:.1f} min", flush=True)
@@ -675,7 +707,7 @@ def main():
                 agent.save(out / "checkpoints" / "best.pt", last_eval)
 
     wall = time.time() - t0
-    json.dump({"steps": cfg.steps, "wall_s": round(wall, 1), "dreams": collected * B,
+    json.dump({"steps": cfg.steps, "wall_s": round(wall, 1), "dreams": used(),
                "best_greedy_sr": best, "best": best_eval, "final": last_eval},
               open(out / "final.json", "w"), indent=1)
     print(f"PMPO-DONE {out.name} best greedy SR {best:.4f} | {wall / 60:.2f} min", flush=True)
