@@ -111,9 +111,11 @@ class DemoStarts:
         if online_frac > 0 and is_late.any() and not is_late.all():
             self.p = np.where(is_late, online_frac / is_late.sum(), (1.0 - online_frac) / (~is_late).sum())
 
-    def sample(self, n):
-        """``n`` contexts: their latents, proprio, aligned actions and task."""
-        pick = self.rng.choice(len(self.index), n, p=self.p)
+    def sample(self, n, pick=None):
+        """``n`` contexts: their latents, proprio, aligned actions and task. ``pick`` (positions in
+        ``index``) chooses them instead of the random draw."""
+        if pick is None:
+            pick = self.rng.choice(len(self.index), n, p=self.p)
         end = self.index[pick]
         base = self.base[pick]
         win = window_frames(end - base, self.window) + base.reshape(-1, 1)

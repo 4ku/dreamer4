@@ -14,7 +14,7 @@ Episodes are written with noise = 1.0, the convention that keeps them out of pha
 clean recordings only): they teach the world model, the copycat stays the one cloned from the original demos. The
 proprio standardisation is copied from --base so a merged dataset reads one convention.
 
-    BASE=<base dataset dir> N=1024 NWORLD=128 OUT=<new dir> python collect_aloha_fast.py
+    BASE=<base dataset dir> N=1024 NWORLD=128 OUT=<new dir> [OFF_XY=0.02 OFF_Z=0.02] python collect_aloha_fast.py
 """
 from __future__ import annotations
 
@@ -44,6 +44,10 @@ PRE_LO, PRE_HI = float(os.environ.get("PRE_LO", 0.01)), float(os.environ.get("PR
 TOL_A_LO, TOL_A_HI = float(os.environ.get("TOL_A_LO", 0.02)), float(os.environ.get("TOL_A_HI", 0.06))
 TOL_B_LO, TOL_B_HI = float(os.environ.get("TOL_B_LO", 0.006)), float(os.environ.get("TOL_B_HI", 0.02))
 CLOSE_LO, CLOSE_HI = int(os.environ.get("CLOSE_LO", 3)), int(os.environ.get("CLOSE_HI", 12))
+# Imprecise grasps: the grasp point is offset from the box centre by up to OFF_XY sideways and OFF_Z upwards, so the
+# data shows what an off-centre grasp does (the box tilts, is pushed or slips) -- a world model that only saw centred
+# grasps dreams every grasp near the box as a clean one, and imagination RL exploits that.
+OFF_XY, OFF_Z = float(os.environ.get("OFF_XY", 0.0)), float(os.environ.get("OFF_Z", 0.0))
 CAM_RES_HW = (128, 128)
 CAMERAS = ("view_0", "view_2")
 ACTION_SCALE = 0.015
@@ -59,8 +63,8 @@ def make_rollout_fn(env, nworld):
     box_qadr = int(env._box_qadr)
     ep_len = int(env._config.episode_length)
 
-    def policy_one(state, box0, grasp, phase, count, gain, pre, tol_a, tol_b, n_close):
-        above, down = box0 + jp.array([0.0, 0.0, 1.0]) * pre, box0 + jp.array([0.0, 0.0, 0.005])
+    def policy_one(state, box0, grasp, phase, count, gain, pre, tol_a, tol_b, n_close, off):
+        above, down = box0 + off + jp.array([0.0, 0.0, 1.0]) * pre, box0 + off + jp.array([0.0, 0.0, 0.005])
         eef = state.data.site_xpos[site]
         box_now = state.data.qpos[box_qadr:box_qadr + 3]
         # Closed loop: a phase ends when the gripper is where it should be, not at a fixed time.
@@ -78,12 +82,12 @@ def make_rollout_fn(env, nworld):
         action = action.at[13].set(jp.clip((finger - state.data.ctrl[13]) / ACTION_SCALE, -1.0, 1.0))
         return action, grasp, nxt, count
 
-    policy = jax.vmap(policy_one, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    policy = jax.vmap(policy_one, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
     reset, step = jax.vmap(env.reset), jax.vmap(env.step)
     kin = jax.vmap(lambda d: mjx.kinematics(mjx_model, d))
     u8 = lambda x: (jp.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(jp.uint8)
 
-    def rollout(rngs, gain, pre, tol_a, tol_b, n_close):
+    def rollout(rngs, gain, pre, tol_a, tol_b, n_close, off):
         state = reset(rngs)
         state = state.replace(data=kin(state.data))
         box0 = state.data.qpos[:, box_qadr:box_qadr + 3]
@@ -91,7 +95,7 @@ def make_rollout_fn(env, nworld):
         def body_fn(carry, t):
             state, grasp, phase, count = carry
             action, grasp, phase, count = policy(state, box0, grasp, phase, count, gain, pre, tol_a, tol_b,
-                                                 n_close)
+                                                 n_close, off)
             nxt = step(state, action)
             out = {"state": state.obs["state"], "view_0": u8(state.obs["pixels/view_0"]),
                    "view_2": u8(state.obs["pixels/view_2"]), "action": action, "reward": nxt.reward,
@@ -130,8 +134,10 @@ def main():
         tol_a = rng.uniform(TOL_A_LO, TOL_A_HI, NWORLD).astype(np.float32)
         tol_b = rng.uniform(TOL_B_LO, TOL_B_HI, NWORLD).astype(np.float32)
         n_close = rng.integers(CLOSE_LO, CLOSE_HI + 1, NWORLD).astype(np.int32)
+        off = np.stack([rng.uniform(-OFF_XY, OFF_XY, NWORLD), rng.uniform(-OFF_XY, OFF_XY, NWORLD),
+                        rng.uniform(0.0, OFF_Z, NWORLD)], 1).astype(np.float32)
         keys = jax.random.split(jax.random.PRNGKey(SEED * 100003 + b), NWORLD)
-        traj, final = rollout(keys, *(jp.asarray(x) for x in (gain, pre, tol_a, tol_b, n_close)))
+        traj, final = rollout(keys, *(jp.asarray(x) for x in (gain, pre, tol_a, tol_b, n_close, off)))
         traj = {k: np.swapaxes(np.asarray(v), 0, 1)[:m] for k, v in traj.items()}   # (m, T, ...)
         final = {k: np.asarray(v)[:m] for k, v in final.items()}
         sl = slice(n, n + m)
@@ -147,7 +153,8 @@ def main():
             episodes.append({"source": "fast_expert", "gain": round(float(gain[i]), 3),
                              "pre": round(float(pre[i]), 3),
                              "tol_a": round(float(tol_a[i]), 4), "tol_b": round(float(tol_b[i]), 4),
-                             "n_close": int(n_close[i]), "lift_step": int(lift_t[i]), "speed": 1.0, "noise": 1.0,
+                             "n_close": int(n_close[i]), "off": [round(float(x), 4) for x in off[i]],
+                             "lift_step": int(lift_t[i]), "speed": 1.0, "noise": 1.0,
                              "success": bool(success[i]), "return": round(float(ret[i]), 2)})
         n += m
         b += 1
@@ -161,7 +168,8 @@ def main():
                      "collector": {"expert": "closed-loop fast", "gain": [GAIN_LO, GAIN_HI],
                                    "pre": [PRE_LO, PRE_HI],
                                    "tol_a": [TOL_A_LO, TOL_A_HI], "tol_b": [TOL_B_LO, TOL_B_HI],
-                                   "n_close": [CLOSE_LO, CLOSE_HI], "seed": SEED,
+                                   "n_close": [CLOSE_LO, CLOSE_HI], "off_xy": OFF_XY, "off_z": OFF_Z,
+                                   "seed": SEED,
                                    "proprio_stats_from": str(BASE)}})
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1))
     s = np.array([e["success"] for e in episodes])
