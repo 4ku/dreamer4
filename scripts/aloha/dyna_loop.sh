@@ -30,6 +30,9 @@ COLLECT_T=${COLLECT_T:-1.0}                # sampling temperature of the real co
 PRIOR=${PRIOR:-}                           # FIXED KL-prior checkpoint for every PMPO stage (empty = its warm start)
 PLR=${PLR:-1e-3}                           # PMPO learning rate (policy and value) at the start of every stage
 BC_LOSS_W=${BC_LOSS_W:-1}                  # weight of the cloning loss in the refresh
+DISTILL=${DISTILL:-0}                      # 1: the refresh keeps the policy by matching its pre-refresh action
+                                           # distribution instead of cloning recorded actions (BC_TOP ignored)
+if [ "$DISTILL" = 1 ]; then BCARGS="--bc_last_part 1 --distill 1"; fi
 START_ITER=${START_ITER:-1}                # resume: collections 1 .. START_ITER-1 are reused; a stage whose output
                                            # already exists (rl_i, the collection, wm_i) is skipped
 export CUDA_VISIBLE_DEVICES=$GPU

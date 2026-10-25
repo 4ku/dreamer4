@@ -30,10 +30,12 @@ the world model are the same network.
     python -m dreamer4.train.train_heads --dyn <phase-1 ckpt> --out runs/heads
 """
 import argparse
+import copy
 import json
 import math
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -244,8 +246,9 @@ class ForwardModel(torch.nn.Module):
         return (err * clip["valid_a"]).sum() / clip["valid_a"].sum().clamp_min(1.0)
 
 
-def agent_forward(world, heads, clip, *, tau_ctx, ctx_signal, emax):
-    """One transformer pass over a clip batch, returning ``h_t`` for every slot.
+def agent_forward(world, heads, clip, *, tau_ctx, ctx_signal, emax, noise=None):
+    """One transformer pass over a clip batch, returning ``h_t`` for every slot. ``noise`` (the
+    latent and proprio draws) lets a second model see exactly the same noisy context.
 
     "To preserve existing capabilities, we reuse the pretraining setting with this additional loss
     function, so the representations are noisy and we continue to apply the video prediction loss."
@@ -256,8 +259,9 @@ def agent_forward(world, heads, clip, *, tau_ctx, ctx_signal, emax):
     z, prop = clip["z"], clip["proprio"]
     B, T = z.shape[:2]
     dev = z.device
-    z_in = (1 - tau_ctx) * z + tau_ctx * torch.randn_like(z)
-    p_in = (1 - tau_ctx) * prop + tau_ctx * torch.randn_like(prop)
+    eps_z, eps_p = noise if noise is not None else (torch.randn_like(z), torch.randn_like(prop))
+    z_in = (1 - tau_ctx) * z + tau_ctx * eps_z
+    p_in = (1 - tau_ctx) * prop + tau_ctx * eps_p
     step = torch.full((B, T), emax, device=dev, dtype=torch.long)
     sig = torch.full((B, T), ctx_signal, device=dev, dtype=torch.long)
     ag = heads.tokens((B, T), task_ids=clip["task"], device=dev)
@@ -265,19 +269,22 @@ def agent_forward(world, heads, clip, *, tau_ctx, ctx_signal, emax):
     return flatten_agent_out(out[-1])
 
 
-def agent_losses(heads, h, clip, *, mtp, demo_mask):
+def agent_losses(heads, h, clip, *, mtp, demo_mask, teacher_logits=None):
     """Paper Eq. 9 -- ``- sum_n ln p(a_{t+n} | h_t) - sum_n ln p(r_{t+n} | h_t)``.
 
     The two sums are returned separately so the RMS normaliser can hold one running scale per term.
     ``demo_mask`` (B,) restricts the behavioral-cloning sum to the relevant half of the mixture
     (Section 4.1); the reward sum runs over the whole batch, because a state that pays nothing is
-    exactly what the failures teach.
+    exactly what the failures teach. ``teacher_logits`` (``--distill``) replaces the recorded
+    actions by a teacher policy's distribution, on the whole batch.
     """
     a_tgt, a_msk = mtp_targets(heads.policy.encode(clip["a_vec"]), clip["valid_a"], mtp)
     r_tgt, r_msk = mtp_targets(clip["reward"], clip["valid_r"], mtp)
-    a_msk = a_msk * demo_mask.reshape(-1, 1, 1)
-    return (heads.policy.clone_loss(heads.policy(h), a_tgt, a_msk),
-            heads.reward.loss(heads.reward(h), r_tgt, r_msk))
+    if teacher_logits is not None:
+        pol = heads.policy.soft_clone_loss(heads.policy(h), teacher_logits, a_msk)
+    else:
+        pol = heads.policy.clone_loss(heads.policy(h), a_tgt, a_msk * demo_mask.reshape(-1, 1, 1))
+    return pol, heads.reward.loss(heads.reward(h), r_tgt, r_msk)
 
 
 @torch.no_grad()
@@ -360,6 +367,11 @@ def parse_args():
                     help="weight of the cloning loss among the RMS-normalised terms (an online loop's refresh only "
                          "needs the policy to follow the finetuned transformer; heavy cloning sharpens it). NOT in "
                          "the paper")
+    ap.add_argument("--distill", type=int, default=0,
+                    help="1 = keep the --init_from policy instead of cloning recorded actions: the "
+                         "policy matches that policy's whole action distribution (computed on its "
+                         "own, frozen transformer) on every clip, while the world model and the "
+                         "reward and value heads learn from the data")
     ap.add_argument("--bc_frac", type=float, default=1.0,
                     help="fraction of the dataset's demonstrations to clone")
     ap.add_argument("--bc_seed", type=int, default=0)
@@ -548,6 +560,17 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
                "latent_meta": world.latent_meta, "model": world.model_cfg},
               open(out / "config.json", "w"), indent=1)
 
+    teacher = None
+    if cfg.distill:
+        if init is None:
+            raise ValueError("--distill keeps the --init_from policy: give one")
+        # The policy as it was before this run, on its own frozen transformer. In an online loop the
+        # refresh teaches the world model the policy's new episodes; cloning the policy's own sampled
+        # actions there narrowed it (entropy 5.2 -> 1.5 in 4 refreshes), matching its distribution does not.
+        teacher = (SimpleNamespace(dyn=copy.deepcopy(world.dyn).eval().requires_grad_(False)),
+                   copy.deepcopy(heads).eval().requires_grad_(False))
+        print("policy: distilled from the --init_from policy on every clip (no recorded actions)", flush=True)
+
     fwd_model = None
     if cfg.fwd_weight > 0:
         fwd_model = ForwardModel(heads.d_in, ds.action_dim, episodes[0]["proprio"].shape[-1]).to(dev)
@@ -640,8 +663,14 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
                                torch.zeros(cfg.batch - half, device=dev)])
         dyn_aux = {}
         with torch.autocast("cuda", torch.bfloat16, enabled=bool(cfg.amp)):
-            h = agent_forward(world, heads, clip, **fwd)
-            pol, rew = agent_losses(heads, h.float(), clip, mtp=cfg.mtp, demo_mask=demo_mask)
+            noise = (torch.randn_like(clip["z"]), torch.randn_like(clip["proprio"]))
+            h = agent_forward(world, heads, clip, noise=noise, **fwd)
+            t_logits = None
+            if teacher is not None:
+                with torch.no_grad():
+                    t_logits = teacher[1].policy(agent_forward(*teacher, clip, noise=noise, **fwd).float())
+            pol, rew = agent_losses(heads, h.float(), clip, mtp=cfg.mtp, demo_mask=demo_mask,
+                                    teacher_logits=t_logits)
             terms = {"policy": pol, "reward": rew}
             if cfg.value_weight > 0:
                 terms["value"] = heads.value.loss(heads.value(h.float()), clip["ret"][..., None],

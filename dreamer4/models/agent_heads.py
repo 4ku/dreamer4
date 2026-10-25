@@ -227,6 +227,14 @@ class PolicyHead(nn.Module):
         nll = -self.log_prob(logits, codes)
         return _masked_mean(nll, mask)
 
+    def soft_clone_loss(self, logits: torch.Tensor, teacher_logits: torch.Tensor,
+                        mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Cloning onto a teacher policy's whole distribution: ``- sum_a pi_teacher(a | h) ln p(a | h)``,
+        the cross-entropy whose gradient is that of ``KL(pi_teacher || p)``. Cloning the teacher's
+        sampled actions instead narrows the policy onto the samples it saw."""
+        lt, lp = self.dist(teacher_logits).logits, self.dist(logits).logits
+        return _masked_mean(self._joint(-(lt.exp() * lp).sum(-1)), mask)
+
 
 class TwoHotHead(nn.Module):
     """A scalar prediction as a symexp two-hot distribution, trained by cross-entropy.
