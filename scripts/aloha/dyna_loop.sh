@@ -35,6 +35,9 @@ DISTILL=${DISTILL:-0}                      # 1: the refresh keeps the policy by 
 if [ "$DISTILL" = 1 ]; then BCARGS="--bc_last_part 1 --distill 1"; fi
 EXTRA_BASE=${EXTRA_BASE:-}                 # more offline data dirs (comma-separated) next to the world model's own:
                                            # part of the base in every stage, never counted as online
+KD=${KD:-1}                                # denoising steps per dreamed frame in the PMPO stages: with 4 the
+                                           # failure-weighted world model dreams more of the risky grasps' failures
+                                           # (one policy: held 0.97 -> 0.91, real 0.81; mixed outcomes 19 -> 41 %)
 FAIL_W=${FAIL_W:-1}                        # failed episodes' video windows sampled FAIL_W x in the refresh: a world
                                            # model trained on mostly successful grasps dreams every uncertain grasp as
                                            # a success; 3 makes it admit the policy's failures (dreamed held 0.97 ->
@@ -65,7 +68,7 @@ for i in $(seq "$START_ITER" "$ITERS"); do
   fi
   if [ ! -f "$R/rl_$i/checkpoints/latest.pt" ]; then
     $PY -m dreamer4.train.train_pmpo --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/rl_$i" --seed "$i" $REALARGS \
-      --steps "$U" --K 1 --lr "$PLR" --value_lr "$PLR" --lr_final 3e-5 --adv_drop_final 0.5 --clip_split 1 \
+      --steps "$U" --K "$KD" --lr "$PLR" --value_lr "$PLR" --lr_final 3e-5 --adv_drop_final 0.5 --clip_split 1 \
       --eval_every 1000000 --eval_n 64 ${PRIOR:+--prior_from "$PRIOR"} \
       --eval_envs 64 --beta "$BETA" ${HORIZON:+--horizon "$HORIZON"} --start_online_frac "$START_FRAC" \
       --base_parts "$NBASE" \

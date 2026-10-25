@@ -35,6 +35,8 @@ ap.add_argument("--repeat", type=int, default=1,
                 help="dream every start this many times: with --greedy the only randomness left is the world "
                      "model's own, and the spread of the outcomes per start shows how stochastic its dreams are")
 ap.add_argument("--greedy", action="store_true", help="greedy actions instead of sampled ones")
+ap.add_argument("--reward_decode", choices=("mode", "mean"), default="mode",
+                help="the dreamed reward: phase 3's default 'mode', or the reward head's expectation")
 ap.add_argument("--heldout", default="", help="dir of <name>.json held-out results printed alongside")
 ap.add_argument("policies", nargs="+", help="name=checkpoint")
 cfg = ap.parse_args()
@@ -45,7 +47,7 @@ for spec in cfg.policies:
     name, ck = spec.split("=", 1)
     torch.manual_seed(cfg.seed)
     world, agent = load_agent(argparse.Namespace(init_from=ck, dyn=cfg.dyn, device="cuda", data=cfg.data,
-                                                 reward_decode="mode", compact=0), dev)
+                                                 reward_decode=cfg.reward_decode, compact=0), dev)
     starts = DemoStarts(encode_episodes(world.tok, world.dataset, range(len(world.dataset))),
                         window=agent.clip_T)
     if cfg.greedy:
