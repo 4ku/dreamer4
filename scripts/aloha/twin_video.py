@@ -32,6 +32,8 @@ ap.add_argument("--K", type=int, default=1)
 ap.add_argument("--lift_r", type=float, default=0.7,
                 help="box held at the end: mean reward of the last 10 steps above this (real and dreamed alike)")
 ap.add_argument("--label", default="")
+ap.add_argument("--first", action="store_true", help="show the first --show episodes as they come (representative) "
+                                                     "instead of the real failures the dream calls successes first")
 ap.add_argument("--json", default="")
 cfg = ap.parse_args()
 
@@ -112,6 +114,8 @@ if cfg.json:
 both = np.flatnonzero(real_held & dream_held)
 show = list(np.flatnonzero(fooled)[:max(cfg.show - 2, 0)])
 show += list(both[:cfg.show - len(show)])
+if cfg.first:
+    show = list(range(min(cfg.show, n)))
 
 
 def tile(img, text, color):
