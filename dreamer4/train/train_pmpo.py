@@ -484,8 +484,11 @@ def parse_args():
     ap.add_argument("--real_every", type=int, default=5)
     ap.add_argument("--start_online_frac", type=float, default=0.0,
                     help="> 0: that fraction of the dream starts comes from the episodes collected online "
-                         "(every --data dir after the first): the recent policies' own states. NOT in "
+                         "(every --data dir after the base): the recent policies' own states. NOT in "
                          "the paper")
+    ap.add_argument("--base_parts", type=int, default=1,
+                    help="the first N --data dirs are the offline base; the dirs after them were "
+                         "collected online")
     ap.add_argument("--real_env", type=int, default=0,
                     help="> 0: learn from that many REAL episodes per update instead of dreams -- the "
                          "same PMPO update and heads, model-free (the control for imagination)")
@@ -569,7 +572,8 @@ def main():
     else:
         parts = getattr(world.dataset, "parts", None) or [world.dataset]
         starts = DemoStarts(encode_episodes(world.tok, world.dataset, range(len(world.dataset))),
-                            window=agent.clip_T, rng=rng, online_from=len(parts[0]),
+                            window=agent.clip_T, rng=rng,
+                            online_from=sum(len(p) for p in parts[:cfg.base_parts]),
                             online_frac=cfg.start_online_frac)
         print(f"dream starts: {len(starts.index)} contexts of {agent.clip_T} frames from "
               f"{world.data_path} | horizon {cfg.horizon}", flush=True)

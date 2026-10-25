@@ -389,14 +389,17 @@ def parse_args():
                          "and its heads replace the fresh ones (head-shape flags are ignored) -- the "
                          "world-model refresh of an online loop. NOT in the paper")
     ap.add_argument("--bc_online_top", type=float, default=0.0,
-                    help="> 0: the demonstrations are the online episodes (data dirs after the first) in "
+                    help="> 0: the demonstrations are the online episodes (data dirs after the base) in "
                          "the top fraction by recorded return -- self-imitation of the policies' best "
                          "real episodes, with no task-specific threshold. NOT in the paper")
     ap.add_argument("--dyn_online_frac", type=float, default=0.0,
                     help="> 0: that fraction of the video-prediction windows comes from the episodes "
-                         "collected online (every data dir after the first) -- uniform sampling over a "
+                         "collected online (every data dir after the base) -- uniform sampling over a "
                          "small new collection next to a large pretraining set replays each new "
                          "transition ~0.1 times per refresh. NOT in the paper")
+    ap.add_argument("--base_parts", type=int, default=1,
+                    help="the first N --data dirs are the offline base; the dirs after them were "
+                         "collected online")
     ap.add_argument("--bc_last_part", type=int, default=0,
                     help="1: the demonstrations are ALL training episodes of the last data dir (the "
                          "newest collection, failures included), so the policy is distilled on its "
@@ -645,7 +648,7 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
         print(f"video prediction: {int(failed.sum())} of {n_train} episodes failed, sampled "
               f"x{cfg.dyn_fail_weight:g} -> {dyn_w[failed].sum() / dyn_w.sum():.0%} of the windows", flush=True)
     parts = getattr(world.dataset, "parts", None) or [world.dataset]
-    online = np.arange(n_train) >= len(parts[0])
+    online = np.arange(n_train) >= sum(len(p) for p in parts[:cfg.base_parts])
     if cfg.dyn_online_frac > 0 and online.any() and not online.all():
         w = np.where(online, cfg.dyn_online_frac / online.sum(), (1.0 - cfg.dyn_online_frac) / (~online).sum())
         dyn_w = w if dyn_w is None else dyn_w * w
@@ -801,9 +804,9 @@ def main():
               f"(distillation of the policy that collected them)", flush=True)
     elif cfg.bc_online_top > 0:
         parts = getattr(ds, "parts", None) or [ds]
-        online = list(range(len(parts[0]), n_train))
+        online = list(range(sum(len(p) for p in parts[:cfg.base_parts]), n_train))
         if not online:
-            raise ValueError("--bc_online_top: no online data dir (dirs after the first) in training")
+            raise ValueError("--bc_online_top: no online data dir (dirs after the base) in training")
         rets = np.array([episodes[i].get("meta", {}).get("return", -np.inf) for i in online])
         thr = np.quantile(rets, 1.0 - cfg.bc_online_top)
         demos = [i for i, r in zip(online, rets) if r >= thr]

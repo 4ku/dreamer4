@@ -33,6 +33,8 @@ BC_LOSS_W=${BC_LOSS_W:-1}                  # weight of the cloning loss in the r
 DISTILL=${DISTILL:-0}                      # 1: the refresh keeps the policy by matching its pre-refresh action
                                            # distribution instead of cloning recorded actions (BC_TOP ignored)
 if [ "$DISTILL" = 1 ]; then BCARGS="--bc_last_part 1 --distill 1"; fi
+EXTRA_BASE=${EXTRA_BASE:-}                 # more offline data dirs (comma-separated) next to the world model's own:
+                                           # part of the base in every stage, never counted as online
 START_ITER=${START_ITER:-1}                # resume: collections 1 .. START_ITER-1 are reused; a stage whose output
                                            # already exists (rl_i, the collection, wm_i) is skipped
 export CUDA_VISIBLE_DEVICES=$GPU
@@ -46,6 +48,8 @@ mkdir -p "$R"
 PARTS=$($PY -c "import torch, sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['config']['data']['path'])" "$WM") \
   || fail "reading $BASE"
 FIRST=${PARTS%%,*}
+if [ -n "$EXTRA_BASE" ]; then PARTS=$PARTS,$EXTRA_BASE; fi
+NBASE=$(echo "$PARTS" | tr ',' '\n' | wc -l)
 [ -f "$R/progress.tsv" ] || printf "iter\tepisodes\tsuccess\treturn\tutc\n" > "$R/progress.tsv"
 
 for j in $(seq 1 $((START_ITER - 1))); do PARTS=$PARTS,$A/data/dyna_${TAG}_$j; done
@@ -60,6 +64,7 @@ for i in $(seq "$START_ITER" "$ITERS"); do
       --steps "$U" --K 1 --lr "$PLR" --value_lr "$PLR" --lr_final 3e-5 --adv_drop_final 0.5 --clip_split 1 \
       --eval_every 1000000 --eval_n 64 ${PRIOR:+--prior_from "$PRIOR"} \
       --eval_envs 64 --beta "$BETA" ${HORIZON:+--horizon "$HORIZON"} --start_online_frac "$START_FRAC" \
+      --base_parts "$NBASE" \
       || fail "PMPO $i"
   fi
   CK=$R/rl_$i/checkpoints/latest.pt
@@ -83,7 +88,7 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
   [ -f "$R/wm_$i/checkpoints/latest.pt" ] || $PY -m dreamer4.train.train_heads --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/wm_$i" --seed 1 \
     --steps "$K" --val_frac 0 $BCARGS --bc_loss_weight "$BC_LOSS_W" --dyn_weight 10 --fwd_weight 0 --lr "$RLR" \
     --dyn_lr "$RDLR" --dyn_warmup "$WARM" --dyn_online_frac "$ONLINE_FRAC" --eval_every 1000000 --final_eval_n 64 \
-    --eval_envs 64 \
+    --eval_envs 64 --base_parts "$NBASE" \
     || fail "refresh $i"
   CK=$R/wm_$i/checkpoints/latest.pt
 done
