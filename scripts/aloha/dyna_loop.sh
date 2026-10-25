@@ -35,6 +35,10 @@ DISTILL=${DISTILL:-0}                      # 1: the refresh keeps the policy by 
 if [ "$DISTILL" = 1 ]; then BCARGS="--bc_last_part 1 --distill 1"; fi
 EXTRA_BASE=${EXTRA_BASE:-}                 # more offline data dirs (comma-separated) next to the world model's own:
                                            # part of the base in every stage, never counted as online
+FAIL_W=${FAIL_W:-1}                        # failed episodes' video windows sampled FAIL_W x in the refresh: a world
+                                           # model trained on mostly successful grasps dreams every uncertain grasp as
+                                           # a success; 3 makes it admit the policy's failures (dreamed held 0.97 ->
+                                           # 0.81 for a policy that holds the box in 0.78 of its real episodes)
 START_ITER=${START_ITER:-1}                # resume: collections 1 .. START_ITER-1 are reused; a stage whose output
                                            # already exists (rl_i, the collection, wm_i) is skipped
 export CUDA_VISIBLE_DEVICES=$GPU
@@ -88,7 +92,7 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
   [ -f "$R/wm_$i/checkpoints/latest.pt" ] || $PY -m dreamer4.train.train_heads --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/wm_$i" --seed 1 \
     --steps "$K" --val_frac 0 $BCARGS --bc_loss_weight "$BC_LOSS_W" --dyn_weight 10 --fwd_weight 0 --lr "$RLR" \
     --dyn_lr "$RDLR" --dyn_warmup "$WARM" --dyn_online_frac "$ONLINE_FRAC" --eval_every 1000000 --final_eval_n 64 \
-    --eval_envs 64 --base_parts "$NBASE" \
+    --eval_envs 64 --base_parts "$NBASE" --dyn_fail_weight "$FAIL_W" \
     || fail "refresh $i"
   CK=$R/wm_$i/checkpoints/latest.pt
 done
