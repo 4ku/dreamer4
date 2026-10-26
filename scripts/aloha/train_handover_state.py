@@ -102,13 +102,14 @@ def main():
         sac_train.train,
         network_factory=functools.partial(sac_networks.make_sac_networks, hidden_layer_sizes=(256, 256)),
         num_timesteps=STEPS, episode_length=hv2.EPISODE_STEPS, action_repeat=1, num_envs=512, num_eval_envs=64,
-        learning_rate=5e-5, discounting=0.97, seed=SEED, batch_size=512, num_evals=50,
+        learning_rate=5e-5, discounting=float(os.environ.get("DISCOUNT", 0.97)), seed=SEED, batch_size=512,
+        num_evals=50,
         normalize_observations=True, reward_scaling=2.0, tau=0.005, min_replay_size=8192,
         max_replay_size=2_000_000, grad_updates_per_step=32, deterministic_eval=True,
         wrap_env_fn=wrapper.wrap_for_brax_training, progress_fn=progress, eval_env=eval_env,
         checkpoint_logdir=str(LOGDIR / "checkpoints"))
-    print(f"SAC on AlohaHandOver, reward {MODE} (bonus {hv2.BONUS}, time {hv2.TIME}, table {hv2.TABLE}), seed {SEED}, "
-          f"{STEPS} steps -> {LOGDIR}", flush=True)
+    print(f"SAC on AlohaHandOver, reward {MODE} (bonus {hv2.BONUS}, time {hv2.TIME}, table {hv2.TABLE}), discount "
+          f"{os.environ.get('DISCOUNT', 0.97)}, seed {SEED}, {STEPS} steps -> {LOGDIR}", flush=True)
     train(environment=env)
     print("DONE", flush=True)
 
