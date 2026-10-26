@@ -14,7 +14,12 @@ missed grasps, the box knocked over -- and what the expert does next). Glitched 
 
 Layout (frames T+1 = 251 including the final one, actions / rewards T = 250):
     state.npy (N, T+1, 14) f32, action.npy (N, T, 14) f32, reward.npy (N, T) f32,
-    pixels_view_0|1|2.npy (N, T+1, 128, 128, 3) u8, manifest.json (each episode's length, end, noise, return)
+    pixels_view_0|1|2.npy (N, T+1, 128, 128, 3) u8, manifest.json (each episode's length, end, noise, return),
+    phi.npy (N, T+1) f32 and contact.npy (N, T) u8: the reward's ingredients, to re-price it without the simulator
+
+RELABEL=1 with OUT = an existing dataset (and its N / NWORLD / SEED / dials) replays it, checks the replay against the
+recorded states and actions, and rewrites only reward.npy, phi.npy, contact.npy and the manifest (BONUS / TIME / TABLE
+env vars change the reward-v2 constants).
 """
 from __future__ import annotations
 
@@ -44,6 +49,9 @@ GLITCH_FRAC = float(os.environ.get("GLITCH_FRAC", 0.0))
 GLITCH_LEN = [int(x) for x in os.environ.get("GLITCH_LEN", "10,50").split(",")]
 GLITCH_T = [int(x) for x in os.environ.get("GLITCH_T", "20,150").split(",")]
 STATS_FROM = os.environ.get("STATS_FROM", "")    # copy this dataset's proprio standardisation
+RELABEL = os.environ.get("RELABEL", "") == "1"   # replay OUT's episodes (same N / NWORLD / SEED / dials), check them
+                                                 # against its states and actions, rewrite only rewards + manifest
+REWARD_CONSTANTS = ("BONUS", "TIME", "TABLE")    # env vars overriding reward-v2 constants (recorded in the manifest)
 CAM_RES_HW = (128, 128)
 CAMERAS = ("view_0", "view_1", "view_2")
 
@@ -53,6 +61,9 @@ def load_hv2():
     spec = importlib.util.spec_from_file_location("aloha_handover_v2", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    for name in REWARD_CONSTANTS:
+        if name in os.environ:
+            setattr(mod, name, float(os.environ[name]))
     return mod
 
 
@@ -70,6 +81,7 @@ def make_rollout_fn(hv2, env, nworld):
     proprio = jax.vmap(lambda d: hv2.proprio(env, d))
     init_aux = jax.vmap(lambda s: hv2.init_aux(env, s))
     v2_step = jax.vmap(lambda s, a: hv2.step_reward(env, s, a))
+    potential = jax.vmap(lambda s: hv2.potential(env, s.data, s.info))
     u8 = lambda x: (jp.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(jp.uint8)
     T = hv2.EPISODE_STEPS
 
@@ -93,10 +105,12 @@ def make_rollout_fn(hv2, env, nworld):
             nxt = step(state, action)
             out = {"state": proprio(state.data), "action": action, **frames(state)}
             out["reward"], out["v2_done"], out["v2_ok"], aux = v2_step(nxt, aux)
+            out["phi"], out["contact"] = aux["phi"], potential(nxt)[1]
             return (nxt, aux), out
 
+        phi0 = aux["phi"]
         (final, _), traj = jax.lax.scan(body_fn, (state, aux), (noise, wild, glitch))
-        return traj, {"state": proprio(final.data), **frames(final)}
+        return traj, {"state": proprio(final.data), "phi0": phi0, **frames(final)}
 
     return jax.jit(rollout), T
 
@@ -108,10 +122,15 @@ def main():
     rollout, T = make_rollout_fn(hv2, env, NWORLD)
     OUT.mkdir(parents=True, exist_ok=True)
     mm = lambda name, shape, dtype: np.lib.format.open_memmap(OUT / name, mode="w+", dtype=dtype, shape=shape)
-    arr = {"state": mm("state.npy", (N, T + 1, 14), np.float32),
-           "action": mm("action.npy", (N, T, 14), np.float32),
-           "reward": mm("reward.npy", (N, T), np.float32),
-           **{c: mm(f"pixels_{c}.npy", (N, T + 1, *CAM_RES_HW, 3), np.uint8) for c in CAMERAS}}
+    arr = {"reward": mm("reward.npy", (N, T), np.float32),
+           "phi": mm("phi.npy", (N, T + 1), np.float32),          # phi before the first step and after each one
+           "contact": mm("contact.npy", (N, T), np.uint8)}        # a finger on the table after each step
+    if RELABEL:
+        old = {"state": np.load(OUT / "state.npy", mmap_mode="r"), "action": np.load(OUT / "action.npy", mmap_mode="r")}
+    else:
+        arr.update({"state": mm("state.npy", (N, T + 1, 14), np.float32),
+                    "action": mm("action.npy", (N, T, 14), np.float32),
+                    **{c: mm(f"pixels_{c}.npy", (N, T + 1, *CAM_RES_HW, 3), np.uint8) for c in CAMERAS}})
     rng = np.random.default_rng(SEED)
     episodes, n, b, t_start = [], 0, 0, time.time()
     while n < N:
@@ -127,11 +146,20 @@ def main():
         traj = {k: np.swapaxes(np.asarray(v), 0, 1)[:m] for k, v in traj.items()}   # (m, T, ...)
         final = {k: np.asarray(v)[:m] for k, v in final.items()}
         sl = slice(n, n + m)
-        arr["state"][sl] = np.concatenate([traj["state"], final["state"][:, None]], 1)
-        for c in CAMERAS:
-            arr[c][sl] = np.concatenate([traj[c], final[c][:, None]], 1)
-        arr["action"][sl] = traj["action"]
+        if RELABEL:
+            d_state = float(np.abs(np.asarray(old["state"][sl][:, :T]) - traj["state"]).max())
+            d_action = float(np.abs(np.asarray(old["action"][sl]) - traj["action"]).max())
+            if max(d_state, d_action) > 1e-3:
+                raise SystemExit(f"replay of batch {b + 1} differs from the recorded episodes: state {d_state:.2e} "
+                                 f"action {d_action:.2e} (same N / NWORLD / SEED / dials?)")
+        else:
+            arr["state"][sl] = np.concatenate([traj["state"], final["state"][:, None]], 1)
+            for c in CAMERAS:
+                arr[c][sl] = np.concatenate([traj[c], final[c][:, None]], 1)
+            arr["action"][sl] = traj["action"]
         arr["reward"][sl] = traj["reward"]
+        arr["phi"][sl] = np.concatenate([final["phi0"][:, None], traj["phi"]], 1)
+        arr["contact"][sl] = traj["contact"] > 0.5
         ret = traj["reward"].sum(1)
         length, end = episode_ends(traj["v2_done"], traj["v2_ok"])
         success = end == "success"
@@ -150,7 +178,7 @@ def main():
               f"{n}/{N} | {time.time() - t0:.1f} s", flush=True)
     for a in arr.values():
         a.flush()
-    flat = np.asarray(arr["state"], np.float64).reshape(-1, 14)
+    flat = np.asarray(old["state"] if RELABEL else arr["state"], np.float64).reshape(-1, 14)
     mean, std = flat.mean(0).round(6).tolist(), flat.std(0).round(6).tolist()
     if STATS_FROM:
         ref = json.loads((pathlib.Path(STATS_FROM) / "manifest.json").read_text())
@@ -158,9 +186,10 @@ def main():
     manifest = {"format": "aloha-npy", "cameras": list(CAMERAS), "downscale": 1, "n_episodes": N,
                 "state_mean": mean, "state_std": std,
                 "env": {"task": "handover", "reward": "v2", "cam_res": list(CAM_RES_HW), "max_steps": T},
+                "reward_v2": {"bonus": hv2.BONUS, "time": hv2.TIME, "table": hv2.TABLE, "hold": hv2.HOLD},
                 "collector": {"demonstrator": SAC, "clean_frac": CLEAN_FRAC, "noise": [NOISE_LO, NOISE_HI],
                               "glitch_frac": GLITCH_FRAC, "glitch_len": GLITCH_LEN, "glitch_t": GLITCH_T,
-                              "seed": SEED},
+                              "seed": SEED, "relabelled": bool(RELABEL)},
                 "episodes": episodes}
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1))
     s = np.array([e["success"] for e in episodes])
