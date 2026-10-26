@@ -30,7 +30,12 @@ class AlohaPickBatch:
     batched = True
 
     def __init__(self, n: int, *, cameras: Sequence[str] = ("view_0", "view_2"), downscale: int = 1,
-                 cam_res: Sequence[int] = (128, 128), max_steps: int = 120):
+                 cam_res: Sequence[int] = (128, 128), max_steps: int = 120, lift_target: float = 0.10,
+                 reward: str = "v1"):
+        """``lift_target``: the box height (m) where the lift reward stops growing (the env's
+        ``box_z_lift_target``). ``reward``: "v1" = the env's own reward (success checked at the last step),
+        "v2" = :mod:`dreamer4.envs.aloha_reward_v2` (success ends the episode). A dataset records both in its
+        manifest's ``env``, so evaluation pays the reward the data was labelled with."""
         python = os.environ.get("ALOHA_PYTHON")
         if not python:
             raise RuntimeError("set ALOHA_PYTHON to the MuJoCo Playground environment's python "
@@ -42,7 +47,7 @@ class AlohaPickBatch:
             env["CUDA_VISIBLE_DEVICES"] = os.environ["ALOHA_GPU"]
         worker = Path(__file__).with_name("aloha_pick_worker.py")
         self._proc = subprocess.Popen([python, str(worker), str(self.n), str(int(cam_res[0])),
-                                       ",".join(self.cameras)],
+                                       ",".join(self.cameras), str(float(lift_target)), str(reward)],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
 
     def _call(self, *msg):

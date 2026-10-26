@@ -15,9 +15,12 @@ clean recordings only): they teach the world model, the copycat stays the one cl
 proprio standardisation is copied from --base so a merged dataset reads one convention.
 
     BASE=<base dataset dir> N=1024 NWORLD=128 OUT=<new dir> [OFF_XY=0.02 OFF_Z=0.02] python collect_aloha_fast.py
+
+REWARD=v2 and LINK_FROM=<dataset> work as in collect_aloha_npy.py (reward v2 labels; re-labelling by replay).
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import pathlib
@@ -48,6 +51,23 @@ CLOSE_LO, CLOSE_HI = int(os.environ.get("CLOSE_LO", 3)), int(os.environ.get("CLO
 # data shows what an off-centre grasp does (the box tilts, is pushed or slips) -- a world model that only saw centred
 # grasps dreams every grasp near the box as a clean one, and imagination RL exploits that.
 OFF_XY, OFF_Z = float(os.environ.get("OFF_XY", 0.0)), float(os.environ.get("OFF_Z", 0.0))
+REWARD = os.environ.get("REWARD", "v1")
+LINK_FROM = os.environ.get("LINK_FROM", "")
+
+
+def load_v2():
+    path = pathlib.Path(__file__).resolve().parents[2] / "dreamer4" / "envs" / "aloha_reward_v2.py"
+    spec = importlib.util.spec_from_file_location("aloha_reward_v2", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def episode_ends(done, ok):
+    """(m, T) v2 done / success flags -> per-episode length (transitions) and how it ended."""
+    T = done.shape[1]
+    first = np.where(done.any(1), done.argmax(1), T - 1)
+    return first + 1, np.where(ok.any(1), "success", np.where(done.any(1), "drop", "time"))
 CAM_RES_HW = (128, 128)
 CAMERAS = ("view_0", "view_2")
 ACTION_SCALE = 0.015
@@ -86,14 +106,19 @@ def make_rollout_fn(env, nworld):
     reset, step = jax.vmap(env.reset), jax.vmap(env.step)
     kin = jax.vmap(lambda d: mjx.kinematics(mjx_model, d))
     u8 = lambda x: (jp.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(jp.uint8)
+    v2 = load_v2() if REWARD == "v2" else None
+    if v2 is not None:
+        init_aux = jax.vmap(lambda s: v2.init_aux(env, s))
+        v2_step = jax.vmap(lambda s, a: v2.step_reward(env, s, a))
 
     def rollout(rngs, gain, pre, tol_a, tol_b, n_close, off):
         state = reset(rngs)
         state = state.replace(data=kin(state.data))
         box0 = state.data.qpos[:, box_qadr:box_qadr + 3]
+        aux = init_aux(state) if v2 is not None else jp.zeros(nworld)
 
         def body_fn(carry, t):
-            state, grasp, phase, count = carry
+            state, grasp, phase, count, aux = carry
             action, grasp, phase, count = policy(state, box0, grasp, phase, count, gain, pre, tol_a, tol_b,
                                                  n_close, off)
             nxt = step(state, action)
@@ -101,11 +126,13 @@ def make_rollout_fn(env, nworld):
                    "view_2": u8(state.obs["pixels/view_2"]), "action": action, "reward": nxt.reward,
                    "box_z": nxt.data.qpos[:, box_qadr + 2],
                    "grasping": nxt.info["grasping"].astype(jp.float32), "phase": phase}
-            return (nxt, grasp, phase, count), out
+            if v2 is not None:
+                out["reward"], out["v2_done"], out["v2_ok"], aux = v2_step(nxt, aux)
+            return (nxt, grasp, phase, count, aux), out
 
         zeros = jp.zeros(nworld, jp.int32)
-        (final, _, _, _), traj = jax.lax.scan(body_fn, (state, jp.zeros((nworld, 3)), zeros, zeros),
-                                              jp.arange(ep_len))
+        (final, _, _, _, _), traj = jax.lax.scan(body_fn, (state, jp.zeros((nworld, 3)), zeros, zeros, aux),
+                                                 jp.arange(ep_len))
         final_obs = {"state": final.obs["state"], "view_0": u8(final.obs["pixels/view_0"]),
                      "view_2": u8(final.obs["pixels/view_2"])}
         return traj, final_obs
@@ -120,10 +147,17 @@ def main():
     base = json.loads((BASE / "manifest.json").read_text())
     OUT.mkdir(parents=True, exist_ok=True)
     mm = lambda name, shape, dtype: np.lib.format.open_memmap(OUT / name, mode="w+", dtype=dtype, shape=shape)
-    arr = {"state": mm("state.npy", (N, T + 1, 14), np.float32),
-           "action": mm("action.npy", (N, T, 14), np.float32),
-           "reward": mm("reward.npy", (N, T), np.float32),
-           **{c: mm(f"pixels_{c}.npy", (N, T + 1, *CAM_RES_HW, 3), np.uint8) for c in CAMERAS}}
+    if LINK_FROM:
+        src = pathlib.Path(LINK_FROM)
+        for name in ["state.npy", "action.npy"] + [f"pixels_{c}.npy" for c in CAMERAS]:
+            (OUT / name).symlink_to((src / name).resolve())
+        old = {"state": np.load(src / "state.npy", mmap_mode="r"), "action": np.load(src / "action.npy", mmap_mode="r")}
+        arr = {"reward": mm("reward.npy", (N, T), np.float32)}
+    else:
+        arr = {"state": mm("state.npy", (N, T + 1, 14), np.float32),
+               "action": mm("action.npy", (N, T, 14), np.float32),
+               "reward": mm("reward.npy", (N, T), np.float32),
+               **{c: mm(f"pixels_{c}.npy", (N, T + 1, *CAM_RES_HW, 3), np.uint8) for c in CAMERAS}}
     rng = np.random.default_rng(SEED)
     episodes, n, b, t_start = [], 0, 0, time.time()
     while n < N:
@@ -141,21 +175,34 @@ def main():
         traj = {k: np.swapaxes(np.asarray(v), 0, 1)[:m] for k, v in traj.items()}   # (m, T, ...)
         final = {k: np.asarray(v)[:m] for k, v in final.items()}
         sl = slice(n, n + m)
-        arr["state"][sl] = np.concatenate([traj["state"], final["state"][:, None]], 1)
-        for c in CAMERAS:
-            arr[c][sl] = np.concatenate([traj[c], final[c][:, None]], 1)
-        arr["action"][sl] = traj["action"]
+        if LINK_FROM:
+            d_state = float(np.abs(np.asarray(old["state"][sl][:, :T]) - traj["state"]).max())
+            d_action = float(np.abs(np.asarray(old["action"][sl]) - traj["action"]).max())
+            if max(d_state, d_action) > 1e-3:
+                raise SystemExit(f"replay of batch {b + 1} differs from {LINK_FROM}: state {d_state:.2e} "
+                                 f"action {d_action:.2e} (same N / NWORLD / SEED / offsets?)")
+        else:
+            arr["state"][sl] = np.concatenate([traj["state"], final["state"][:, None]], 1)
+            for c in CAMERAS:
+                arr[c][sl] = np.concatenate([traj[c], final[c][:, None]], 1)
+            arr["action"][sl] = traj["action"]
         arr["reward"][sl] = traj["reward"]
-        success = (traj["box_z"][:, -1] > 0.10) & (traj["grasping"][:, -1] > 0.5)
         ret = traj["reward"].sum(1)
+        if REWARD == "v2":
+            length, end = episode_ends(traj["v2_done"], traj["v2_ok"])
+            success = end == "success"
+        else:
+            success = (traj["box_z"][:, -1] > 0.10) & (traj["grasping"][:, -1] > 0.5)
         lift_t = np.where((traj["phase"] == 3).any(1), (traj["phase"] == 3).argmax(1), -1)
         for i in range(m):
-            episodes.append({"source": "fast_expert", "gain": round(float(gain[i]), 3),
-                             "pre": round(float(pre[i]), 3),
-                             "tol_a": round(float(tol_a[i]), 4), "tol_b": round(float(tol_b[i]), 4),
-                             "n_close": int(n_close[i]), "off": [round(float(x), 4) for x in off[i]],
-                             "lift_step": int(lift_t[i]), "speed": 1.0, "noise": 1.0,
-                             "success": bool(success[i]), "return": round(float(ret[i]), 2)})
+            rec = {"source": "fast_expert", "gain": round(float(gain[i]), 3), "pre": round(float(pre[i]), 3),
+                   "tol_a": round(float(tol_a[i]), 4), "tol_b": round(float(tol_b[i]), 4),
+                   "n_close": int(n_close[i]), "off": [round(float(x), 4) for x in off[i]],
+                   "lift_step": int(lift_t[i]), "speed": 1.0, "noise": 1.0,
+                   "success": bool(success[i]), "return": round(float(ret[i]), 3)}
+            if REWARD == "v2":
+                rec.update(length=int(length[i]), end=str(end[i]))
+            episodes.append(rec)
         n += m
         b += 1
         print(f"batch {b}: {m} episodes, success {success.mean():.2f}, return {ret.mean():.1f} "
@@ -164,12 +211,13 @@ def main():
     for a in arr.values():
         a.flush()
     manifest = {k: base[k] for k in ("format", "cameras", "downscale", "env", "state_mean", "state_std")}
+    manifest["env"] = {**manifest["env"], **({"reward": "v2"} if REWARD == "v2" else {})}
     manifest.update({"n_episodes": N, "episodes": episodes,
                      "collector": {"expert": "closed-loop fast", "gain": [GAIN_LO, GAIN_HI],
                                    "pre": [PRE_LO, PRE_HI],
                                    "tol_a": [TOL_A_LO, TOL_A_HI], "tol_b": [TOL_B_LO, TOL_B_HI],
                                    "n_close": [CLOSE_LO, CLOSE_HI], "off_xy": OFF_XY, "off_z": OFF_Z,
-                                   "seed": SEED,
+                                   "seed": SEED, "reward": REWARD, "relabelled_from": LINK_FROM or None,
                                    "proprio_stats_from": str(BASE)}})
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1))
     s = np.array([e["success"] for e in episodes])

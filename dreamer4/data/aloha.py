@@ -67,6 +67,9 @@ class AlohaEpisodeDataset(EpisodeVideoDataset):
     #: Episodes whose recorded action noise is above this are not cloned.
     BC_MAX_NOISE = 0.0
 
+    #: Reward v2 (:mod:`dreamer4.envs.aloha_reward_v2`): a step paying at least this is the success step.
+    TERMINAL_REWARD = 0.5
+
     #: Floor of the standardising std: the frozen left arm only jitters (std 3e-6 - 5e-3 rad), and
     #: dividing by that would blow physics noise up to O(1); the right gripper moves with std 0.01.
     STD_FLOOR = 0.01
@@ -121,7 +124,8 @@ class AlohaEpisodeDataset(EpisodeVideoDataset):
         return self._action.shape[-1] if self._actions else None
 
     def episode_frames(self, i: int) -> int:
-        return self._n_trans + 1
+        """Reward v2 ends an episode at success or a drop: the manifest records its ``length`` (transitions)."""
+        return int(self._episodes[i].get("length", self._n_trans)) + 1
 
     def _load_clip(self, i: int, start: int, length: int) -> dict:
         frames = slice(start, start + length)
@@ -134,7 +138,10 @@ class AlohaEpisodeDataset(EpisodeVideoDataset):
             out["actions"] = np.asarray(self._action[i, steps], np.float32)
             if self._reward is not None:
                 out["rewards"] = np.asarray(self._reward[i, steps], np.float32)
-                out["terminals"] = np.zeros(length - 1, bool)
+                rec = self._episodes[i]
+                ended = rec.get("end") in ("success", "drop")
+                last = int(rec.get("length", self._n_trans)) - 1
+                out["terminals"] = (np.arange(start, start + length - 1) == last) & ended
         return out
 
     def standardise(self, state: np.ndarray) -> np.ndarray:
@@ -152,7 +159,10 @@ class AlohaEpisodeDataset(EpisodeVideoDataset):
         return float(rec.get("noise", 0.0) <= self.BC_MAX_NOISE)
 
     def continues_from_reward(self, reward_pred):
-        """Episodes end at the time limit only: nothing a reward says is terminal."""
+        """Reward v1: episodes end at the time limit only, nothing a reward says is terminal. Reward v2: the step
+        that pays the success bonus (>= TERMINAL_REWARD) ends the episode."""
+        if self.manifest.get("env", {}).get("reward") == "v2":
+            return (reward_pred < self.TERMINAL_REWARD) * 1.0
         return reward_pred * 0.0 + 1.0
 
     def proprio_from_info(self, info: Dict) -> Optional[np.ndarray]:

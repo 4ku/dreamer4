@@ -52,8 +52,12 @@ fail() { stamp "FAILED: $*"; exit 1; }
 WM=$A/runs/$BASE/checkpoints/latest.pt
 R=$A/runs/dyna_$TAG
 mkdir -p "$R"
-PARTS=$($PY -c "import torch, sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['config']['data']['path'])" "$WM") \
-  || fail "reading $BASE"
+if [ -n "${BASE_DATA:-}" ]; then              # e.g. the reward-v2 re-labelling of the world model's own data:
+  PARTS=$BASE_DATA                            # its first dir sets the env and the terminal rule of every stage
+else
+  PARTS=$($PY -c "import torch, sys; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['config']['data']['path'])" "$WM") \
+    || fail "reading $BASE"
+fi
 FIRST=${PARTS%%,*}
 if [ -n "$EXTRA_BASE" ]; then PARTS=$PARTS,$EXTRA_BASE; fi
 NBASE=$(echo "$PARTS" | tr ',' '\n' | wc -l)

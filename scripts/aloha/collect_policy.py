@@ -35,8 +35,10 @@ cfg = ap.parse_args()
 dev = torch.device("cuda")
 base = json.loads((Path(cfg.base) / "manifest.json").read_text())
 ckpt = torch.load(cfg.ckpt, map_location="cpu", weights_only=False)
-world = WorldModel(cfg.dyn, device=dev, n_agent=int(ckpt["n_agent"]))
+# The env (and its reward version) comes from the base dataset, not from the world model's own data.
+world = WorldModel(cfg.dyn, device=dev, n_agent=int(ckpt["n_agent"]), data=cfg.base)
 world.load_dynamics_weights(ckpt["dyn"])
+v2 = base.get("env", {}).get("reward") == "v2"
 heads = build_agent_heads(ckpt["agent_cfg"]).to(dev)
 heads.load_state_dict(ckpt["agent"])
 policy = AgentPolicy(world.dyn.eval(), heads.eval(), window=int(ckpt["clip_T"]),
@@ -74,6 +76,9 @@ with torch.no_grad():
             state[done:done + m, t] = np.stack([i["state"] for i in infos])[:m]
 
         record(0, frames, infos)
+        length = np.full(B, T)
+        ended = np.zeros(B, bool)
+        ok = np.zeros(B, bool)
         for t in range(T):
             vid = np.stack([np.stack(w[-hist:]) for w in window])
             z = tok.encode_last(vid).float().to(dev)
@@ -82,18 +87,28 @@ with torch.no_grad():
             a = policy.act(z, pr, greedy=cfg.greedy, temperature=cfg.temperature, prev_action=prev)
             prev = a
             env_a = np.asarray(policy.env_action(a), np.float32)
-            frames, r, _, infos = env.step(env_a)
+            frames, r, term, infos = env.step(env_a)
             action[done:done + m, t] = env_a[:m]
             reward[done:done + m, t] = np.asarray(r)[:m]
             ret += np.asarray(r)
             for w, f in zip(window, frames):
                 w.append(f)
             record(t + 1, frames, infos)
-        ok = np.array([i["is_success"] for i in infos])
+            if v2:
+                # Reward v2 ends an episode at success or a drop: the worker keeps the world stepping and paying 0.
+                now = np.asarray(term, bool) & ~ended
+                length = np.where(now, t + 1, length)
+                ok |= np.array([i["is_success"] for i in infos])
+                ended |= now
+        if not v2:
+            ok = np.array([i["is_success"] for i in infos])
         for i in range(m):
-            episodes.append({"source": "policy", "ckpt": cfg.ckpt, "greedy": bool(cfg.greedy),
-                             "temperature": cfg.temperature, "seed": cfg.seed + done + i, "speed": 1.0, "noise": 1.0,
-                             "success": bool(ok[i]), "return": round(float(ret[i]), 3)})
+            rec = {"source": "policy", "ckpt": cfg.ckpt, "greedy": bool(cfg.greedy),
+                   "temperature": cfg.temperature, "seed": cfg.seed + done + i, "speed": 1.0, "noise": 1.0,
+                   "success": bool(ok[i]), "return": round(float(ret[i]), 3)}
+            if v2:
+                rec.update(length=int(length[i]), end="success" if ok[i] else ("drop" if ended[i] else "time"))
+            episodes.append(rec)
         done += m
         print(f"{done}/{N}: round success {ok[:m].mean():.2f} return {ret[:m].mean():.1f} | "
               f"{(time.time() - t0) / 60:.1f} min", flush=True)

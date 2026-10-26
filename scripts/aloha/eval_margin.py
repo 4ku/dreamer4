@@ -25,6 +25,9 @@ ap.add_argument("--n", type=int, default=512)
 ap.add_argument("--envs", type=int, default=64)
 ap.add_argument("--seed", type=int, default=900000)
 ap.add_argument("--sampled", action="store_true")
+ap.add_argument("--data", default="",
+                help="dataset whose env spec to play (a reward-v2 re-labelling ends episodes at success); "
+                     "default: the world model's")
 ap.add_argument("policies", nargs="+", help="name=checkpoint")
 cfg = ap.parse_args()
 
@@ -33,12 +36,12 @@ results, env = {}, None
 for spec in cfg.policies:
     name, ck = spec.split("=", 1)
     world, agent = load_agent(argparse.Namespace(init_from=ck, dyn=cfg.dyn, device="cuda", reward_decode="mode",
-                                                 compact=0), dev)
+                                                 compact=0, data=cfg.data), dev)
     if env is None:
         env = make_eval_envs(world.env_spec, cfg.envs)
     policy = agent.eval_policy()
     tok, hist, T, B = world.tok, world.tok.history, env.max_steps, env.n
-    succ, rets, last = [], [], []
+    succ, rets, last, lens = [], [], [], []
     torch.manual_seed(cfg.seed)
     with torch.no_grad():
         for start in range(0, cfg.n, B):
@@ -46,7 +49,7 @@ for spec in cfg.policies:
             frames, infos = env.reset([cfg.seed + start + i for i in range(B)])
             window = [[f] * hist for f in frames]
             policy.reset_rows(None)
-            prev, ret = None, np.zeros(B)
+            prev, ret, ln = None, np.zeros(B), np.zeros(B, np.int64)
             alive, ok, r_last = np.ones(B, bool), np.zeros(B, bool), np.zeros(B)
             for t in range(T):
                 z = tok.encode_last(np.stack([np.stack(w[-hist:]) for w in window])).float().to(dev)
@@ -57,6 +60,7 @@ for spec in cfg.policies:
                 frames, r, term, infos = env.step(policy.env_action(a))
                 r = np.asarray(r, np.float64)
                 ret += np.where(alive, r, 0.0)
+                ln += alive
                 ended = alive & (np.asarray(term, bool) | (t == T - 1))
                 ok |= ended & np.array([i["is_success"] for i in infos])
                 r_last = np.where(ended, r, r_last)
@@ -68,15 +72,18 @@ for spec in cfg.policies:
             succ += ok[:m].tolist()
             rets += ret[:m].tolist()
             last += r_last[:m].tolist()
-    succ, rets, last = np.array(succ), np.array(rets), np.array(last)
+            lens += ln[:m].tolist()
+    succ, rets, last, lens = np.array(succ), np.array(rets), np.array(last), np.array(lens)
     res = {"ckpt": ck, "n": int(len(succ)), "success": float(succ.mean()), "return": float(rets.mean()),
            "held_9cm": float((last >= 0.99).mean()), "held_9_5cm": float((last >= 1.04).mean()),
            "fail_but_held_9cm": float(((~succ) & (last >= 0.99)).mean()),
-           "fail_return": float(rets[~succ].mean()) if (~succ).any() else float("nan")}
+           "fail_return": float(rets[~succ].mean()) if (~succ).any() else float("nan"),
+           "steps": float(lens.mean()), "steps_success": float(lens[succ].mean()) if succ.any() else float("nan")}
     results[name] = res
     print(f"{name:24s} success {res['success']:.3f} | grasped >= ~9 cm at the end {res['held_9cm']:.3f} "
           f"(>= ~9.5 cm {res['held_9_5cm']:.3f}) | return {res['return']:.1f} | failures that still hold >= 9 cm "
-          f"{res['fail_but_held_9cm']:.3f}", flush=True)
+          f"{res['fail_but_held_9cm']:.3f} | steps to the end {res['steps']:.1f} (successes {res['steps_success']:.1f})",
+          flush=True)
     del world, agent, policy
     torch.cuda.empty_cache()
 env.close()

@@ -225,11 +225,13 @@ def main(argv=None):
     ap.add_argument("--json", default="", help="also write the result here")
     ap.add_argument("--temperature", type=float, default=1.0,
                     help="temperature of the SAMPLED evaluation (< 1 sharpens the policy toward greedy)")
+    ap.add_argument("--data", default="",
+                    help="dataset whose env spec to play (e.g. a reward-v2 re-labelling); default: the world model's")
     cfg = ap.parse_args(argv)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     t0 = time.time()
     ckpt = torch.load(cfg.ckpt, map_location="cpu", weights_only=False)
-    world = WorldModel(cfg.dyn, device=dev, n_agent=int(ckpt["n_agent"]))
+    world = WorldModel(cfg.dyn, device=dev, n_agent=int(ckpt["n_agent"]), data=cfg.data or None)
     world.load_dynamics_weights(ckpt["dyn"])
     heads = build_agent_heads(ckpt["agent_cfg"]).to(dev)
     heads.load_state_dict(ckpt["agent"])
