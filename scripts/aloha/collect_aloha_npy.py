@@ -48,6 +48,8 @@ CLEAN_FRAC = float(os.environ.get("CLEAN_FRAC", 0.5))
 NOISE_LO, NOISE_HI = float(os.environ.get("NOISE_LO", 0.05)), float(os.environ.get("NOISE_HI", 0.5))
 REWARD = os.environ.get("REWARD", "v1")
 LINK_FROM = os.environ.get("LINK_FROM", "")
+STATS_FROM = os.environ.get("STATS_FROM", "")    # copy this dataset's proprio standardisation (one convention for
+                                                 # the models trained on it); default: computed from the new states
 CAM_RES_HW = (128, 128)
 CAMERAS = ("view_0", "view_2")
 ACTION_SCALE = 0.015
@@ -203,8 +205,12 @@ def main():
     env_spec = {"cam_res": list(CAM_RES_HW), "max_steps": T}
     if REWARD == "v2":
         env_spec["reward"] = "v2"
+    mean, std = flat.mean(0).round(6).tolist(), flat.std(0).round(6).tolist()
+    if STATS_FROM:
+        ref = json.loads((pathlib.Path(STATS_FROM) / "manifest.json").read_text())
+        mean, std = ref["state_mean"], ref["state_std"]
     manifest = {"format": "aloha-npy", "cameras": list(CAMERAS), "downscale": 1, "n_episodes": N,
-                "state_mean": flat.mean(0).round(6).tolist(), "state_std": flat.std(0).round(6).tolist(),
+                "state_mean": mean, "state_std": std,
                 "env": env_spec,
                 "collector": {"speed": [SPEED_LO, SPEED_HI], "clean_frac": CLEAN_FRAC,
                               "noise": [NOISE_LO, NOISE_HI], "seed": SEED, "reward": REWARD,
