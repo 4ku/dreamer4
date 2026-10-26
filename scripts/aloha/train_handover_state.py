@@ -47,14 +47,18 @@ for name in ("TABLE", "TIME", "BONUS"):
 AUX = ("phi", "held", "left_held", "t", "ended")
 
 
+RATCHET = os.environ.get("RATCHET", "") == "1"   # ablation: progress = new best phi only (the env's own scheme)
+
+
 class HandOverV2(handover.HandOver):
     """The env with the reward-v2 bookkeeping in ``info``; pays v2 (or, MODE v1, its own reward) and always reports
-    the v2 success in ``metrics`` (brax's evaluator sums a metric over the episode)."""
+    the v2 success and phi in ``metrics`` (brax's evaluator sums a metric over the episode)."""
 
     def reset(self, rng):
         s = super().reset(rng)
         aux = hv2.init_aux(self, s)
         s.info.update({f"v2_{k}": v for k, v in aux.items()})
+        s.info["v2_best"] = aux["phi"]
         s.metrics.update(success=jp.zeros(()), phi=aux["phi"])
         return s
 
@@ -65,8 +69,14 @@ class HandOverV2(handover.HandOver):
         fresh = (state.info["steps"] if "steps" in state.info else state.info["_steps"]) == 0
         init = hv2.init_aux(self, state)
         aux = {k: jp.where(fresh, init[k], state.info[f"v2_{k}"]) for k in AUX}
+        best = jp.where(fresh, init["phi"], state.info["v2_best"])
         nxt = super().step(state, action)
+        phi_before, was_over = aux["phi"], aux["ended"]
         reward, done, ok, aux = hv2.step_reward(self, nxt, aux)
+        if RATCHET:
+            # swap the progress term phi' - phi for max(phi' - best so far, 0)
+            reward = jp.where(was_over, reward, reward - (aux["phi"] - phi_before) + jp.maximum(aux["phi"] - best, 0.0))
+        nxt.info["v2_best"] = jp.maximum(best, aux["phi"])
         nxt.info.update({f"v2_{k}": v for k, v in aux.items()})
         nxt.metrics.update(success=ok.astype(jp.float32), phi=aux["phi"])
         if MODE == "v1":
@@ -93,9 +103,10 @@ def main():
                "reward": float(metrics["eval/episode_reward"]),
                "success": float(metrics.get("eval/episode_success", float("nan"))),
                "length": float(metrics.get("eval/avg_episode_length", float("nan")))}
+        row["phi_mean"] = float(metrics.get("eval/episode_phi", float("nan"))) / max(row["length"], 1.0)
         log.write(json.dumps(row) + "\n")
         print(f"[{row['minutes']:7.1f} min] {num_steps:>11d} steps | return {row['reward']:7.3f} | v2 success "
-              f"{row['success']:.3f} | episode length {row['length']:.0f}", flush=True)
+              f"{row['success']:.3f} | episode length {row['length']:.0f} | mean phi {row['phi_mean']:.3f}", flush=True)
 
     env, eval_env = make_env(), make_env()
     train = functools.partial(
@@ -108,8 +119,9 @@ def main():
         max_replay_size=2_000_000, grad_updates_per_step=32, deterministic_eval=True,
         wrap_env_fn=wrapper.wrap_for_brax_training, progress_fn=progress, eval_env=eval_env,
         checkpoint_logdir=str(LOGDIR / "checkpoints"))
-    print(f"SAC on AlohaHandOver, reward {MODE} (bonus {hv2.BONUS}, time {hv2.TIME}, table {hv2.TABLE}), discount "
-          f"{os.environ.get('DISCOUNT', 0.97)}, seed {SEED}, {STEPS} steps -> {LOGDIR}", flush=True)
+    print(f"SAC on AlohaHandOver, reward {MODE}{' ratchet' if RATCHET else ''} (bonus {hv2.BONUS}, time {hv2.TIME}, "
+          f"table {hv2.TABLE}), discount {os.environ.get('DISCOUNT', 0.97)}, seed {SEED}, {STEPS} steps -> {LOGDIR}",
+          flush=True)
     train(environment=env)
     print("DONE", flush=True)
 
