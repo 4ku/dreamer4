@@ -1,0 +1,173 @@
+"""Collect AlohaHandOver episodes for the Dreamer4 world model, written straight into the aloha-npy layout.
+
+The demonstrator is the April state-only SAC expert (the fork's ``learning/train_jax_sac.py``, run 65, return 6.09 on
+the env's own reward; success 0.977 under reward v2). It acts on the env's privileged 83-D state; the episodes record
+what Dreamer sees: three cameras, the 14-D joint state, the applied (noisy) action and the reward-v2 labels of
+:mod:`dreamer4.envs.aloha_handover_v2` (green target, success ends the episode, drops do not). One per-episode dial:
+Gaussian noise of std sigma on the expert's action -- a share CLEAN_FRAC of the episodes is noise-free (the clones
+learn from those), the rest draws sigma ~ U(NOISE_LO, NOISE_HI). The expert shrugs noise off (success 0.96 / 0.88 /
+0.77 at sigma 0.1 / 0.3 / 0.5), so a second dial makes it fail and recover: a share GLITCH_FRAC of the episodes gets
+one burst of uniformly random actions, GLITCH_LEN steps long, starting at a step in GLITCH_T (drops at the hand-over,
+missed grasps, the box knocked over -- and what the expert does next). Glitched episodes are never cloned.
+
+    SAC=<checkpoint dir> N=2000 NWORLD=64 OUT=<dir> python collect_handover.py   (in the fork's venv)
+
+Layout (frames T+1 = 251 including the final one, actions / rewards T = 250):
+    state.npy (N, T+1, 14) f32, action.npy (N, T, 14) f32, reward.npy (N, T) f32,
+    pixels_view_0|1|2.npy (N, T+1, 128, 128, 3) u8, manifest.json (each episode's length, end, noise, return)
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import pathlib
+import sys
+import time
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("MUJOCO_GL", "egl")
+
+import jax
+import jax.numpy as jp
+import numpy as np
+from brax.training.agents.sac import checkpoint as sac_ckpt
+
+N = int(os.environ.get("N", 2000))
+NWORLD = int(os.environ.get("NWORLD", 64))
+OUT = pathlib.Path(os.environ["OUT"])
+SAC = os.path.abspath(os.environ["SAC"])
+SEED = int(os.environ.get("SEED", 0))
+CLEAN_FRAC = float(os.environ.get("CLEAN_FRAC", 0.5))
+NOISE_LO, NOISE_HI = float(os.environ.get("NOISE_LO", 0.05)), float(os.environ.get("NOISE_HI", 0.5))
+GLITCH_FRAC = float(os.environ.get("GLITCH_FRAC", 0.0))
+GLITCH_LEN = [int(x) for x in os.environ.get("GLITCH_LEN", "10,50").split(",")]
+GLITCH_T = [int(x) for x in os.environ.get("GLITCH_T", "20,150").split(",")]
+STATS_FROM = os.environ.get("STATS_FROM", "")    # copy this dataset's proprio standardisation
+CAM_RES_HW = (128, 128)
+CAMERAS = ("view_0", "view_1", "view_2")
+
+
+def load_hv2():
+    path = pathlib.Path(__file__).resolve().parents[2] / "dreamer4" / "envs" / "aloha_handover_v2.py"
+    spec = importlib.util.spec_from_file_location("aloha_handover_v2", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def episode_ends(done, ok):
+    """(m, T) v2 done / success flags -> per-episode length (transitions) and how it ended."""
+    T = done.shape[1]
+    first = np.where(done.any(1), done.argmax(1), T - 1)
+    end = np.where(ok.any(1), "success", np.where(done.any(1), "out", "time"))
+    return first + 1, end
+
+
+def make_rollout_fn(hv2, env, nworld):
+    policy = sac_ckpt.load_policy(SAC, deterministic=True)
+    reset, step = jax.vmap(env.reset), jax.vmap(env.step)
+    proprio = jax.vmap(lambda d: hv2.proprio(env, d))
+    init_aux = jax.vmap(lambda s: hv2.init_aux(env, s))
+    v2_step = jax.vmap(lambda s, a: hv2.step_reward(env, s, a))
+    u8 = lambda x: (jp.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(jp.uint8)
+    T = hv2.EPISODE_STEPS
+
+    def frames(state):
+        return {c: u8(state.obs[f"pixels/{c}"]) for c in CAMERAS}
+
+    def rollout(rngs, sigma, g_start, g_len, noise_key):
+        state = reset(rngs)
+        k_noise, k_glitch = jax.random.split(noise_key)
+        noise = jax.random.normal(k_noise, (T, nworld, 14)) * sigma[None, :, None]
+        wild = jax.random.uniform(k_glitch, (T, nworld, 14), minval=-1.0, maxval=1.0)
+        t = jp.arange(T)[:, None]
+        glitch = (t >= g_start[None]) & (t < (g_start + g_len)[None])          # (T, nworld)
+        aux = init_aux(state)
+
+        def body_fn(carry, xs):
+            state, aux = carry
+            eps, rand, g = xs
+            clean, _ = policy(state.obs["state"], jax.random.PRNGKey(0))
+            action = jp.where(g[:, None], rand, jp.clip(clean + eps, -1.0, 1.0))   # recorded = applied
+            nxt = step(state, action)
+            out = {"state": proprio(state.data), "action": action, **frames(state)}
+            out["reward"], out["v2_done"], out["v2_ok"], aux = v2_step(nxt, aux)
+            return (nxt, aux), out
+
+        (final, _), traj = jax.lax.scan(body_fn, (state, aux), (noise, wild, glitch))
+        return traj, {"state": proprio(final.data), **frames(final)}
+
+    return jax.jit(rollout), T
+
+
+def main():
+    hv2 = load_hv2()
+    env = hv2.make_env({"vision": True, "vision_config.nworld": NWORLD, "vision_config.cam_res": CAM_RES_HW,
+                        "impl": "warp"})
+    rollout, T = make_rollout_fn(hv2, env, NWORLD)
+    OUT.mkdir(parents=True, exist_ok=True)
+    mm = lambda name, shape, dtype: np.lib.format.open_memmap(OUT / name, mode="w+", dtype=dtype, shape=shape)
+    arr = {"state": mm("state.npy", (N, T + 1, 14), np.float32),
+           "action": mm("action.npy", (N, T, 14), np.float32),
+           "reward": mm("reward.npy", (N, T), np.float32),
+           **{c: mm(f"pixels_{c}.npy", (N, T + 1, *CAM_RES_HW, 3), np.uint8) for c in CAMERAS}}
+    rng = np.random.default_rng(SEED)
+    episodes, n, b, t_start = [], 0, 0, time.time()
+    while n < N:
+        t0 = time.time()
+        m = min(NWORLD, N - n)
+        sigma = np.where(rng.random(NWORLD) < CLEAN_FRAC, 0.0,
+                         rng.uniform(NOISE_LO, NOISE_HI, NWORLD)).astype(np.float32)
+        g_len = np.where(rng.random(NWORLD) < GLITCH_FRAC,
+                         rng.integers(GLITCH_LEN[0], GLITCH_LEN[1] + 1, NWORLD), 0).astype(np.int32)
+        g_start = rng.integers(GLITCH_T[0], GLITCH_T[1] + 1, NWORLD).astype(np.int32)
+        keys = jax.random.split(jax.random.PRNGKey(SEED * 100003 + b), NWORLD + 1)
+        traj, final = rollout(keys[:NWORLD], jp.asarray(sigma), jp.asarray(g_start), jp.asarray(g_len), keys[-1])
+        traj = {k: np.swapaxes(np.asarray(v), 0, 1)[:m] for k, v in traj.items()}   # (m, T, ...)
+        final = {k: np.asarray(v)[:m] for k, v in final.items()}
+        sl = slice(n, n + m)
+        arr["state"][sl] = np.concatenate([traj["state"], final["state"][:, None]], 1)
+        for c in CAMERAS:
+            arr[c][sl] = np.concatenate([traj[c], final[c][:, None]], 1)
+        arr["action"][sl] = traj["action"]
+        arr["reward"][sl] = traj["reward"]
+        ret = traj["reward"].sum(1)
+        length, end = episode_ends(traj["v2_done"], traj["v2_ok"])
+        success = end == "success"
+        for i in range(m):
+            rec = {"noise": round(float(sigma[i]), 3), "success": bool(success[i]),
+                   "return": round(float(ret[i]), 3), "length": int(length[i]), "end": str(end[i])}
+            if g_len[i]:
+                rec["glitch"] = [int(g_start[i]), int(g_len[i])]
+                rec["noise"] = max(rec["noise"], 1.0)        # never cloned (the adapter clones noise-free ones)
+            episodes.append(rec)
+        n += m
+        b += 1
+        clean = sigma[:m] == 0
+        print(f"batch {b}: {m} episodes, success {success.mean():.2f} (clean {success[clean].mean() if clean.any() else float('nan'):.2f}), "
+              f"return {ret.mean():.2f}, success step {length[success].mean() if success.any() else float('nan'):.0f} | "
+              f"{n}/{N} | {time.time() - t0:.1f} s", flush=True)
+    for a in arr.values():
+        a.flush()
+    flat = np.asarray(arr["state"], np.float64).reshape(-1, 14)
+    mean, std = flat.mean(0).round(6).tolist(), flat.std(0).round(6).tolist()
+    if STATS_FROM:
+        ref = json.loads((pathlib.Path(STATS_FROM) / "manifest.json").read_text())
+        mean, std = ref["state_mean"], ref["state_std"]
+    manifest = {"format": "aloha-npy", "cameras": list(CAMERAS), "downscale": 1, "n_episodes": N,
+                "state_mean": mean, "state_std": std,
+                "env": {"task": "handover", "reward": "v2", "cam_res": list(CAM_RES_HW), "max_steps": T},
+                "collector": {"demonstrator": SAC, "clean_frac": CLEAN_FRAC, "noise": [NOISE_LO, NOISE_HI],
+                              "glitch_frac": GLITCH_FRAC, "glitch_len": GLITCH_LEN, "glitch_t": GLITCH_T,
+                              "seed": SEED},
+                "episodes": episodes}
+    (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    s = np.array([e["success"] for e in episodes])
+    r = np.array([e["return"] for e in episodes])
+    print(f"DONE {N} episodes in {(time.time() - t_start) / 60:.1f} min: success {s.mean():.3f}, "
+          f"return {r.mean():.2f} (max {r.max():.2f})", flush=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

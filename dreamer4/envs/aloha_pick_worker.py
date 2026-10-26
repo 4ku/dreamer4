@@ -1,4 +1,4 @@
-"""Worker process: N AlohaPick worlds (MuJoCo Playground, vision) stepped in lockstep.
+"""Worker process: N AlohaPick or AlohaHandOver worlds (MuJoCo Playground, vision) stepped in lockstep.
 
 Runs in the MuJoCo Playground environment (JAX + MJX + the batch renderer), NOT in the training
 environment: :class:`dreamer4.envs.aloha_pick.AlohaPickBatch` starts it as a subprocess and talks to
@@ -48,25 +48,35 @@ def main():
     nworld, res, cameras = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].split(",")
     lift_target = float(sys.argv[4]) if len(sys.argv) > 4 else 0.10
     reward_mode = sys.argv[5] if len(sys.argv) > 5 else "v1"
+    task = sys.argv[6] if len(sys.argv) > 6 else "pick"
     import jax
     import jax.numpy as jp
     import numpy as np
     from mujoco_playground import manipulation
 
-    env = manipulation.load("AlohaPick", config_overrides={
-        "vision": True, "vision_config.nworld": nworld, "vision_config.cam_res": (res, res),
-        "box_z_lift_target": lift_target})
+    vision = {"vision": True, "vision_config.nworld": nworld, "vision_config.cam_res": (res, res)}
+    if task == "handover":
+        # this file's directory is on sys.path (it runs as a script)
+        import aloha_handover_v2 as v2        # green target, no drop termination, 14-D proprio, reward v2
+        env = v2.make_env({**vision, "impl": "warp"})
+        joint_state = jax.jit(jax.vmap(lambda d: v2.proprio(env, d)))
+        reward_mode = "v2"
+    else:
+        env = manipulation.load("AlohaPick", config_overrides={**vision, "box_z_lift_target": lift_target})
+        joint_state = None
+        if reward_mode == "v2":
+            import aloha_reward_v2 as v2
     reset = jax.jit(jax.vmap(env.reset))
     step = jax.jit(jax.vmap(env.step))
     if reward_mode == "v2":
-        import aloha_reward_v2 as v2          # this file's directory is on sys.path (it runs as a script)
         init_aux = jax.jit(jax.vmap(lambda s: v2.init_aux(env, s)))
         v2_step = jax.jit(jax.vmap(lambda s, a: v2.step_reward(env, s, a)))
     aux = None
     u8 = lambda x: np.asarray((jp.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(jp.uint8))
 
     def obs_dict(state):
-        out = {"state": np.asarray(state.obs["state"], np.float32)}
+        js = state.obs["state"] if joint_state is None else joint_state(state.data)
+        out = {"state": np.asarray(js, np.float32)}
         for c in cameras:
             out[c] = u8(state.obs[f"pixels/{c}"])
         return out
