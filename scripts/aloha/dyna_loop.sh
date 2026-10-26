@@ -2,7 +2,11 @@
 # AlohaPick online loop with SMALL real collections: imagination PMPO -> collect a few episodes with the latest policy
 # -> refresh the world model on all data (the transformer keeps its video-prediction loss, the reward and value heads
 # see the new episodes, the policy clones its best real episodes or is distilled on its newest) -> imagination again.
-#   scripts/aloha/dyna_loop.sh <gpu> <tag> <start ckpt (phase 2/3)> <world-model run> [iterations]
+#   scripts/aloha/dyna_loop.sh <gpu> <tag> <start ckpt (phase 2/3)> <world-model run> [iterations, 0 = no limit]
+# Stopping: after the iterations, when the greedy held-out success of the newest policy reaches TARGET_SR in TARGET_N
+# consecutive iterations (each one is tested on EVAL_N held-out episodes, results in runs/dyna_<tag>/heldout.tsv), or
+# at the next iteration boundary once runs/dyna_<tag>/STOP exists. runs/dyna_<tag>/control.env, if present, is sourced
+# at the start of every iteration: a running loop's settings (ITERS, TARGET_SR, EVAL_N, M, ...) can be changed there.
 # recipe.sh runs it with the settings that worked (HORIZON 32, ONLINE_FRAC 0.5, START_FRAC 0.5, K 1000, BC_TOP 0.25,
 # REAL_EVERY 50); the defaults here are the plain loop.
 # Env: A (workspace with data/ and runs/), PY (the dreamer4 venv's python), REPO (this repository, default: the
@@ -45,6 +49,10 @@ FAIL_W=${FAIL_W:-1}                        # failed episodes' video windows samp
 START_ITER=${START_ITER:-1}                # resume: collections 1 .. START_ITER-1 are reused; a stage whose output
                                            # already exists (rl_i, the collection, wm_i) is skipped
 LAST_REFRESH=${LAST_REFRESH:-1}            # 0: no refresh after the last collection (no PMPO stage would use it)
+EVAL_N=${EVAL_N:-0}                        # > 0: greedy held-out episodes played by every new policy
+TARGET_SR=${TARGET_SR:-}                   # stop once that held-out success is reached TARGET_N times in a row
+TARGET_N=${TARGET_N:-2}
+export LC_ALL=C                            # numbers in awk / sort: a ru_RU LC_NUMERIC reads 0.99 as 0
 export CUDA_VISIBLE_DEVICES=$GPU
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "${REPO:-$HERE/../..}"
@@ -63,9 +71,13 @@ FIRST=${PARTS%%,*}
 if [ -n "$EXTRA_BASE" ]; then PARTS=$PARTS,$EXTRA_BASE; fi
 NBASE=$(echo "$PARTS" | tr ',' '\n' | wc -l)
 [ -f "$R/progress.tsv" ] || printf "iter\tepisodes\tsuccess\treturn\tutc\n" > "$R/progress.tsv"
+[ -f "$R/heldout.tsv" ] || printf "iter\tsuccess\tsteps_success\treturn\tutc\n" > "$R/heldout.tsv"
 
 for j in $(seq 1 $((START_ITER - 1))); do PARTS=$PARTS,$A/data/dyna_${TAG}_$j; done
-for i in $(seq "$START_ITER" "$ITERS"); do
+i=$START_ITER
+while :; do
+  if [ -f "$R/control.env" ]; then . "$R/control.env"; fi
+  if [ "$ITERS" -gt 0 ] && [ "$i" -gt "$ITERS" ]; then break; fi
   stamp "iteration $i: PMPO $U updates from $CK"
   REALARGS=""
   if [ -n "$REAL_EVERY" ] && [ "$i" -gt 1 ]; then
@@ -80,6 +92,22 @@ for i in $(seq "$START_ITER" "$ITERS"); do
       || fail "PMPO $i"
   fi
   CK=$R/rl_$i/checkpoints/latest.pt
+  if [ "$EVAL_N" -gt 0 ] && ! cut -f1 "$R/heldout.tsv" | grep -qx "$i"; then
+    stamp "iteration $i: greedy held-out, $EVAL_N episodes"
+    PYTHONPATH=. $PY "$HERE/eval_margin.py" --dyn "$WM" --data "$FIRST" --out "$R/rl_$i/heldout.json" --n "$EVAL_N" \
+      "rl_$i=$CK" > "$R/rl_$i/heldout.log" 2>&1 || fail "held-out $i"
+    $PY -c "import json, sys; r = json.load(open(sys.argv[1]))['results']['rl_' + sys.argv[2]]
+print('%s\t%.4f\t%.1f\t%.3f' % (sys.argv[2], r['success'], r['steps_success'], r['return']), end='')" \
+      "$R/rl_$i/heldout.json" "$i" >> "$R/heldout.tsv" && printf "\t%s\n" "$(date -u +%H:%M)" >> "$R/heldout.tsv"
+    stamp "iteration $i: held-out $(tail -n 1 "$R/heldout.tsv" | cut -f2-4)"
+  fi
+  if [ -n "$TARGET_SR" ] && [ "$EVAL_N" -gt 0 ]; then
+    hits=$(tail -n "$TARGET_N" "$R/heldout.tsv" | awk -F'\t' -v t="$TARGET_SR" '$1 != "iter" && $2 >= t {k++} END {print k + 0}')
+    if [ "$hits" -ge "$TARGET_N" ]; then
+      stamp "TARGET REACHED: held-out success >= $TARGET_SR in $TARGET_N iterations in a row"
+      break
+    fi
+  fi
 
   stamp "iteration $i: collect $M episodes"
   OUT=$A/data/dyna_${TAG}_$i
@@ -95,7 +123,9 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
       >> "$R/progress.tsv" && printf "\t%s\n" "$(date -u +%H:%M)" >> "$R/progress.tsv"
   fi
   PARTS=$PARTS,$OUT
-  if [ "$i" = "$ITERS" ] && [ "$LAST_REFRESH" = 0 ]; then
+  last=0
+  if [ -f "$R/STOP" ] || [ "$i" = "$ITERS" ]; then last=1; fi
+  if [ "$last" = 1 ] && [ "$LAST_REFRESH" = 0 ]; then
     break
   fi
 
@@ -106,5 +136,7 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
     --eval_envs 64 --base_parts "$NBASE" --dyn_fail_weight "$FAIL_W" \
     || fail "refresh $i"
   CK=$R/wm_$i/checkpoints/latest.pt
+  if [ "$last" = 1 ]; then break; fi
+  i=$((i + 1))
 done
 stamp "LOOP DONE"
