@@ -59,7 +59,12 @@ class HandOverV2(handover.HandOver):
         return s
 
     def step(self, state, action):
-        aux = {k: state.info[f"v2_{k}"] for k in AUX}
+        # brax's auto-reset swaps a finished episode's data and observation for the first state's but leaves
+        # ``info`` alone: a new episode is the step whose episode counter is 0, and the v2 bookkeeping restarts
+        # there (carried over, the stale phi charged every new episode for the last one's progress)
+        fresh = (state.info["steps"] if "steps" in state.info else state.info["_steps"]) == 0
+        init = hv2.init_aux(self, state)
+        aux = {k: jp.where(fresh, init[k], state.info[f"v2_{k}"]) for k in AUX}
         nxt = super().step(state, action)
         reward, done, ok, aux = hv2.step_reward(self, nxt, aux)
         nxt.info.update({f"v2_{k}": v for k, v in aux.items()})
