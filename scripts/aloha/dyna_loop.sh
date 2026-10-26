@@ -44,6 +44,7 @@ FAIL_W=${FAIL_W:-1}                        # failed episodes' video windows samp
                                            # 0.81 for a policy that holds the box in 0.78 of its real episodes)
 START_ITER=${START_ITER:-1}                # resume: collections 1 .. START_ITER-1 are reused; a stage whose output
                                            # already exists (rl_i, the collection, wm_i) is skipped
+LAST_REFRESH=${LAST_REFRESH:-1}            # 0: no refresh after the last collection (no PMPO stage would use it)
 export CUDA_VISIBLE_DEVICES=$GPU
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "${REPO:-$HERE/../..}"
@@ -94,6 +95,9 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
       >> "$R/progress.tsv" && printf "\t%s\n" "$(date -u +%H:%M)" >> "$R/progress.tsv"
   fi
   PARTS=$PARTS,$OUT
+  if [ "$i" = "$ITERS" ] && [ "$LAST_REFRESH" = 0 ]; then
+    break
+  fi
 
   stamp "iteration $i: refresh the world model and heads, $K steps"
   [ -f "$R/wm_$i/checkpoints/latest.pt" ] || $PY -m dreamer4.train.train_heads --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/wm_$i" --seed 1 \
