@@ -60,6 +60,7 @@ CAL_H=${CAL_H:-}                           # dreamed episode length (empty = the
 GATE=${GATE:-}                             # with CAL_N: an iteration runs RL only if the last dreamed success was
                                            # within GATE of the real one; otherwise it keeps the policy and only
                                            # collects + refreshes (an RL stage in a dishonest world model is exploited)
+GATE_RET=${GATE_RET:-}                     # the same test on the return (what RL climbs): |dreamed - real| <= GATE_RET
 export LC_ALL=C                            # numbers in awk / sort: a ru_RU LC_NUMERIC reads 0.99 as 0
 export CUDA_VISIBLE_DEVICES=$GPU
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -84,7 +85,8 @@ if [ -n "$EXTRA_BASE" ]; then PARTS=$PARTS,$EXTRA_BASE; fi
 NBASE=$(echo "$PARTS" | tr ',' '\n' | wc -l)
 [ -f "$R/progress.tsv" ] || printf "iter\tepisodes\tsuccess\treturn\tutc\n" > "$R/progress.tsv"
 [ -f "$R/heldout.tsv" ] || printf "iter\tsuccess\tsteps_success\treturn\tutc\n" > "$R/heldout.tsv"
-[ "$CAL_N" -gt 0 ] && [ ! -f "$R/calib.tsv" ] && printf "iter\treal_success\tdream_success\tgap\tutc\n" > "$R/calib.tsv"
+[ "$CAL_N" -gt 0 ] && [ ! -f "$R/calib.tsv" ] \
+  && printf "iter\treal_success\tdream_success\tgap\tutc\treal_return\tdream_return\treturn_gap\n" > "$R/calib.tsv"
 
 for j in $(seq 1 $((START_ITER - 1))); do PARTS=$PARTS,$A/data/dyna_${TAG}_$j; done
 i=$START_ITER
@@ -96,6 +98,11 @@ while :; do
   if [ -n "$GATE" ] && [ "$i" -gt 1 ]; then
     gap=$(awk -F'\t' -v k=$((i - 1)) '$1 == k {g = $4} END {print g}' "$R/calib.tsv" 2>/dev/null)
     if [ -z "$gap" ] || awk -v g="$gap" -v t="$GATE" 'BEGIN {exit !(g > t || g < -t)}'; then rl=0; fi
+  fi
+  if [ -n "$GATE_RET" ] && [ "$i" -gt 1 ]; then
+    rgap=$(awk -F'\t' -v k=$((i - 1)) '$1 == k {g = $8} END {print g}' "$R/calib.tsv" 2>/dev/null)
+    if [ -z "$rgap" ] || awk -v g="$rgap" -v t="$GATE_RET" 'BEGIN {exit !(g > t || g < -t)}'; then rl=0; fi
+    gap="${gap:-} return ${rgap:-unknown}"
   fi
   if [ "$rl" = 0 ] && [ ! -f "$R/rl_$i/checkpoints/latest.pt" ]; then
     stamp "iteration $i: no RL (U $U, dreamed - real success ${gap:-unknown}, gate ${GATE:-none}): the policy is kept"
@@ -164,11 +171,13 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
     PYTHONPATH=. $PY "$HERE/dream_eval.py" --dyn "$WM" --data "$FIRST" --out "$R/wm_$i/dream_eval.json" --n "$CAL_N" \
       --batch 128 --horizon "$CAL_H" --K "$KD" --seed "$i" "wm_$i=$CK" > "$R/wm_$i/dream_eval.log" 2>&1 \
       || fail "dream eval $i"
-    $PY -c "import json, sys; d = json.load(open(sys.argv[1]))['results']['wm_' + sys.argv[2]]['dream_success']
-e = json.load(open(sys.argv[3] + '/manifest.json'))['episodes']; s = sum(x['success'] for x in e) / len(e)
-print('%s\t%.3f\t%.3f\t%.3f' % (sys.argv[2], s, d, d - s), end='')" "$R/wm_$i/dream_eval.json" "$i" "$OUT" \
-      >> "$R/calib.tsv" && printf "\t%s\n" "$(date -u +%H:%M)" >> "$R/calib.tsv"
-    stamp "iteration $i: real vs dreamed success $(tail -n 1 "$R/calib.tsv" | cut -f2-4)"
+    $PY -c "import json, sys; r = json.load(open(sys.argv[1]))['results']['wm_' + sys.argv[2]]
+e = json.load(open(sys.argv[3] + '/manifest.json'))['episodes']; n = len(e)
+s, ret = sum(x['success'] for x in e) / n, sum(x['return'] for x in e) / n
+d, dr = r['dream_success'], r['dream_return']
+print('%s\t%.3f\t%.3f\t%.3f\t%s\t%.3f\t%.3f\t%.3f' % (sys.argv[2], s, d, d - s, sys.argv[4], ret, dr, dr - ret))" \
+      "$R/wm_$i/dream_eval.json" "$i" "$OUT" "$(date -u +%H:%M)" >> "$R/calib.tsv" || fail "calibration row $i"
+    stamp "iteration $i: real vs dreamed success $(tail -n 1 "$R/calib.tsv" | cut -f2-4), return $(tail -n 1 "$R/calib.tsv" | cut -f6-8)"
   fi
   if [ "$last" = 1 ]; then break; fi
   i=$((i + 1))
