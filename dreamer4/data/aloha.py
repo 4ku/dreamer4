@@ -29,6 +29,7 @@ Domain facts used by the hooks:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Union
 
@@ -64,8 +65,9 @@ class AlohaEpisodeDataset(EpisodeVideoDataset):
 
     PROPRIO_MODES = ("state",)
 
-    #: Episodes whose recorded action noise is above this are not cloned.
-    BC_MAX_NOISE = 0.0
+    #: Episodes whose recorded action noise is above this are not cloned (ALOHA_BC_MAX_NOISE overrides: noisy
+    #: successes show the expert recovering from its mistakes).
+    BC_MAX_NOISE = float(os.environ.get("ALOHA_BC_MAX_NOISE", 0.0))
 
     #: Reward v2 (:mod:`dreamer4.envs.aloha_reward_v2`): a step paying at least this is the success step.
     TERMINAL_REWARD = 0.5
