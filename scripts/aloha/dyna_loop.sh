@@ -143,8 +143,8 @@ print('%s\t%.4f\t%.1f\t%.3f' % (sys.argv[2], r['success'], r['steps_success'], r
   OUT=$A/data/dyna_${TAG}_$i
   if [ ! -f "$OUT/manifest.json" ]; then
     PYTHONPATH=. $PY "$HERE/collect_policy.py" --ckpt "$CK" --dyn "$WM" --base "$FIRST" --out "$OUT" --n "$M" \
-      --envs 64 --seed $((SEED + 1000 * i)) --temperature "$COLLECT_T" | tee "$R/collect_$i.log" \
-      || fail "collection $i"
+      --envs 64 --seed $((SEED + 1000 * i)) --temperature "$COLLECT_T" | tee "$R/collect_$i.log"
+    [ -f "$OUT/manifest.json" ] || fail "collection $i"     # the pipe through tee hides the collector's exit code
   fi
   if ! cut -f1 "$R/progress.tsv" | grep -qx "$i"; then
     $PY -c "import json, sys; e = json.load(open(sys.argv[1] + '/manifest.json'))['episodes']
