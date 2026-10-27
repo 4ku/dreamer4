@@ -25,10 +25,16 @@ Reward v2, as AlohaPick's (:mod:`aloha_reward_v2`):
 Checked on the April state-only SAC expert (256 episodes): success 0.977, at step 88 (median); exactly the episodes
 the old "return >= 4 and never terminated" rule kept; every success preceded by a left-hand lift (step 32).
 """
+import os
+
 import jax.numpy as jp
 from mujoco import mjx
 
-BONUS, TIME, TABLE, HOLD = 1.0, 0.01, 0.1, 5
+BONUS, HOLD = 1.0, 5
+# HANDOVER_TIME / HANDOVER_TABLE re-price the two costs (a whole pipeline sets them once: the collectors, the eval /
+# collection env worker and the trainers all read this module)
+TIME = float(os.environ.get("HANDOVER_TIME", 0.01))
+TABLE = float(os.environ.get("HANDOVER_TABLE", 0.1))
 GOAL, GRIP, CLOSED, AWAY, LIFTED = 0.05, 0.05, 0.028, 0.08, 0.05
 TERMINAL_REWARD = 0.5
 TARGET_RGBA = (0.1, 0.8, 0.1, 1.0)
