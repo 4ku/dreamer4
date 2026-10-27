@@ -49,6 +49,7 @@ torch.manual_seed(cfg.seed)
 world, agent = load_agent(argparse.Namespace(init_from=cfg.heads, dyn=cfg.dyn, device="cuda",
                                              reward_decode="mode", compact=0), dev)
 heads, W, D = agent.heads, agent.clip_T, world.action_vec_dim
+world.tok.max_windows = 16      # frames encoded / decoded per call: 64 three-camera windows need ~4 GiB of attention
 gen = WorldModel(cfg.gen_dyn, device=dev) if cfg.gen_dyn else None
 
 ds = open_video_dataset(cfg.data, proprio="state", actions=True)
@@ -124,8 +125,14 @@ for s in range(0, len(picks), cfg.batch):
         gen_r.append(replay(eps, "gen")[0])
     for j, i in enumerate(idx):
         if i in show:                                     # frames C0 .. END-1
-            dec = world.tok.decode_latents(zd[j:j + 1]).permute(0, 1, 3, 4, 2)[0].float().cpu().numpy()
-            shown[i] = (eps[j]["video"][:END], dec)
+            # decoded 16 frames at a time, each chunk with the tokenizer's history before it (identical frames,
+            # a fraction of the memory: a whole three-camera episode at once needed ~3.8 GiB)
+            h, parts = world.tok.history, []
+            for a in range(0, zd.shape[1], 16):
+                lo = max(0, a - (h - 1))
+                d = world.tok.decode_latents(zd[j:j + 1, lo:a + 16]).permute(0, 1, 3, 4, 2)[0].float().cpu().numpy()
+                parts.append(d[a - lo:])
+            shown[i] = (eps[j]["video"][:END], np.concatenate(parts))
     print(f"{min(s + cfg.batch, len(picks))}/{len(picks)} replayed", flush=True)
 real_r, dream_r, teach_r = (np.concatenate(x) for x in (real_r, dream_r, teach_r))
 srcs = {"real": real_r, "dream": dream_r, "teacher": teach_r}

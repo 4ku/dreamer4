@@ -70,6 +70,9 @@ class AlohaPickBatch:
         """One lockstep step -> ``(frames, rewards (n,), terminated (n,), infos)``."""
         obs = self._call("step", np.asarray(actions, np.float32))
         infos = [{"state": s, "is_success": bool(k)} for s, k in zip(obs["state"], obs["success"])]
+        if "viz" in obs:      # HandOver: what the success test sees (for videos)
+            for i, info in enumerate(infos):
+                info["viz"] = {k: v[i] for k, v in obs["viz"].items()}
         return self._frames(obs), obs["reward"], obs["done"], infos
 
     def close(self):

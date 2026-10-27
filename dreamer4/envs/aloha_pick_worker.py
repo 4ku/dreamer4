@@ -71,6 +71,15 @@ def main():
     if reward_mode == "v2":
         init_aux = jax.jit(jax.vmap(lambda s: v2.init_aux(env, s)))
         v2_step = jax.jit(jax.vmap(lambda s, a: v2.step_reward(env, s, a)))
+    viz = None
+    if task == "handover":
+        def viz_one(s, a):
+            """What the success test sees, for videos: box height, box-target distance, the hand flags."""
+            box = s.data.xpos[env._box_body]
+            _, at_goal = v2.hand_flags(env, s.data, s.info)
+            return {"box_z": box[2], "d_target": jp.linalg.norm(box - s.info["target_pos"]),
+                    "left_held": a["left_held"], "held": a["held"], "at_goal": at_goal}
+        viz = jax.jit(jax.vmap(viz_one))
     aux = None
     u8 = lambda x: np.asarray((jp.clip(x, 0.0, 1.0) * 255.0 + 0.5).astype(jp.uint8))
 
@@ -101,6 +110,8 @@ def main():
                 out["reward"] = np.asarray(r, np.float32)
                 out["done"] = np.asarray(done, bool)
                 out["success"] = np.asarray(ok, bool)
+                if viz is not None:
+                    out["viz"] = {k: np.asarray(v) for k, v in viz(state, aux).items()}
             else:
                 out["reward"] = np.asarray(state.reward, np.float32)
                 out["done"] = np.asarray(state.done, bool)
