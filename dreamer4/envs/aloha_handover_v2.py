@@ -35,6 +35,10 @@ BONUS, HOLD = 1.0, 5
 # collection env worker and the trainers all read this module)
 TIME = float(os.environ.get("HANDOVER_TIME", 0.01))
 TABLE = float(os.environ.get("HANDOVER_TABLE", 0.1))
+# HANDOVER_LIFT_W > 0: phi = (1 - w) * env terms + w * lift_frac (the box's height above its rest, up to LIFT_SPAN).
+# In the env's terms a 10 cm lift is worth ~0.03 of phi: the grasp's outcome only pays ~50 steps later, at the target.
+LIFT_W = float(os.environ.get("HANDOVER_LIFT_W", 0.0))
+BOX_REST, LIFT_SPAN = 0.03, 0.07         # full at 10 cm: every target (z >= 0.10) keeps it full
 GOAL, GRIP, CLOSED, AWAY, LIFTED = 0.05, 0.05, 0.028, 0.08, 0.05
 TERMINAL_REWARD = 0.5
 TARGET_RGBA = (0.1, 0.8, 0.1, 1.0)
@@ -69,6 +73,9 @@ def potential(env, data, info):
     """phi in [0, 1] and the table-contact flag of one world (the env's reward terms)."""
     raw = env._get_reward(data, dict(info))
     phi = (raw["gripper_box"] + 4.0 * raw["box_handover"] + 8.0 * raw["handover_target"]) / 22.0
+    if LIFT_W > 0:
+        lift = jp.clip((data.xpos[env._box_body][2] - BOX_REST) / LIFT_SPAN, 0.0, 1.0)
+        phi = (1.0 - LIFT_W) * phi + LIFT_W * lift
     return phi, 1.0 - raw["no_table_collision"]
 
 
