@@ -56,7 +56,7 @@ for spec in cfg.policies:
     firsts = np.flatnonzero(starts.index == starts.base)          # each episode's frame 0
     pick = np.random.default_rng(cfg.seed).choice(firsts, cfg.n, replace=len(firsts) < cfg.n)
     pick = np.repeat(pick, cfg.repeat)
-    rets, held = [], []
+    rets, held, ends, lens = [], [], [], []
     for i in range(0, len(pick), cfg.batch):
         rows = pick[i:i + cfg.batch]
         with torch.autocast("cuda", torch.bfloat16):
@@ -64,8 +64,12 @@ for spec in cfg.policies:
         r = roll["rewards"].float()
         rets.append(r.sum(1).cpu().numpy())
         held.append((r[:, -10:].mean(1) > cfg.lift_r).cpu().numpy())
-    rets, held = np.concatenate(rets), np.concatenate(held)
-    res = {"ckpt": ck, "dream_return": float(rets.mean()), "dream_held": float(held.mean()), "n": cfg.n}
+        ends.append(roll["terminated"].cpu().numpy())          # reward v2: the dream ended on the success bonus
+        lens.append((roll["alive"].sum(1) - 1).cpu().numpy())
+    rets, held, ends, lens = map(np.concatenate, (rets, held, ends, lens))
+    res = {"ckpt": ck, "dream_return": float(rets.mean()), "dream_held": float(held.mean()), "n": cfg.n,
+           "dream_success": float(ends.mean()),
+           "dream_steps_success": float(lens[ends].mean()) if ends.any() else float("nan")}
     if cfg.repeat > 1:
         per_start = held.reshape(cfg.n, cfg.repeat).mean(1)
         res.update(starts_always_held=float((per_start == 1).mean()), starts_never_held=float((per_start == 0).mean()),
@@ -76,7 +80,8 @@ for spec in cfg.policies:
         h = json.load(open(hf))
         res.update(real_return=h["sampled_return"], real_success=h["sampled_sr"])
     results[name] = res
-    line = f"{name:28s} dream return {res['dream_return']:6.1f}  held {res['dream_held']:.2f}"
+    line = (f"{name:28s} dream return {res['dream_return']:7.2f}  held {res['dream_held']:.2f}  "
+            f"success {res['dream_success']:.3f} (steps {res['dream_steps_success']:.1f})")
     if "real_return" in res:
         line += f" | real (sampled) return {res['real_return']:6.1f}  success {res['real_success']:.2f}"
     if cfg.repeat > 1:

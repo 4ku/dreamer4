@@ -52,6 +52,14 @@ LAST_REFRESH=${LAST_REFRESH:-1}            # 0: no refresh after the last collec
 EVAL_N=${EVAL_N:-0}                        # > 0: greedy held-out episodes played by every new policy
 TARGET_SR=${TARGET_SR:-}                   # stop once that held-out success is reached TARGET_N times in a row
 TARGET_N=${TARGET_N:-2}
+CAL_N=${CAL_N:-0}                          # > 0: after every refresh the refreshed policy plays CAL_N whole episodes
+                                           # in its world model (dream_eval.py, K = KD, sampled actions); their
+                                           # success next to the real success of the collection it learned from goes
+                                           # to runs/dyna_<tag>/calib.tsv -- is the world model honest about the policy?
+CAL_H=${CAL_H:-}                           # dreamed episode length (empty = the env's time limit)
+GATE=${GATE:-}                             # with CAL_N: an iteration runs RL only if the last dreamed success was
+                                           # within GATE of the real one; otherwise it keeps the policy and only
+                                           # collects + refreshes (an RL stage in a dishonest world model is exploited)
 export LC_ALL=C                            # numbers in awk / sort: a ru_RU LC_NUMERIC reads 0.99 as 0
 export CUDA_VISIBLE_DEVICES=$GPU
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -68,16 +76,31 @@ else
     || fail "reading $BASE"
 fi
 FIRST=${PARTS%%,*}
+if [ -z "$CAL_H" ]; then
+  CAL_H=$($PY -c "import json, sys; print(json.load(open(sys.argv[1] + '/manifest.json'))['env']['max_steps'])" "$FIRST") \
+    || fail "reading the time limit of $FIRST"
+fi
 if [ -n "$EXTRA_BASE" ]; then PARTS=$PARTS,$EXTRA_BASE; fi
 NBASE=$(echo "$PARTS" | tr ',' '\n' | wc -l)
 [ -f "$R/progress.tsv" ] || printf "iter\tepisodes\tsuccess\treturn\tutc\n" > "$R/progress.tsv"
 [ -f "$R/heldout.tsv" ] || printf "iter\tsuccess\tsteps_success\treturn\tutc\n" > "$R/heldout.tsv"
+[ "$CAL_N" -gt 0 ] && [ ! -f "$R/calib.tsv" ] && printf "iter\treal_success\tdream_success\tgap\tutc\n" > "$R/calib.tsv"
 
 for j in $(seq 1 $((START_ITER - 1))); do PARTS=$PARTS,$A/data/dyna_${TAG}_$j; done
 i=$START_ITER
 while :; do
   if [ -f "$R/control.env" ]; then . "$R/control.env"; fi
   if [ "$ITERS" -gt 0 ] && [ "$i" -gt "$ITERS" ]; then break; fi
+  rl=1
+  if [ "$U" = 0 ]; then rl=0; fi
+  if [ -n "$GATE" ] && [ "$i" -gt 1 ]; then
+    gap=$(awk -F'\t' -v k=$((i - 1)) '$1 == k {g = $4} END {print g}' "$R/calib.tsv" 2>/dev/null)
+    if [ -z "$gap" ] || awk -v g="$gap" -v t="$GATE" 'BEGIN {exit !(g > t || g < -t)}'; then rl=0; fi
+  fi
+  if [ "$rl" = 0 ] && [ ! -f "$R/rl_$i/checkpoints/latest.pt" ]; then
+    stamp "iteration $i: no RL (U $U, dreamed - real success ${gap:-unknown}, gate ${GATE:-none}): the policy is kept"
+    mkdir -p "$R/rl_$i/checkpoints" && cp "$CK" "$R/rl_$i/checkpoints/latest.pt" || fail "keeping the policy $i"
+  fi
   stamp "iteration $i: PMPO $U updates from $CK"
   REALARGS=""
   if [ -n "$REAL_EVERY" ] && [ "$i" -gt 1 ]; then
@@ -92,7 +115,7 @@ while :; do
       || fail "PMPO $i"
   fi
   CK=$R/rl_$i/checkpoints/latest.pt
-  if [ "$EVAL_N" -gt 0 ] && ! cut -f1 "$R/heldout.tsv" | grep -qx "$i"; then
+  if [ "$EVAL_N" -gt 0 ] && { [ "$rl" = 1 ] || [ "$i" = 1 ]; } && ! cut -f1 "$R/heldout.tsv" | grep -qx "$i"; then
     stamp "iteration $i: greedy held-out, $EVAL_N episodes"
     PYTHONPATH=. $PY "$HERE/eval_margin.py" --dyn "$WM" --data "$FIRST" --out "$R/rl_$i/heldout.json" --n "$EVAL_N" \
       "rl_$i=$CK" > "$R/rl_$i/heldout.log" 2>&1 || fail "held-out $i"
@@ -136,6 +159,17 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
     --eval_envs 64 --base_parts "$NBASE" --dyn_fail_weight "$FAIL_W" \
     || fail "refresh $i"
   CK=$R/wm_$i/checkpoints/latest.pt
+  if [ "$CAL_N" -gt 0 ] && ! cut -f1 "$R/calib.tsv" | grep -qx "$i"; then
+    stamp "iteration $i: $CAL_N whole episodes of the refreshed policy in its world model"
+    PYTHONPATH=. $PY "$HERE/dream_eval.py" --dyn "$WM" --data "$FIRST" --out "$R/wm_$i/dream_eval.json" --n "$CAL_N" \
+      --batch 128 --horizon "$CAL_H" --K "$KD" --seed "$i" "wm_$i=$CK" > "$R/wm_$i/dream_eval.log" 2>&1 \
+      || fail "dream eval $i"
+    $PY -c "import json, sys; d = json.load(open(sys.argv[1]))['results']['wm_' + sys.argv[2]]['dream_success']
+e = json.load(open(sys.argv[3] + '/manifest.json'))['episodes']; s = sum(x['success'] for x in e) / len(e)
+print('%s\t%.3f\t%.3f\t%.3f' % (sys.argv[2], s, d, d - s), end='')" "$R/wm_$i/dream_eval.json" "$i" "$OUT" \
+      >> "$R/calib.tsv" && printf "\t%s\n" "$(date -u +%H:%M)" >> "$R/calib.tsv"
+    stamp "iteration $i: real vs dreamed success $(tail -n 1 "$R/calib.tsv" | cut -f2-4)"
+  fi
   if [ "$last" = 1 ]; then break; fi
   i=$((i + 1))
 done

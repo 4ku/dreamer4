@@ -320,8 +320,9 @@ class Imagination:
     def real_rollout(self, env, *, seed, keep=False):
         """One batch of REAL episodes played with the current (sampled) policy -- what the same PMPO
         update learns from in ``--real_env`` mode, the model-free control for imagination: every state,
-        action and reward is the environment's. Episodes all run to the time limit, where the λ-return
-        bootstraps from the value, as a dream does at its horizon. Same keys as :meth:`rollout`.
+        action and reward is the environment's. An episode the env ends (reward v2: the success bonus)
+        is terminal there, as a dream the reward head ends; the others run to the time limit, where the
+        λ-return bootstraps from the value, as a dream does at its horizon. Same keys as :meth:`rollout`.
         ``keep`` also returns the played episodes as ``episodes`` (latents, proprio, action vectors) in
         the form :class:`DemoStarts` reads, so dreams can start from the states the policy really met."""
         world, heads, dev = self.world, self.heads, self.device
@@ -334,6 +335,7 @@ class Imagination:
         code_shape = (heads.policy.n_actions,) if heads.policy.bins else ()
         actions = torch.zeros(B, steps, *code_shape, dtype=torch.long, device=dev)
         rewards = torch.zeros(B, steps, device=dev)
+        end_at, succ = np.full(B, -1), np.zeros(B, bool)     # the frame the env ended each episode on
         zs, props, vecs = [], [], []
         prev = None
         for t in range(steps + 1):
@@ -353,14 +355,24 @@ class Imagination:
             prev = a
             if keep:
                 vecs.append(heads.policy.action_vector(a).float().cpu().numpy())
-            frames, r, _, infos = env.step(policy.env_action(a))
+            frames, r, term, infos = env.step(policy.env_action(a))
             rewards[:, t] = torch.as_tensor(np.array(r, np.float32), device=dev)
+            newly = (end_at < 0) & np.asarray(term, bool)
+            end_at[newly] = t + 1
+            succ |= newly & np.array([i["is_success"] for i in infos], bool)
             for w, f in zip(window, frames):
                 w.append(f)
-        ones = torch.ones(B, steps + 1, device=dev)
-        roll = {"H": H, "actions": actions, "rewards": rewards, "continues": ones, "alive": ones.clone(),
-                "terminated": torch.zeros(B, dtype=torch.bool, device=dev),
-                "success": float(np.mean([i["is_success"] for i in infos]))}
+        # the masks of Tape.finish: the end frame is occupied, nothing is done from it or after it
+        cont = torch.ones(B, steps + 1, device=dev)
+        alive = torch.ones(B, steps + 1, device=dev)
+        for i in np.flatnonzero(end_at >= 0):
+            cont[i, end_at[i]:] = 0.0
+            alive[i, end_at[i] + 1:] = 0.0
+        ended = end_at >= 0
+        last = np.array([i["is_success"] for i in infos], bool)
+        roll = {"H": H, "actions": actions, "rewards": rewards, "continues": cont, "alive": alive,
+                "terminated": torch.as_tensor(ended, device=dev),
+                "success": float(np.where(ended, succ, last).mean())}
         if keep:
             z_all, p_all, v_all = torch.stack(zs, 1), np.stack(props, 1), np.stack(vecs, 1)
             roll["episodes"] = [{"z": z_all[b], "proprio": p_all[b], "actions": v_all[b]} for b in range(B)]
