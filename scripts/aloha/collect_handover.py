@@ -15,11 +15,14 @@ missed grasps, the box knocked over -- and what the expert does next). Glitched 
 Layout (frames T+1 = 251 including the final one, actions / rewards T = 250):
     state.npy (N, T+1, 14) f32, action.npy (N, T, 14) f32, reward.npy (N, T) f32,
     pixels_view_0|1|2.npy (N, T+1, 128, 128, 3) u8, manifest.json (each episode's length, end, noise, return),
-    phi.npy (N, T+1) f32 and contact.npy (N, T) u8: the reward's ingredients, to re-price it without the simulator
+    phi.npy (N, T+1) f32 and contact.npy (N, T) u8: the reward's ingredients, to re-price it without the simulator;
+    privileged.npy (N, T+1, 83) f32: the env's own observation (joints, velocities, box, grippers, box - target, time)
+    -- enough to rebuild a reward of another shape offline
 
 RELABEL=1 with OUT = an existing dataset (and its N / NWORLD / SEED / dials) replays it, checks the replay against the
-recorded states and actions, and rewrites only reward.npy, phi.npy, contact.npy and the manifest (BONUS / TIME / TABLE
-env vars change the reward-v2 constants).
+recorded states and actions, and rewrites only reward.npy, phi.npy, contact.npy and the manifest. The replay must be
+bit-exact: on a GPU shared with other jobs MJX diverges within a batch (state 0.25 off, measured), so re-label only on
+an idle GPU, or rebuild offline from privileged.npy.
 """
 from __future__ import annotations
 
@@ -103,14 +106,14 @@ def make_rollout_fn(hv2, env, nworld):
             clean, _ = policy(state.obs["state"], jax.random.PRNGKey(0))
             action = jp.where(g[:, None], rand, jp.clip(clean + eps, -1.0, 1.0))   # recorded = applied
             nxt = step(state, action)
-            out = {"state": proprio(state.data), "action": action, **frames(state)}
+            out = {"state": proprio(state.data), "priv": state.obs["state"], "action": action, **frames(state)}
             out["reward"], out["v2_done"], out["v2_ok"], aux = v2_step(nxt, aux)
             out["phi"], out["contact"] = aux["phi"], potential(nxt)[1]
             return (nxt, aux), out
 
         phi0 = aux["phi"]
         (final, _), traj = jax.lax.scan(body_fn, (state, aux), (noise, wild, glitch))
-        return traj, {"state": proprio(final.data), "phi0": phi0, **frames(final)}
+        return traj, {"state": proprio(final.data), "priv": final.obs["state"], "phi0": phi0, **frames(final)}
 
     return jax.jit(rollout), T
 
@@ -128,7 +131,10 @@ def main():
     if RELABEL:
         old = {"state": np.load(OUT / "state.npy", mmap_mode="r"), "action": np.load(OUT / "action.npy", mmap_mode="r")}
     else:
+        d_priv = env.observation_size["state"]
+        d_priv = int(d_priv[0]) if isinstance(d_priv, (tuple, list)) else int(d_priv)
         arr.update({"state": mm("state.npy", (N, T + 1, 14), np.float32),
+                    "priv": mm("privileged.npy", (N, T + 1, d_priv), np.float32),
                     "action": mm("action.npy", (N, T, 14), np.float32),
                     **{c: mm(f"pixels_{c}.npy", (N, T + 1, *CAM_RES_HW, 3), np.uint8) for c in CAMERAS}})
     rng = np.random.default_rng(SEED)
@@ -154,6 +160,7 @@ def main():
                                  f"action {d_action:.2e} (same N / NWORLD / SEED / dials?)")
         else:
             arr["state"][sl] = np.concatenate([traj["state"], final["state"][:, None]], 1)
+            arr["priv"][sl] = np.concatenate([traj["priv"], final["priv"][:, None]], 1)
             for c in CAMERAS:
                 arr[c][sl] = np.concatenate([traj[c], final[c][:, None]], 1)
             arr["action"][sl] = traj["action"]
