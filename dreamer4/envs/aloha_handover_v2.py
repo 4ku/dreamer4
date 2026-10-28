@@ -43,6 +43,10 @@ GOAL, GRIP, CLOSED, AWAY, LIFTED = 0.05, 0.05, 0.028, 0.08, 0.05
 TERMINAL_REWARD = 0.5
 TARGET_RGBA = (0.1, 0.8, 0.1, 1.0)
 EPISODE_STEPS = 250
+# HANDOVER_TARGET="x,y,z": every episode uses this one green target (the env draws it at random around
+# (0.20, 0.00, 0.25), +-0.15 per axis, x >= 0.15); the box's start stays random. Set once for a whole pipeline.
+FIXED_TARGET = tuple(float(v) for v in os.environ["HANDOVER_TARGET"].split(",")) \
+    if os.environ.get("HANDOVER_TARGET") else None
 
 
 def make_env(config_overrides=None):
@@ -56,6 +60,19 @@ def make_env(config_overrides=None):
             self._mj_model.geom_rgba[geom] = TARGET_RGBA
             self._mjx_model = mjx.put_model(self._mj_model, impl=self._config.impl)
             super()._init_vision()
+
+        def reset(self, rng):
+            state = super().reset(rng)
+            if FIXED_TARGET is None:
+                return state
+            target = jp.asarray(FIXED_TARGET)
+            data = state.data.replace(mocap_pos=state.data.mocap_pos.at[self._mocap_target].set(target))
+            info = {**state.info, "target_pos": target}
+            obs = self._get_obs(data, info)
+            if self._vision:            # the first frame must show the target where it is
+                data, pixel_obs = self._render_pixel_obs(data, info["brightness"], do_forward=True)
+                obs = {"state": obs, **pixel_obs}
+            return state.replace(data=data, obs=obs, info=info)
 
     return HandOverGreenTarget(config=handover.default_config(),
                                config_overrides={"no_drop_termination": True, **(config_overrides or {})})

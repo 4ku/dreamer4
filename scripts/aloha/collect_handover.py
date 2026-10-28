@@ -51,6 +51,12 @@ NOISE_LO, NOISE_HI = float(os.environ.get("NOISE_LO", 0.05)), float(os.environ.g
 GLITCH_FRAC = float(os.environ.get("GLITCH_FRAC", 0.0))
 GLITCH_LEN = [int(x) for x in os.environ.get("GLITCH_LEN", "10,50").split(",")]
 GLITCH_T = [int(x) for x in os.environ.get("GLITCH_T", "20,150").split(",")]
+# KICK_FRAC: a share of the episodes where the box gets one horizontal push (KICK_SPEED m/s, random direction) the
+# moment the left gripper first reaches it (closer than KICK_DIST, box still on the table): the first grasp closes on
+# air and the expert has to re-grasp. Every recorded action stays the expert's own, so these corrections are cloned.
+KICK_FRAC = float(os.environ.get("KICK_FRAC", 0.0))
+KICK_SPEED = [float(x) for x in os.environ.get("KICK_SPEED", "0.2,0.5").split(",")]
+KICK_DIST = float(os.environ.get("KICK_DIST", 0.05))   # the gripper site is ~3.8 cm from the box at the grasp
 STATS_FROM = os.environ.get("STATS_FROM", "")    # copy this dataset's proprio standardisation
 RELABEL = os.environ.get("RELABEL", "") == "1"   # replay OUT's episodes (same N / NWORLD / SEED / dials), check them
                                                  # against its states and actions, rewrite only rewards + manifest
@@ -91,7 +97,18 @@ def make_rollout_fn(hv2, env, nworld):
     def frames(state):
         return {c: u8(state.obs[f"pixels/{c}"]) for c in CAMERAS}
 
-    def rollout(rngs, sigma, g_start, g_len, noise_key):
+    box_dof = int(env._mj_model.jnt_dofadr[env._mj_model.body_jntadr[env._box_body]])
+
+    def kick(state, kick_v, kicked, t):
+        """Push the box of the worlds whose left gripper has just reached it (once per episode)."""
+        box = state.data.xpos[:, env._box_body]
+        d_lg = jp.linalg.norm(state.data.site_xpos[:, env._left_gripper_site] - box, axis=-1)
+        fire = (jp.linalg.norm(kick_v, axis=-1) > 0) & (kicked < 0) & (d_lg < KICK_DIST) & (box[:, 2] < 0.045)
+        qvel = state.data.qvel.at[:, box_dof:box_dof + 2].set(
+            jp.where(fire[:, None], kick_v, state.data.qvel[:, box_dof:box_dof + 2]))
+        return state.replace(data=state.data.replace(qvel=qvel)), jp.where(fire, t, kicked)
+
+    def rollout(rngs, sigma, g_start, g_len, kick_v, noise_key):
         state = reset(rngs)
         k_noise, k_glitch = jax.random.split(noise_key)
         noise = jax.random.normal(k_noise, (T, nworld, 14)) * sigma[None, :, None]
@@ -101,19 +118,23 @@ def make_rollout_fn(hv2, env, nworld):
         aux = init_aux(state)
 
         def body_fn(carry, xs):
-            state, aux = carry
-            eps, rand, g = xs
+            state, aux, kicked = carry
+            eps, rand, g, ti = xs
+            state, kicked = kick(state, kick_v, kicked, ti)
             clean, _ = policy(state.obs["state"], jax.random.PRNGKey(0))
             action = jp.where(g[:, None], rand, jp.clip(clean + eps, -1.0, 1.0))   # recorded = applied
             nxt = step(state, action)
             out = {"state": proprio(state.data), "priv": state.obs["state"], "action": action, **frames(state)}
             out["reward"], out["v2_done"], out["v2_ok"], aux = v2_step(nxt, aux)
             out["phi"], out["contact"] = aux["phi"], potential(nxt)[1]
-            return (nxt, aux), out
+            return (nxt, aux, kicked), out
 
         phi0 = aux["phi"]
-        (final, _), traj = jax.lax.scan(body_fn, (state, aux), (noise, wild, glitch))
-        return traj, {"state": proprio(final.data), "priv": final.obs["state"], "phi0": phi0, **frames(final)}
+        kicked0 = jp.full((nworld,), -1, jp.int32)
+        (final, _, kicked), traj = jax.lax.scan(body_fn, (state, aux, kicked0),
+                                                (noise, wild, glitch, jp.arange(T, dtype=jp.int32)))
+        return traj, {"state": proprio(final.data), "priv": final.obs["state"], "phi0": phi0, "kicked": kicked,
+                      **frames(final)}
 
     return jax.jit(rollout), T
 
@@ -147,8 +168,12 @@ def main():
         g_len = np.where(rng.random(NWORLD) < GLITCH_FRAC,
                          rng.integers(GLITCH_LEN[0], GLITCH_LEN[1] + 1, NWORLD), 0).astype(np.int32)
         g_start = rng.integers(GLITCH_T[0], GLITCH_T[1] + 1, NWORLD).astype(np.int32)
+        ang = rng.uniform(0, 2 * np.pi, NWORLD)
+        speed = np.where(rng.random(NWORLD) < KICK_FRAC, rng.uniform(KICK_SPEED[0], KICK_SPEED[1], NWORLD), 0.0)
+        kick_v = (speed[:, None] * np.stack([np.cos(ang), np.sin(ang)], 1)).astype(np.float32)
         keys = jax.random.split(jax.random.PRNGKey(SEED * 100003 + b), NWORLD + 1)
-        traj, final = rollout(keys[:NWORLD], jp.asarray(sigma), jp.asarray(g_start), jp.asarray(g_len), keys[-1])
+        traj, final = rollout(keys[:NWORLD], jp.asarray(sigma), jp.asarray(g_start), jp.asarray(g_len),
+                              jp.asarray(kick_v), keys[-1])
         traj = {k: np.swapaxes(np.asarray(v), 0, 1)[:m] for k, v in traj.items()}   # (m, T, ...)
         final = {k: np.asarray(v)[:m] for k, v in final.items()}
         sl = slice(n, n + m)
@@ -176,6 +201,8 @@ def main():
             if g_len[i]:
                 rec["glitch"] = [int(g_start[i]), int(g_len[i])]
                 rec["noise"] = max(rec["noise"], 1.0)        # never cloned (the adapter clones noise-free ones)
+            if speed[i] > 0:
+                rec["kick"] = [int(final["kicked"][i]), round(float(speed[i]), 3)]   # step (-1: never fired), m/s
             episodes.append(rec)
         n += m
         b += 1
@@ -196,6 +223,8 @@ def main():
                 "reward_v2": {"bonus": hv2.BONUS, "time": hv2.TIME, "table": hv2.TABLE, "hold": hv2.HOLD},
                 "collector": {"demonstrator": SAC, "clean_frac": CLEAN_FRAC, "noise": [NOISE_LO, NOISE_HI],
                               "glitch_frac": GLITCH_FRAC, "glitch_len": GLITCH_LEN, "glitch_t": GLITCH_T,
+                              "kick_frac": KICK_FRAC, "kick_speed": KICK_SPEED, "kick_dist": KICK_DIST,
+                              "target": os.environ.get("HANDOVER_TARGET", "random"),
                               "seed": SEED, "relabelled": bool(RELABEL)},
                 "episodes": episodes}
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=1))
