@@ -735,6 +735,10 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
             n_ev = cfg.final_eval_n if s == cfg.steps else cfg.eval_n
             metrics = {"acc_heldout": m["acc"],
                        "reward_heldout": {k: v for k, v in m.items() if k != "acc"}}
+            if s == cfg.steps:
+                # the trained model goes to disk before the final evaluation: an evaluation worker that runs out of
+                # memory next to a big model must not take the whole run with it
+                save(run.out / "checkpoints" / "latest.pt", {"step": s, **metrics})
             if run.envs:
                 metrics.update(run.play(policy, n_ev, dev))
             run.record(s, metrics, save)
