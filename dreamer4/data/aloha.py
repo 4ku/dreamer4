@@ -129,10 +129,17 @@ class AlohaEpisodeDataset(EpisodeVideoDataset):
         """Reward v2 ends an episode at success or a drop: the manifest records its ``length`` (transitions)."""
         return int(self._episodes[i].get("length", self._n_trans)) + 1
 
-    def _load_clip(self, i: int, start: int, length: int) -> dict:
+    def clip_meta(self, i: int, start: int, length: int) -> dict:
+        n = self.episode_frames(i)
+        if not 0 <= start <= n - length:
+            raise IndexError(f"clip [{start}, {start + length}) outside episode {i} with {n} frames")
+        return self._load_clip(i, start, length, video=False)
+
+    def _load_clip(self, i: int, start: int, length: int, video: bool = True) -> dict:
         frames = slice(start, start + length)
-        out = {"video": compose_frame([np.asarray(self._pix[c][i, frames]) for c in self.cameras],
-                                      self.downscale)}
+        out = {}
+        if video:
+            out["video"] = compose_frame([np.asarray(self._pix[c][i, frames]) for c in self.cameras], self.downscale)
         if self._proprio != "none":
             out["proprio"] = self.standardise(np.asarray(self._state[i, frames]))
         if self._actions:

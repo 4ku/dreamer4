@@ -283,10 +283,12 @@ def encode_episodes(tokenizer: FrozenTokenizer, dataset: EpisodeVideoDataset,
     n_new = 0
     for i in indices:
         n = dataset.episode_frames(int(i))
-        clip = dataset.clip(int(i), 0, n)
-        video = clip["video"]
         z = cached.get(int(i))
-        if z is not None and z.shape[0] == n:
+        hit = z is not None and z.shape[0] == n
+        # a cached episode needs no pixels: on big datasets reading them was most of the start-up time
+        clip = dataset.clip_meta(int(i), 0, n) if hit and not keep_video else dataset.clip(int(i), 0, n)
+        video = clip.get("video")
+        if hit:
             z = z.to(tokenizer.device)
         else:
             parts = []

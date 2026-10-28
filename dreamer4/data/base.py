@@ -102,6 +102,11 @@ class EpisodeVideoDataset:
                              f"{i} with {n} frames")
         return self._load_clip(i, start, length)
 
+    def clip_meta(self, i: int, start: int, length: int) -> dict:
+        """:meth:`clip` without the video, where the storage can skip it (a latent-cache hit needs no pixels); the
+        default reads the whole clip."""
+        return self.clip(i, start, length)
+
     @property
     def frame_shape(self) -> Tuple[int, int, int]:
         """(H, W, C) of one frame (probes the first episode)."""
