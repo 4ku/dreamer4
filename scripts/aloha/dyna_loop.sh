@@ -41,6 +41,10 @@ DISTILL=${DISTILL:-0}                      # 1: the refresh keeps the policy by 
 if [ "$DISTILL" = 1 ]; then BCARGS="--bc_last_part 1 --distill 1"; fi
 EXTRA_BASE=${EXTRA_BASE:-}                 # more offline data dirs (comma-separated) next to the world model's own:
                                            # part of the base in every stage, never counted as online
+EXTRA_ONLINE=${EXTRA_ONLINE:-}             # offline data dirs counted as ONLINE: the refresh's video windows and the
+                                           # dream starts draw from them with the collections (HandOver: 1 024 expert
+                                           # grasps 2-12 mm off teach the world model which grasps hold; only then
+                                           # does RL in dreams fix the grasp, no lift 0.21 -> 0.08)
 KD=${KD:-1}                                # denoising steps per dreamed frame in the PMPO stages: with 4 the
                                            # failure-weighted world model dreams more of the risky grasps' failures
                                            # (one policy: held 0.97 -> 0.91, real 0.81; mixed outcomes 19 -> 41 %)
@@ -85,6 +89,7 @@ if [ -z "$CAL_H" ]; then
 fi
 if [ -n "$EXTRA_BASE" ]; then PARTS=$PARTS,$EXTRA_BASE; fi
 NBASE=$(echo "$PARTS" | tr ',' '\n' | wc -l)
+if [ -n "$EXTRA_ONLINE" ]; then PARTS=$PARTS,$EXTRA_ONLINE; fi
 [ -f "$R/progress.tsv" ] || printf "iter\tepisodes\tsuccess\treturn\tutc\n" > "$R/progress.tsv"
 [ -f "$R/heldout.tsv" ] || printf "iter\tsuccess\tsteps_success\treturn\tutc\n" > "$R/heldout.tsv"
 [ "$CAL_N" -gt 0 ] && [ ! -f "$R/calib.tsv" ] \
