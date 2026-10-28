@@ -57,6 +57,13 @@ GLITCH_T = [int(x) for x in os.environ.get("GLITCH_T", "20,150").split(",")]
 KICK_FRAC = float(os.environ.get("KICK_FRAC", 0.0))
 KICK_SPEED = [float(x) for x in os.environ.get("KICK_SPEED", "0.2,0.5").split(",")]
 KICK_DIST = float(os.environ.get("KICK_DIST", 0.05))   # the gripper site is ~3.8 cm from the box at the grasp
+# OFF_FRAC: a share of the episodes where the expert sees the box shifted horizontally by OFF (m, random direction) until
+# step OFF_UNTIL: its first grasp lands off-centre (some hold, some miss), then it sees the true box and re-grasps. The
+# world model learns which grasps hold; every recorded action is still the expert's.
+OFF_FRAC = float(os.environ.get("OFF_FRAC", 0.0))
+OFF = [float(x) for x in os.environ.get("OFF", "0.01,0.03").split(",")]
+OFF_UNTIL = int(os.environ.get("OFF_UNTIL", 45))
+BOX_OBS = ((16, 17), (49, 50), (52, 53), (79, 80))   # the box's x, y in the 83-D obs: qpos, top, bottom, box - target
 STATS_FROM = os.environ.get("STATS_FROM", "")    # copy this dataset's proprio standardisation
 RELABEL = os.environ.get("RELABEL", "") == "1"   # replay OUT's episodes (same N / NWORLD / SEED / dials), check them
                                                  # against its states and actions, rewrite only rewards + manifest
@@ -108,7 +115,14 @@ def make_rollout_fn(hv2, env, nworld):
             jp.where(fire[:, None], kick_v, state.data.qvel[:, box_dof:box_dof + 2]))
         return state.replace(data=state.data.replace(qvel=qvel)), jp.where(fire, t, kicked)
 
-    def rollout(rngs, sigma, g_start, g_len, kick_v, noise_key):
+    def seen(obs, off, t):
+        """The expert's view: the box shifted by ``off`` (nworld, 2) until OFF_UNTIL."""
+        on = (t < OFF_UNTIL)
+        for ix, iy in BOX_OBS:
+            obs = obs.at[:, ix].add(jp.where(on, off[:, 0], 0.0)).at[:, iy].add(jp.where(on, off[:, 1], 0.0))
+        return obs
+
+    def rollout(rngs, sigma, g_start, g_len, kick_v, off, noise_key):
         state = reset(rngs)
         k_noise, k_glitch = jax.random.split(noise_key)
         noise = jax.random.normal(k_noise, (T, nworld, 14)) * sigma[None, :, None]
@@ -121,7 +135,7 @@ def make_rollout_fn(hv2, env, nworld):
             state, aux, kicked = carry
             eps, rand, g, ti = xs
             state, kicked = kick(state, kick_v, kicked, ti)
-            clean, _ = policy(state.obs["state"], jax.random.PRNGKey(0))
+            clean, _ = policy(seen(state.obs["state"], off, ti), jax.random.PRNGKey(0))
             action = jp.where(g[:, None], rand, jp.clip(clean + eps, -1.0, 1.0))   # recorded = applied
             nxt = step(state, action)
             out = {"state": proprio(state.data), "priv": state.obs["state"], "action": action, **frames(state)}
@@ -171,9 +185,12 @@ def main():
         ang = rng.uniform(0, 2 * np.pi, NWORLD)
         speed = np.where(rng.random(NWORLD) < KICK_FRAC, rng.uniform(KICK_SPEED[0], KICK_SPEED[1], NWORLD), 0.0)
         kick_v = (speed[:, None] * np.stack([np.cos(ang), np.sin(ang)], 1)).astype(np.float32)
+        ang_o = rng.uniform(0, 2 * np.pi, NWORLD)
+        mag = np.where(rng.random(NWORLD) < OFF_FRAC, rng.uniform(OFF[0], OFF[1], NWORLD), 0.0)
+        off = (mag[:, None] * np.stack([np.cos(ang_o), np.sin(ang_o)], 1)).astype(np.float32)
         keys = jax.random.split(jax.random.PRNGKey(SEED * 100003 + b), NWORLD + 1)
         traj, final = rollout(keys[:NWORLD], jp.asarray(sigma), jp.asarray(g_start), jp.asarray(g_len),
-                              jp.asarray(kick_v), keys[-1])
+                              jp.asarray(kick_v), jp.asarray(off), keys[-1])
         traj = {k: np.swapaxes(np.asarray(v), 0, 1)[:m] for k, v in traj.items()}   # (m, T, ...)
         final = {k: np.asarray(v)[:m] for k, v in final.items()}
         sl = slice(n, n + m)
@@ -203,6 +220,8 @@ def main():
                 rec["noise"] = max(rec["noise"], 1.0)        # never cloned (the adapter clones noise-free ones)
             if speed[i] > 0:
                 rec["kick"] = [int(final["kicked"][i]), round(float(speed[i]), 3)]   # step (-1: never fired), m/s
+            if mag[i] > 0:
+                rec["off"] = [round(float(off[i, 0]), 4), round(float(off[i, 1]), 4)]   # the expert's box offset (m)
             episodes.append(rec)
         n += m
         b += 1
@@ -224,6 +243,7 @@ def main():
                 "collector": {"demonstrator": SAC, "clean_frac": CLEAN_FRAC, "noise": [NOISE_LO, NOISE_HI],
                               "glitch_frac": GLITCH_FRAC, "glitch_len": GLITCH_LEN, "glitch_t": GLITCH_T,
                               "kick_frac": KICK_FRAC, "kick_speed": KICK_SPEED, "kick_dist": KICK_DIST,
+                              "off_frac": OFF_FRAC, "off": OFF, "off_until": OFF_UNTIL,
                               "target": os.environ.get("HANDOVER_TARGET", "random"),
                               "seed": SEED, "relabelled": bool(RELABEL)},
                 "episodes": episodes}
