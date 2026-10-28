@@ -27,6 +27,9 @@ ap.add_argument("--n", type=int, default=24)
 ap.add_argument("--show", type=int, default=6)
 ap.add_argument("--seed", type=int, default=900000)
 ap.add_argument("--label", default="")
+ap.add_argument("--first", action="store_true",
+                help="show the first --show episodes as they come (the same seeds for every policy: a fair before/after)")
+ap.add_argument("--upscale", type=int, default=2, help="pixel upscaling of the video (1 keeps the file small)")
 cfg = ap.parse_args()
 dev = torch.device("cuda")
 world, agent = load_agent(argparse.Namespace(init_from=cfg.ckpt, dyn=cfg.dyn, device="cuda", reward_decode="mode",
@@ -63,6 +66,8 @@ print(f"{cfg.n} episodes: success {ok.mean():.3f}, success at step {ended[ok].me
 succ, fail = np.flatnonzero(ok), np.flatnonzero(~ok)
 show = list(succ[:cfg.show // 2]) + list(fail[:cfg.show - min(len(succ), cfg.show // 2)])
 show = show[:cfg.show]
+if cfg.first:
+    show = list(range(min(cfg.show, cfg.n)))
 font = ImageFont.truetype(font_manager.findfont("DejaVu Sans"), 13)
 font_b = ImageFont.truetype(font_manager.findfont("DejaVu Sans:bold"), 14)
 font_t = ImageFont.truetype(font_manager.findfont("DejaVu Sans:bold"), 17)
@@ -110,7 +115,8 @@ def frame(t):
     dh.text((6, 24), "success = left hand lifted the box, then box < 5 cm from the GREEN target in the closed right "
                      "hand, left hand away — 5 steps in a row", fill=(60, 60, 60), font=font)
     out = np.concatenate([np.asarray(head), grid], 0)
-    return np.asarray(Image.fromarray(out).resize((out.shape[1] * 2, out.shape[0] * 2), Image.NEAREST))
+    s = max(1, cfg.upscale)
+    return np.asarray(Image.fromarray(out).resize((out.shape[1] * s, out.shape[0] * s), Image.NEAREST))
 
 
 last = int(min(T, ended[show].max() + 1))
