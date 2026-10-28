@@ -23,6 +23,8 @@ export ALOHA_PYTHON=$A/mujoco_playground/.venv/bin/python PYTORCH_ALLOC_CONF=exp
 GPU=$1 TAG=$2 CK=$3 BASE=$4 ITERS=${5:-12}
 U=${U:-250} M=${M:-128} K=${K:-500} SEED=${SEED:-3000000} BETA=${BETA:-0.1}
 RLR=${RLR:-1e-4} RDLR=${RDLR:-5e-5} WARM=${WARM:-100}
+RBATCH=${RBATCH:-}                         # refresh clips per step (empty = train_heads' default; a bigger world
+                                           # model may need fewer to fit next to the evaluation workers)
 HORIZON=${HORIZON:-}                       # imagination horizon; empty = the episode length (phase 3's default)
 ONLINE_FRAC=${ONLINE_FRAC:-0}              # share of the refresh's video windows from the online collections
 START_FRAC=${START_FRAC:-0}                # share of the dream starts from the online collections
@@ -161,14 +163,15 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
 
   stamp "iteration $i: refresh the world model and heads, $K steps"
   [ -f "$R/wm_$i/checkpoints/latest.pt" ] || $PY -m dreamer4.train.train_heads --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/wm_$i" --seed 1 \
-    --steps "$K" --val_frac 0 $BCARGS --bc_loss_weight "$BC_LOSS_W" --dyn_weight 10 --fwd_weight 0 --lr "$RLR" \
+    --steps "$K" ${RBATCH:+--batch "$RBATCH"} --val_frac 0 $BCARGS --bc_loss_weight "$BC_LOSS_W" --dyn_weight 10 --fwd_weight 0 --lr "$RLR" \
     --dyn_lr "$RDLR" --dyn_warmup "$WARM" --dyn_online_frac "$ONLINE_FRAC" --eval_every 1000000 --final_eval_n 64 \
     --eval_envs 64 --base_parts "$NBASE" --dyn_fail_weight "$FAIL_W" \
     || fail "refresh $i"
   CK=$R/wm_$i/checkpoints/latest.pt
   if [ "$CAL_N" -gt 0 ] && ! cut -f1 "$R/calib.tsv" | grep -qx "$i"; then
     stamp "iteration $i: $CAL_N whole episodes of the refreshed policy in its world model"
-    PYTHONPATH=. $PY "$HERE/dream_eval.py" --dyn "$WM" --data "$FIRST" --out "$R/wm_$i/dream_eval.json" --n "$CAL_N" \
+    # dreams start from the first frames of the episodes this refresh learned from: the policy's own start states
+    PYTHONPATH=. $PY "$HERE/dream_eval.py" --dyn "$WM" --data "$OUT" --out "$R/wm_$i/dream_eval.json" --n "$CAL_N" \
       --batch 128 --horizon "$CAL_H" --K "$KD" --seed "$i" "wm_$i=$CK" > "$R/wm_$i/dream_eval.log" 2>&1 \
       || fail "dream eval $i"
     $PY -c "import json, sys; r = json.load(open(sys.argv[1]))['results']['wm_' + sys.argv[2]]
