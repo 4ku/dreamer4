@@ -668,8 +668,9 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
               f"episodes collected online (data dirs after the first)", flush=True)
     if cfg.dyn_recent_frac > 0 and cfg.dyn_recent_parts > 0:
         recent = np.arange(n_train) >= sum(len(p) for p in parts[:max(0, len(parts) - cfg.dyn_recent_parts)])
-        if recent.any() and not recent.all():
-            w0 = np.ones(n_train) if dyn_w is None else dyn_w
+        w0 = np.ones(n_train) if dyn_w is None else dyn_w
+        # nothing to share with when every other episode already has weight 0 (e.g. the only online data IS recent)
+        if w0[recent].sum() > 0 and w0[~recent].sum() > 0:
             dyn_w = np.where(recent, w0 * cfg.dyn_recent_frac / w0[recent].sum(),
                              w0 * (1.0 - cfg.dyn_recent_frac) / w0[~recent].sum())
             print(f"video prediction: {cfg.dyn_recent_frac:.0%} of the windows from the {int(recent.sum())} "
