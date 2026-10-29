@@ -448,6 +448,15 @@ def parse_args():
                          "the rarest physics: a dreamed player then walks through a wall after ONE "
                          "push in 2.5-4 %% of wall bumps (phase 1b: 0.4 %%); at 3 it stays at 1 %% "
                          "with the cloning result unchanged, at 10 cloning suffers")
+    ap.add_argument("--dyn_recent_parts", type=int, default=0,
+                    help="with --dyn_recent_frac: how many of the LAST data dirs count as recent (an online loop's "
+                         "newest collections)")
+    ap.add_argument("--dyn_recent_frac", type=float, default=0.0,
+                    help="> 0: that fraction of the video-prediction windows comes from the last "
+                         "--dyn_recent_parts data dirs (failures keep their weight inside each group). Without it "
+                         "the current policy's 128 new episodes are ~5 %% of an online set of near-miss expert "
+                         "data and older policies' episodes, and the refreshed model dreams the policy at 0.99 "
+                         "success against a real 0.56 (HandOver). NOT in the paper")
     ap.add_argument("--dyn_fail_weight", type=float, default=1.0,
                     help="sampling weight of FAILED episodes (manifest success false) in the video-"
                          "prediction windows; > 1 oversamples them. On AlohaPick (~10 %% failures per "
@@ -657,6 +666,14 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
         dyn_w = w if dyn_w is None else dyn_w * w
         print(f"video prediction: {cfg.dyn_online_frac:.0%} of the windows from the {int(online.sum())} "
               f"episodes collected online (data dirs after the first)", flush=True)
+    if cfg.dyn_recent_frac > 0 and cfg.dyn_recent_parts > 0:
+        recent = np.arange(n_train) >= sum(len(p) for p in parts[:max(0, len(parts) - cfg.dyn_recent_parts)])
+        if recent.any() and not recent.all():
+            w0 = np.ones(n_train) if dyn_w is None else dyn_w
+            dyn_w = np.where(recent, w0 * cfg.dyn_recent_frac / w0[recent].sum(),
+                             w0 * (1.0 - cfg.dyn_recent_frac) / w0[~recent].sum())
+            print(f"video prediction: {cfg.dyn_recent_frac:.0%} of the windows from the {int(recent.sum())} "
+                  f"episodes of the newest {cfg.dyn_recent_parts} data dirs", flush=True)
     run = Run(cfg, world, out, writer)
     half = max(1, cfg.batch // 2)
     t_last = time.time()
