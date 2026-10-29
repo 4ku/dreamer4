@@ -61,6 +61,12 @@ FAIL_W=${FAIL_W:-1}                        # failed episodes' video windows samp
                                            # model trained on mostly successful grasps dreams every uncertain grasp as
                                            # a success; 3 makes it admit the policy's failures (dreamed held 0.97 ->
                                            # 0.81 for a policy that holds the box in 0.78 of its real episodes)
+ACCEPT_TOL=${ACCEPT_TOL:-}                 # when an RL stage's policy returns more than ACCEPT_TOL less than the
+                                           # last kept policy (greedy held-out when EVAL_N > 0, else its collection),
+                                           # the stage is REJECTED: it still collects (the world model learns from
+                                           # exactly where its dreams were wrong), but the next refresh starts from
+                                           # the stage's start checkpoint again. Decisions in runs/dyna_<tag>/
+                                           # accept.tsv. Empty = every stage is kept
 START_ITER=${START_ITER:-1}                # resume: collections 1 .. START_ITER-1 are reused; a stage whose output
                                            # already exists (rl_i, the collection, wm_i) is skipped
 LAST_REFRESH=${LAST_REFRESH:-1}            # 0: no refresh after the last collection (no PMPO stage would use it)
@@ -125,6 +131,7 @@ while :; do
     mkdir -p "$R/rl_$i/checkpoints" && cp "$CK" "$R/rl_$i/checkpoints/latest.pt" || fail "keeping the policy $i"
   fi
   stamp "iteration $i: PMPO $U updates from $CK"
+  STAGE_START=$CK
   REALARGS=""
   if [ -n "$REAL_EVERY" ] && [ "$i" -gt 1 ]; then
     REALARGS="--real_data $A/data/dyna_${TAG}_$((i - 1)) --real_every $REAL_EVERY"
@@ -171,6 +178,24 @@ print('%s\t%.4f\t%.1f\t%.3f' % (sys.argv[2], r['success'], r['steps_success'], r
 print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[2]),
       sum(x['success'] for x in e) / len(e), sum(x['return'] for x in e) / len(e)), end='')" "$OUT" "$i" "$M" \
       >> "$R/progress.tsv" && printf "\t%s\n" "$(date -u +%H:%M)" >> "$R/progress.tsv"
+  fi
+  if [ -n "$ACCEPT_TOL" ]; then
+    [ -f "$R/accept.tsv" ] || printf "iter\tverdict\treturn\tref_return\tutc\n" > "$R/accept.tsv"
+    verdict=$(awk -F'\t' -v k="$i" '$1 == k {v = $2} END {print v}' "$R/accept.tsv")
+    if [ -z "$verdict" ]; then
+      # the greedy held-out (same seeds every iteration: a paired comparison) when there is one, else the collection
+      f=$R/progress.tsv
+      if [ "$EVAL_N" -gt 0 ] && cut -f1 "$R/heldout.tsv" | grep -qx "$i"; then f=$R/heldout.tsv; fi
+      cur=$(awk -F'\t' -v k="$i" '$1 == k {r = $4} END {print r}' "$f")
+      ref=$(awk -F'\t' 'NR > 1 && $2 == "kept" {r = $3} END {print r}' "$R/accept.tsv")   # the kept policy's
+      verdict=kept
+      if [ "$rl" = 1 ] && [ -n "$ref" ] && awk -v c="$cur" -v r="$ref" -v t="$ACCEPT_TOL" 'BEGIN {exit !(c < r - t)}'; then
+        verdict=rejected
+      fi
+      printf "%s\t%s\t%s\t%s\t%s\n" "$i" "$verdict" "$cur" "${ref:-none}" "$(date -u +%H:%M)" >> "$R/accept.tsv"
+      stamp "iteration $i: collection return $cur, kept policy's ${ref:-none}, tolerance $ACCEPT_TOL: rl_$i $verdict"
+    fi
+    if [ "$verdict" = rejected ]; then CK=$STAGE_START; fi
   fi
   PARTS=$PARTS,$OUT
   last=0
