@@ -45,6 +45,10 @@ EXTRA_ONLINE=${EXTRA_ONLINE:-}             # offline data dirs counted as ONLINE
                                            # dream starts draw from them with the collections (HandOver: 1 024 expert
                                            # grasps 2-12 mm off teach the world model which grasps hold; only then
                                            # does RL in dreams fix the grasp, no lift 0.21 -> 0.08)
+PMPO_ONLINE=${PMPO_ONLINE:-0}              # 1: the PMPO stages read only the online parts. They use the data for
+                                           # nothing but dream starts, and with START_FRAC 1 every start is online:
+                                           # the base's latents (~5 GB for the HandOver base) would only fill the GPU
+EVAL_ENVS=${EVAL_ENVS:-64}                 # env worlds of the stages' evaluations (fewer = less GPU memory)
 KD=${KD:-1}                                # denoising steps per dreamed frame in the PMPO stages: with 4 the
                                            # failure-weighted world model dreams more of the risky grasps' failures
                                            # (one policy: held 0.97 -> 0.91, real 0.81; mixed outcomes 19 -> 41 %)
@@ -121,11 +125,15 @@ while :; do
     REALARGS="--real_data $A/data/dyna_${TAG}_$((i - 1)) --real_every $REAL_EVERY"
   fi
   if [ ! -f "$R/rl_$i/checkpoints/latest.pt" ]; then
-    $PY -m dreamer4.train.train_pmpo --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/rl_$i" --seed "$i" $REALARGS \
+    PDATA=$PARTS PBASE=$NBASE
+    if [ "$PMPO_ONLINE" = 1 ] && [ "$(echo "$PARTS" | tr ',' '\n' | wc -l)" -gt "$NBASE" ]; then
+      PDATA=$(echo "$PARTS" | cut -d, -f$((NBASE + 1))-) PBASE=0
+    fi
+    $PY -m dreamer4.train.train_pmpo --dyn "$WM" --data "$PDATA" --init_from "$CK" --out "$R/rl_$i" --seed "$i" $REALARGS \
       --steps "$U" --K "$KD" --lr "$PLR" --value_lr "$PLR" --lr_final 3e-5 --adv_drop_final 0.5 --clip_split 1 \
       --eval_every 1000000 --eval_n 64 ${PRIOR:+--prior_from "$PRIOR"} \
-      --eval_envs 64 --beta "$BETA" ${HORIZON:+--horizon "$HORIZON"} --start_online_frac "$START_FRAC" \
-      --base_parts "$NBASE" \
+      --eval_envs "$EVAL_ENVS" --beta "$BETA" ${HORIZON:+--horizon "$HORIZON"} --start_online_frac "$START_FRAC" \
+      --base_parts "$PBASE" \
       || fail "PMPO $i"
   fi
   CK=$R/rl_$i/checkpoints/latest.pt
@@ -170,7 +178,7 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
   [ -f "$R/wm_$i/checkpoints/latest.pt" ] || $PY -m dreamer4.train.train_heads --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/wm_$i" --seed 1 \
     --steps "$K" ${RBATCH:+--batch "$RBATCH"} --val_frac 0 $BCARGS --bc_loss_weight "$BC_LOSS_W" --dyn_weight 10 --fwd_weight 0 --lr "$RLR" \
     --dyn_lr "$RDLR" --dyn_warmup "$WARM" --dyn_online_frac "$ONLINE_FRAC" --eval_every 1000000 --final_eval_n 64 \
-    --eval_envs 64 --base_parts "$NBASE" --dyn_fail_weight "$FAIL_W" \
+    --eval_envs "$EVAL_ENVS" --base_parts "$NBASE" --dyn_fail_weight "$FAIL_W" \
     || fail "refresh $i"
   CK=$R/wm_$i/checkpoints/latest.pt
   if [ "$CAL_N" -gt 0 ] && ! cut -f1 "$R/calib.tsv" | grep -qx "$i"; then
