@@ -57,11 +57,13 @@ GLITCH_T = [int(x) for x in os.environ.get("GLITCH_T", "20,150").split(",")]
 KICK_FRAC = float(os.environ.get("KICK_FRAC", 0.0))
 KICK_SPEED = [float(x) for x in os.environ.get("KICK_SPEED", "0.2,0.5").split(",")]
 KICK_DIST = float(os.environ.get("KICK_DIST", 0.05))   # the gripper site is ~3.8 cm from the box at the grasp
-# OFF_FRAC: a share of the episodes where the expert sees the box shifted horizontally by OFF (m, random direction) until
-# step OFF_UNTIL: its first grasp lands off-centre (some hold, some miss), then it sees the true box and re-grasps. The
-# world model learns which grasps hold; every recorded action is still the expert's.
+# OFF_FRAC: a share of the episodes where the expert sees the box shifted horizontally by OFF (m, random direction) from
+# step OFF_FROM until OFF_UNTIL: its first grasp lands off-centre (some hold, some miss), then it sees the true box and
+# re-grasps. The world model learns which grasps hold; every recorded action is still the expert's. A window after the
+# lift (OFF_FROM ~38) moves the right hand's grasp instead: near-miss hand-overs.
 OFF_FRAC = float(os.environ.get("OFF_FRAC", 0.0))
 OFF = [float(x) for x in os.environ.get("OFF", "0.01,0.03").split(",")]
+OFF_FROM = int(os.environ.get("OFF_FROM", 0))
 OFF_UNTIL = int(os.environ.get("OFF_UNTIL", 45))
 BOX_OBS = ((16, 17), (49, 50), (52, 53), (79, 80))   # the box's x, y in the 83-D obs: qpos, top, bottom, box - target
 STATS_FROM = os.environ.get("STATS_FROM", "")    # copy this dataset's proprio standardisation
@@ -116,8 +118,8 @@ def make_rollout_fn(hv2, env, nworld):
         return state.replace(data=state.data.replace(qvel=qvel)), jp.where(fire, t, kicked)
 
     def seen(obs, off, t):
-        """The expert's view: the box shifted by ``off`` (nworld, 2) until OFF_UNTIL."""
-        on = (t < OFF_UNTIL)
+        """The expert's view: the box shifted by ``off`` (nworld, 2) from OFF_FROM until OFF_UNTIL."""
+        on = (t >= OFF_FROM) & (t < OFF_UNTIL)
         for ix, iy in BOX_OBS:
             obs = obs.at[:, ix].add(jp.where(on, off[:, 0], 0.0)).at[:, iy].add(jp.where(on, off[:, 1], 0.0))
         return obs
@@ -243,7 +245,7 @@ def main():
                 "collector": {"demonstrator": SAC, "clean_frac": CLEAN_FRAC, "noise": [NOISE_LO, NOISE_HI],
                               "glitch_frac": GLITCH_FRAC, "glitch_len": GLITCH_LEN, "glitch_t": GLITCH_T,
                               "kick_frac": KICK_FRAC, "kick_speed": KICK_SPEED, "kick_dist": KICK_DIST,
-                              "off_frac": OFF_FRAC, "off": OFF, "off_until": OFF_UNTIL,
+                              "off_frac": OFF_FRAC, "off": OFF, "off_from": OFF_FROM, "off_until": OFF_UNTIL,
                               "target": os.environ.get("HANDOVER_TARGET", "random"),
                               "seed": SEED, "relabelled": bool(RELABEL)},
                 "episodes": episodes}

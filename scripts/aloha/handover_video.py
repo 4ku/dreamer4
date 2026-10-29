@@ -30,6 +30,8 @@ ap.add_argument("--label", default="")
 ap.add_argument("--first", action="store_true",
                 help="show the first --show episodes as they come (the same seeds for every policy: a fair before/after)")
 ap.add_argument("--upscale", type=int, default=2, help="pixel upscaling of the video (1 keeps the file small)")
+ap.add_argument("--lifted_fails", type=int, default=0,
+                help="show this many failures that HAD lifted the box (the hand-over failed), the rest successes")
 cfg = ap.parse_args()
 dev = torch.device("cuda")
 world, agent = load_agent(argparse.Namespace(init_from=cfg.ckpt, dyn=cfg.dyn, device="cuda", reward_decode="mode",
@@ -43,6 +45,7 @@ policy.reset_rows(None)
 video, viz, rew, prev = [np.stack(frames)], [], np.zeros((cfg.n, T)), None
 ended = np.full(cfg.n, T)        # the step an episode ended at (success / out of bounds); T = the time limit
 ok = np.zeros(cfg.n, bool)
+lifted = np.zeros(cfg.n, bool)
 with torch.no_grad():
     for t in range(T):
         z = tok.encode_last(np.stack([np.stack(w[-hist:]) for w in window])).float().to(dev)
@@ -58,6 +61,7 @@ with torch.no_grad():
         newly = np.asarray(done, bool) & (ended == T)
         ended[newly] = t + 1
         ok |= np.array([i["is_success"] for i in infos])
+        lifted |= (ended >= t + 1) & np.array([bool(i["viz"]["left_held"]) for i in infos])
         if (ended < T).all():
             break
 env.close()
@@ -68,6 +72,10 @@ show = list(succ[:cfg.show // 2]) + list(fail[:cfg.show - min(len(succ), cfg.sho
 show = show[:cfg.show]
 if cfg.first:
     show = list(range(min(cfg.show, cfg.n)))
+if cfg.lifted_fails:
+    lf = np.flatnonzero(lifted & ~ok)
+    show = list(lf[:cfg.lifted_fails]) + list(succ[:cfg.show - min(len(lf), cfg.lifted_fails)])
+    print(f"lifted, then failed: {len(lf)} of {cfg.n}")
 font = ImageFont.truetype(font_manager.findfont("DejaVu Sans"), 13)
 font_b = ImageFont.truetype(font_manager.findfont("DejaVu Sans:bold"), 14)
 font_t = ImageFont.truetype(font_manager.findfont("DejaVu Sans:bold"), 17)
@@ -99,7 +107,8 @@ def tile(i, t):
     if ok[i] and t >= ended[i]:
         d.text((4, H + 33), f"SUCCESS at step {ended[i]}: +1, the episode ends", fill=(80, 255, 80), font=font_b)
     elif not ok[i] and t >= T - 1:
-        d.text((4, H + 33), "FAIL: no hand-over by the time limit (250)", fill=(255, 90, 90), font=font_b)
+        d.text((4, H + 33), "FAIL: lifted, but no hand-over by step 250" if lifted[i] else
+               "FAIL: never lifted the box (grasp missed)", fill=(255, 90, 90), font=font_b)
     return np.asarray(img)
 
 
