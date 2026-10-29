@@ -49,6 +49,8 @@ PMPO_ONLINE=${PMPO_ONLINE:-0}              # 1: the PMPO stages read only the on
                                            # nothing but dream starts, and with START_FRAC 1 every start is online:
                                            # the base's latents (~5 GB for the HandOver base) would only fill the GPU
 EVAL_ENVS=${EVAL_ENVS:-64}                 # env worlds of the stages' evaluations (fewer = less GPU memory)
+REFRESH_EVAL_N=${REFRESH_EVAL_N:-64}       # the refresh's final real evaluation (0: none and no env workers; the
+                                           # held-out EVAL_N measures every policy anyway)
 KD=${KD:-1}                                # denoising steps per dreamed frame in the PMPO stages: with 4 the
                                            # failure-weighted world model dreams more of the risky grasps' failures
                                            # (one policy: held 0.97 -> 0.91, real 0.81; mixed outcomes 19 -> 41 %)
@@ -177,7 +179,7 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
   stamp "iteration $i: refresh the world model and heads, $K steps"
   [ -f "$R/wm_$i/checkpoints/latest.pt" ] || $PY -m dreamer4.train.train_heads --dyn "$WM" --data "$PARTS" --init_from "$CK" --out "$R/wm_$i" --seed 1 \
     --steps "$K" ${RBATCH:+--batch "$RBATCH"} --val_frac 0 $BCARGS --bc_loss_weight "$BC_LOSS_W" --dyn_weight 10 --fwd_weight 0 --lr "$RLR" \
-    --dyn_lr "$RDLR" --dyn_warmup "$WARM" --dyn_online_frac "$ONLINE_FRAC" --eval_every 1000000 --final_eval_n 64 \
+    --dyn_lr "$RDLR" --dyn_warmup "$WARM" --dyn_online_frac "$ONLINE_FRAC" --eval_every 1000000 --final_eval_n "$REFRESH_EVAL_N" \
     --eval_envs "$EVAL_ENVS" --base_parts "$NBASE" --dyn_fail_weight "$FAIL_W" \
     || fail "refresh $i"
   CK=$R/wm_$i/checkpoints/latest.pt

@@ -481,10 +481,13 @@ class Run:
 
     def __init__(self, cfg, world, out, writer):
         self.cfg, self.world, self.out, self.writer = cfg, world, out, writer
-        self.envs = make_eval_envs(world.env_spec, cfg.eval_envs) if world.env_spec else []
+        # --final_eval_n 0 with no evaluation before the last step: no env workers at all (they hold GPU memory for
+        # the whole run, and a big world model's refresh leaves them too little)
+        plays = cfg.final_eval_n > 0 or cfg.eval_every < cfg.steps
+        self.envs = make_eval_envs(world.env_spec, cfg.eval_envs) if world.env_spec and plays else []
         if not self.envs:
-            print("no env_spec in this dataset: real-env evaluation is skipped and no best.pt is "
-                  "written (offline metrics only)", flush=True)
+            print("no env_spec in this dataset or no evaluation asked for: real-env evaluation is skipped and no "
+                  "best.pt is written (offline metrics only)", flush=True)
         self.best = (-1.0, float("nan"))
         self.last_eval, self.best_eval = {}, {}
         self.t0 = time.time()
