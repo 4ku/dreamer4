@@ -61,12 +61,12 @@ FAIL_W=${FAIL_W:-1}                        # failed episodes' video windows samp
                                            # model trained on mostly successful grasps dreams every uncertain grasp as
                                            # a success; 3 makes it admit the policy's failures (dreamed held 0.97 ->
                                            # 0.81 for a policy that holds the box in 0.78 of its real episodes)
-ACCEPT_TOL=${ACCEPT_TOL:-}                 # when an RL stage's policy returns more than ACCEPT_TOL less than the
-                                           # last kept policy (greedy held-out when EVAL_N > 0, else its collection),
-                                           # the stage is REJECTED: it still collects (the world model learns from
-                                           # exactly where its dreams were wrong), but the next refresh starts from
-                                           # the stage's start checkpoint again. Decisions in runs/dyna_<tag>/
-                                           # accept.tsv. Empty = every stage is kept
+ACCEPT_TOL=${ACCEPT_TOL:-}                 # with EVAL_N: when an RL stage's policy returns more than ACCEPT_TOL less
+                                           # than the policy it started from (both played on the same EVAL_N held-out
+                                           # seeds in one run), the stage is REJECTED: it still collects (the world
+                                           # model learns from exactly where its dreams were wrong), but the next
+                                           # refresh starts from the stage's start checkpoint again. Decisions in
+                                           # runs/dyna_<tag>/accept.tsv. Empty = every stage is kept
 START_ITER=${START_ITER:-1}                # resume: collections 1 .. START_ITER-1 are reused; a stage whose output
                                            # already exists (rl_i, the collection, wm_i) is skipped
 LAST_REFRESH=${LAST_REFRESH:-1}            # 0: no refresh after the last collection (no PMPO stage would use it)
@@ -158,6 +158,24 @@ print('%s\t%.4f\t%.1f\t%.3f' % (sys.argv[2], r['success'], r['steps_success'], r
       "$R/rl_$i/heldout.json" "$i" >> "$R/heldout.tsv" && printf "\t%s\n" "$(date -u +%H:%M)" >> "$R/heldout.tsv"
     stamp "iteration $i: held-out $(tail -n 1 "$R/heldout.tsv" | cut -f2-4)"
   fi
+  verdict=""
+  if [ -n "$ACCEPT_TOL" ] && [ "$EVAL_N" -gt 0 ] && [ "$STAGE_START" != "$CK" ] && [ -f "$STAGE_START" ]; then
+    [ -f "$R/accept.tsv" ] || printf "iter\tverdict\treturn\tstart_return\tsuccess\tstart_success\tutc\n" > "$R/accept.tsv"
+    if ! cut -f1 "$R/accept.tsv" | grep -qx "$i"; then
+      # the stage's policy and the policy it started from on the same held-out seeds, in ONE run: two separate
+      # 128-episode runs of the same policy differ by up to ~0.2 return (the physics is not bit-exact across batches)
+      stamp "iteration $i: acceptance -- rl_$i against its start, $EVAL_N greedy episodes each"
+      PYTHONPATH=. $PY "$HERE/eval_margin.py" --dyn "$WM" --data "$FIRST" --out "$R/rl_$i/accept.json" --n "$EVAL_N" \
+        "start_$i=$STAGE_START" "rl_$i=$CK" > "$R/rl_$i/accept.log" 2>&1 || fail "acceptance $i"
+      $PY -c "import json, sys; r = json.load(open(sys.argv[1]))['results']; i, tol = sys.argv[2], float(sys.argv[3])
+c, s = r['rl_' + i], r['start_' + i]
+print('%s\t%s\t%.3f\t%.3f\t%.4f\t%.4f' % (i, 'rejected' if c['return'] < s['return'] - tol else 'kept', c['return'],
+      s['return'], c['success'], s['success']), end='')" "$R/rl_$i/accept.json" "$i" "$ACCEPT_TOL" >> "$R/accept.tsv" \
+        && printf "\t%s\n" "$(date -u +%H:%M)" >> "$R/accept.tsv"
+      stamp "iteration $i: return / start return / success / start success $(tail -n 1 "$R/accept.tsv" | cut -f3-6): rl_$i $(tail -n 1 "$R/accept.tsv" | cut -f2)"
+    fi
+    verdict=$(awk -F'\t' -v k="$i" '$1 == k {v = $2} END {print v}' "$R/accept.tsv")
+  fi
   if [ -n "$TARGET_SR" ] && [ "$EVAL_N" -gt 0 ]; then
     hits=$(tail -n "$TARGET_N" "$R/heldout.tsv" | awk -F'\t' -v t="$TARGET_SR" '$1 != "iter" && $2 >= t {k++} END {print k + 0}')
     if [ "$hits" -ge "$TARGET_N" ]; then
@@ -179,24 +197,7 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
       sum(x['success'] for x in e) / len(e), sum(x['return'] for x in e) / len(e)), end='')" "$OUT" "$i" "$M" \
       >> "$R/progress.tsv" && printf "\t%s\n" "$(date -u +%H:%M)" >> "$R/progress.tsv"
   fi
-  if [ -n "$ACCEPT_TOL" ]; then
-    [ -f "$R/accept.tsv" ] || printf "iter\tverdict\treturn\tref_return\tutc\n" > "$R/accept.tsv"
-    verdict=$(awk -F'\t' -v k="$i" '$1 == k {v = $2} END {print v}' "$R/accept.tsv")
-    if [ -z "$verdict" ]; then
-      # the greedy held-out (same seeds every iteration: a paired comparison) when there is one, else the collection
-      f=$R/progress.tsv
-      if [ "$EVAL_N" -gt 0 ] && cut -f1 "$R/heldout.tsv" | grep -qx "$i"; then f=$R/heldout.tsv; fi
-      cur=$(awk -F'\t' -v k="$i" '$1 == k {r = $4} END {print r}' "$f")
-      ref=$(awk -F'\t' 'NR > 1 && $2 == "kept" {r = $3} END {print r}' "$R/accept.tsv")   # the kept policy's
-      verdict=kept
-      if [ "$rl" = 1 ] && [ -n "$ref" ] && awk -v c="$cur" -v r="$ref" -v t="$ACCEPT_TOL" 'BEGIN {exit !(c < r - t)}'; then
-        verdict=rejected
-      fi
-      printf "%s\t%s\t%s\t%s\t%s\n" "$i" "$verdict" "$cur" "${ref:-none}" "$(date -u +%H:%M)" >> "$R/accept.tsv"
-      stamp "iteration $i: collection return $cur, kept policy's ${ref:-none}, tolerance $ACCEPT_TOL: rl_$i $verdict"
-    fi
-    if [ "$verdict" = rejected ]; then CK=$STAGE_START; fi
-  fi
+  if [ "${verdict:-}" = rejected ]; then CK=$STAGE_START; fi
   PARTS=$PARTS,$OUT
   last=0
   if [ -f "$R/STOP" ] || [ "$i" = "$ITERS" ]; then last=1; fi
