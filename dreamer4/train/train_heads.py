@@ -448,6 +448,11 @@ def parse_args():
                          "the rarest physics: a dreamed player then walks through a wall after ONE "
                          "push in 2.5-4 %% of wall bumps (phase 1b: 0.4 %%); at 3 it stays at 1 %% "
                          "with the cloning result unchanged, at 10 cloning suffers")
+    ap.add_argument("--reward_offset", type=float, default=0.0,
+                    help="added to every recorded reward the reward head learns: training-time shaping that the "
+                         "dreams (and so RL) inherit, while evaluation keeps the env's own reward. +0.007 turns "
+                         "HandOver reward v2's -0.01 per-step time cost into -0.003: a rushed grasp the world model "
+                         "cannot judge then saves 0.09 per 30 steps instead of 0.3. NOT in the paper")
     ap.add_argument("--dyn_recent_parts", type=int, default=0,
                     help="with --dyn_recent_frac: how many of the LAST data dirs count as recent (an online loop's "
                          "newest collections)")
@@ -817,6 +822,10 @@ def main():
         raise ValueError("this dataset records no rewards/terminals, so the reward head cannot be "
                          "trained on it")
     n_train = int(round(len(ds) * (1.0 - cfg.val_frac)))
+    if cfg.reward_offset:
+        for ep in episodes:
+            ep["rewards"] = np.asarray(ep["rewards"], np.float32) + np.float32(cfg.reward_offset)
+        print(f"reward head learns the recorded rewards {cfg.reward_offset:+g} per step", flush=True)
     if cfg.value_weight > 0:
         add_returns(episodes, cfg.gamma)
     if cfg.bc_last_part:
