@@ -72,13 +72,16 @@ class DemoStarts:
     here, and the actions are the recorded action VECTORS (one-hot or continuous alike).
     """
 
-    def __init__(self, episodes, *, window, rng=None, online_from=None, online_frac=0.0):
+    def __init__(self, episodes, *, window, rng=None, online_from=None, online_frac=0.0, recent_from=None,
+                 recent_frac=0.0):
         """``online_frac`` > 0 draws that fraction of the starts from episodes ``online_from`` onwards
-        (the ones an online loop collected with recent policies), the rest from the earlier ones."""
+        (the ones an online loop collected with recent policies), the rest from the earlier ones.
+        ``recent_frac`` > 0 then gives episodes ``recent_from`` onwards (the newest collections, the
+        current policy's own states) that share of the starts."""
         self.window = int(window)
         z, proprio, into, task, local = [], [], [], [], []
         offset = 0
-        late = []
+        late, recent = [], []
         for e_idx, ep in enumerate(episodes):
             n = ep["z"].shape[0]
             # The last frame of an episode that ENDED is not a start: there is nothing left to do
@@ -96,6 +99,7 @@ class DemoStarts:
             task.append(np.full(n, int(ep.get("meta", {}).get("task", 0)), np.int64))
             local.append((offset, keep))
             late.append(online_from is not None and e_idx >= online_from)
+            recent.append(recent_from is not None and e_idx >= recent_from)
             offset += n
         self.z = torch.cat(z)
         self.proprio = np.concatenate(proprio)
@@ -110,6 +114,12 @@ class DemoStarts:
         is_late = np.concatenate([np.full(k, flag) for (o, k), flag in zip(local, late)])
         if online_frac > 0 and is_late.any() and not is_late.all():
             self.p = np.where(is_late, online_frac / is_late.sum(), (1.0 - online_frac) / (~is_late).sum())
+        is_recent = np.concatenate([np.full(k, flag) for (o, k), flag in zip(local, recent)])
+        w0 = np.full(len(self.index), 1.0 / len(self.index)) if self.p is None else self.p
+        # nothing to share with when every other start already has weight 0
+        if recent_frac > 0 and w0[is_recent].sum() > 0 and w0[~is_recent].sum() > 0:
+            self.p = np.where(is_recent, w0 * recent_frac / w0[is_recent].sum(),
+                              w0 * (1.0 - recent_frac) / w0[~is_recent].sum())
 
     def sample(self, n, pick=None):
         """``n`` contexts: their latents, proprio, aligned actions and task. ``pick`` (positions in
@@ -503,6 +513,12 @@ def parse_args():
     ap.add_argument("--base_parts", type=int, default=1,
                     help="the first N --data dirs are the offline base; the dirs after them were "
                          "collected online")
+    ap.add_argument("--start_recent_parts", type=int, default=2,
+                    help="the newest N --data dirs are the current policy's own collections (--start_recent_frac)")
+    ap.add_argument("--start_recent_frac", type=float, default=0.0,
+                    help="> 0: that fraction of the dream starts comes from the newest --start_recent_parts "
+                         "dirs. Uniform over a long online history (HandOver, 30 dirs), 55 %% of the starts are the "
+                         "states of much weaker predecessors and 5 %% the current policy's. NOT in the paper")
     ap.add_argument("--real_env", type=int, default=0,
                     help="> 0: learn from that many REAL episodes per update instead of dreams -- the "
                          "same PMPO update and heads, model-free (the control for imagination)")
@@ -585,12 +601,17 @@ def main():
         print(f"REAL-ENV rollouts: {cfg.real_env} episodes of {cfg.horizon} steps per update{mix}", flush=True)
     else:
         parts = getattr(world.dataset, "parts", None) or [world.dataset]
+        recent_from = sum(len(p) for p in parts[:max(0, len(parts) - cfg.start_recent_parts)])
         starts = DemoStarts(encode_episodes(world.tok, world.dataset, range(len(world.dataset))),
                             window=agent.clip_T, rng=rng,
                             online_from=sum(len(p) for p in parts[:cfg.base_parts]),
-                            online_frac=cfg.start_online_frac)
+                            online_frac=cfg.start_online_frac,
+                            recent_from=recent_from, recent_frac=cfg.start_recent_frac)
         print(f"dream starts: {len(starts.index)} contexts of {agent.clip_T} frames from "
               f"{world.data_path} | horizon {cfg.horizon}", flush=True)
+        if cfg.start_recent_frac > 0:
+            print(f"dream starts: {cfg.start_recent_frac:.0%} from the {len(world.dataset) - recent_from} episodes "
+                  f"of the newest {cfg.start_recent_parts} data dirs", flush=True)
     recorded = None
     if cfg.real_data:
         rds = open_video_dataset(cfg.real_data, proprio=world.proprio_mode, actions=True)

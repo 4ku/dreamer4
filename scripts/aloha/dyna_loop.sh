@@ -57,6 +57,9 @@ REWARD_OFFSET=${REWARD_OFFSET:-0}          # added to every recorded reward the 
 RECENT_FRAC=${RECENT_FRAC:-0}              # > 0: that share of the refresh's video windows from the newest
 RECENT_PARTS=${RECENT_PARTS:-2}            # RECENT_PARTS collections (the current policy's own episodes; uniform
                                            # sampling leaves them ~5 % next to near-miss and older data)
+START_RECENT_FRAC=${START_RECENT_FRAC:-0}  # > 0: that share of the PMPO stages' dream starts from the newest
+START_RECENT_PARTS=${START_RECENT_PARTS:-2} # START_RECENT_PARTS collections (uniform starts over the whole online
+                                           # history are mostly the states of much weaker earlier policies)
 KD=${KD:-1}                                # denoising steps per dreamed frame in the PMPO stages: with 4 the
                                            # failure-weighted world model dreams more of the risky grasps' failures
                                            # (one policy: held 0.97 -> 0.91, real 0.81; mixed outcomes 19 -> 41 %)
@@ -148,7 +151,7 @@ while :; do
       --steps "$U" --K "$KD" --lr "$PLR" --value_lr "$PLR" --lr_final 3e-5 --adv_drop_final 0.5 --clip_split 1 \
       --eval_every 1000000 --eval_n 64 ${PRIOR:+--prior_from "$PRIOR"} \
       --eval_envs "$EVAL_ENVS" --beta "$BETA" ${HORIZON:+--horizon "$HORIZON"} --start_online_frac "$START_FRAC" \
-      --base_parts "$PBASE" \
+      --base_parts "$PBASE" --start_recent_parts "$START_RECENT_PARTS" --start_recent_frac "$START_RECENT_FRAC" \
       || fail "PMPO $i"
   fi
   CK=$R/rl_$i/checkpoints/latest.pt
