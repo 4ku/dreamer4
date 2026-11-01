@@ -38,11 +38,25 @@ ap.add_argument("--greedy", action="store_true", help="greedy actions instead of
 ap.add_argument("--reward_decode", choices=("mode", "mean"), default="mode",
                 help="the dreamed reward: phase 3's default 'mode', or the reward head's expectation")
 ap.add_argument("--heldout", default="", help="dir of <name>.json held-out results printed alongside")
+ap.add_argument("--grasp_split", action="store_true",
+                help="HandOver: sort the dreamed failures by the dreamed gripper joints as plot_ho_failures.py "
+                     "sorts real ones -- missed first grasp (left), missed hand-over grasp (right), both held")
 ap.add_argument("policies", nargs="+", help="name=checkpoint")
 cfg = ap.parse_args()
 
 dev = torch.device("cuda")
 results = {}
+
+
+def holds(g, lo=0.040, hi=0.052, n=8):
+    """Rows (episodes) whose gripper stopped closing at the box's width for n steps: it held the box."""
+    ok = (g > lo) & (g < hi)
+    run = np.zeros(len(g), int)
+    best = np.zeros(len(g), int)
+    for t in range(g.shape[1]):
+        run = np.where(ok[:, t], run + 1, 0)
+        best = np.maximum(best, run)
+    return best >= n
 for spec in cfg.policies:
     name, ck = spec.split("=", 1)
     torch.manual_seed(cfg.seed)
@@ -56,20 +70,41 @@ for spec in cfg.policies:
     firsts = np.flatnonzero(starts.index == starts.base)          # each episode's frame 0
     pick = np.random.default_rng(cfg.seed).choice(firsts, cfg.n, replace=len(firsts) < cfg.n)
     pick = np.repeat(pick, cfg.repeat)
-    rets, held, ends, lens = [], [], [], []
+    rets, held, ends, lens, grips = [], [], [], [], []
+    if cfg.grasp_split:
+        # the dreamed proprio is standardised: undo the (affine, per-joint) standardisation of the data
+        leaf = (getattr(world.dataset, "parts", None) or [world.dataset])[0]
+        dim = leaf.proprio_dim
+        z0, z1 = leaf.standardise(np.zeros(dim)), leaf.standardise(np.ones(dim))
+        p_std = 1.0 / (z1 - z0)
+        p_mean = -z0 * p_std
     for i in range(0, len(pick), cfg.batch):
         rows = pick[i:i + cfg.batch]
         with torch.autocast("cuda", torch.bfloat16):
-            roll = agent.rollout(starts.sample(len(rows), pick=rows), horizon=cfg.horizon, K=cfg.K, term_prob=0.5)
+            roll = agent.rollout(starts.sample(len(rows), pick=rows), horizon=cfg.horizon, K=cfg.K, term_prob=0.5,
+                                 keep_proprio=cfg.grasp_split)
         r = roll["rewards"].float()
         rets.append(r.sum(1).cpu().numpy())
         held.append((r[:, -10:].mean(1) > cfg.lift_r).cpu().numpy())
         ends.append(roll["terminated"].cpu().numpy())          # reward v2: the dream ended on the success bonus
         lens.append((roll["alive"].sum(1) - 1).cpu().numpy())
+        if cfg.grasp_split:
+            st = roll["proprio"].cpu().numpy() * p_std + p_mean
+            alive = roll["alive"].cpu().numpy() > 0
+            # frames after a dream's end repeat nothing useful: park them outside the hold band
+            left, right = np.where(alive, st[..., 6], 0.0), np.where(alive, st[..., 13], 0.0)
+            grips.append(np.stack([holds(left), holds(right)], 1))
     rets, held, ends, lens = map(np.concatenate, (rets, held, ends, lens))
     res = {"ckpt": ck, "dream_return": float(rets.mean()), "dream_held": float(held.mean()), "n": cfg.n,
            "dream_success": float(ends.mean()),
            "dream_steps_success": float(lens[ends].mean()) if ends.any() else float("nan")}
+    if cfg.grasp_split:
+        g = np.concatenate(grips)
+        fail = ~ends
+        res.update(dream_missed_grasp=float((fail & ~g[:, 0]).mean()),
+                   dream_missed_handover=float((fail & g[:, 0] & ~g[:, 1]).mean()),
+                   dream_both_held_failed=float((fail & g[:, 0] & g[:, 1]).mean()),
+                   dream_left_held=float(g[:, 0].mean()))
     if cfg.repeat > 1:
         per_start = held.reshape(cfg.n, cfg.repeat).mean(1)
         res.update(starts_always_held=float((per_start == 1).mean()), starts_never_held=float((per_start == 0).mean()),
@@ -87,6 +122,9 @@ for spec in cfg.policies:
     if cfg.repeat > 1:
         line += (f" | per start: always held {res['starts_always_held']:.2f}, never {res['starts_never_held']:.2f}, "
                  f"mixed {res['starts_mixed']:.2f}, return sd {res['return_sd_within_start']:.1f}")
+    if cfg.grasp_split:
+        line += (f" | failures: missed grasp {res['dream_missed_grasp']:.3f}, missed hand-over "
+                 f"{res['dream_missed_handover']:.3f}, both held {res['dream_both_held_failed']:.3f}")
     print(line, flush=True)
     del world, agent, starts
     torch.cuda.empty_cache()

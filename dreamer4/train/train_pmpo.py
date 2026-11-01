@@ -255,7 +255,8 @@ class Imagination:
                            tau_ctx=self.world.tau_ctx, k_max=self.world.k_max).eval()
 
     @torch.no_grad()
-    def rollout(self, starts_batch, *, horizon, K, term_prob):
+    def rollout(self, starts_batch, *, horizon, K, term_prob, keep_proprio=False):
+        """``keep_proprio``: also return the dreamed proprio of every frame (``proprio``, standardised)."""
         world, heads, dev = self.world, self.heads, self.device
         B = len(starts_batch["z"])
         D = world.action_vec_dim
@@ -278,6 +279,10 @@ class Imagination:
 
         tape = Tape(B, horizon, dev, code_shape=(heads.policy.n_actions,) if heads.policy.bins else ())
         H = torch.zeros(B, horizon + 1, self.d_in, device=dev)
+        P = None
+        if keep_proprio:
+            P = torch.zeros(B, horizon + 1, prop.shape[-1], device=dev)
+            P[:, 0] = prop[:, -1].float()
         # Batch rows still being simulated. With --compact, dreams that have ended leave the batch
         # (and the KV cache) in blocks of 32: whatever they would produce after their end is masked
         # out by `alive` / `continues` anyway, so the update is unchanged and only dead compute goes.
@@ -323,8 +328,10 @@ class Imagination:
                                          act_hist=act_hist[:, -(z.shape[1] + 1):], K=K, cache=cache)
             z = torch.cat([z, z_new[:, None]], 1)
             prop = torch.cat([prop, prop_new[:, None]], 1)
+            if P is not None:
+                P[rows, t + 1] = prop_new.float()
         H[:, t + 1:] = H[:, t:t + 1]                  # freeze the tail of finished episodes
-        return tape.finish({"H": H})
+        return tape.finish({"H": H} if P is None else {"H": H, "proprio": P})
 
     @torch.no_grad()
     def real_rollout(self, env, *, seed, keep=False):
