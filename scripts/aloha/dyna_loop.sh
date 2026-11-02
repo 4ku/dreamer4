@@ -39,6 +39,9 @@ BC_LOSS_W=${BC_LOSS_W:-1}                  # weight of the cloning loss in the r
 DISTILL=${DISTILL:-0}                      # 1: the refresh keeps the policy by matching its pre-refresh action
                                            # distribution instead of cloning recorded actions (BC_TOP ignored)
 if [ "$DISTILL" = 1 ]; then BCARGS="--bc_last_part 1 --distill 1"; fi
+BC_ANCHOR=${BC_ANCHOR:-0}                  # with DISTILL=1: weight of an extra cloning loss on the base data's expert
+                                           # demonstrations in every refresh (holds the policy near the expert where
+                                           # the dreams give RL no signal)
 EXTRA_BASE=${EXTRA_BASE:-}                 # more offline data dirs (comma-separated) next to the world model's own:
                                            # part of the base in every stage, never counted as online
 EXTRA_ONLINE=${EXTRA_ONLINE:-}             # offline data dirs counted as ONLINE: the refresh's video windows and the
@@ -217,6 +220,7 @@ print('%d\t%d\t%.3f\t%.2f' % (int(sys.argv[2]), int(sys.argv[3]) * int(sys.argv[
     --dyn_lr "$RDLR" --dyn_warmup "$WARM" --dyn_online_frac "$ONLINE_FRAC" --eval_every 1000000 --final_eval_n "$REFRESH_EVAL_N" \
     --eval_envs "$EVAL_ENVS" --base_parts "$NBASE" --dyn_fail_weight "$FAIL_W" \
     --dyn_recent_parts "$RECENT_PARTS" --dyn_recent_frac "$RECENT_FRAC" --reward_offset "$REWARD_OFFSET" \
+    --bc_anchor "$BC_ANCHOR" \
     || fail "refresh $i"
   CK=$R/wm_$i/checkpoints/latest.pt
   if [ "$CAL_N" -gt 0 ] && ! cut -f1 "$R/calib.tsv" | grep -qx "$i"; then

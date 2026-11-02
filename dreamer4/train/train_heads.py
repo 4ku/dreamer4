@@ -372,6 +372,11 @@ def parse_args():
                          "policy matches that policy's whole action distribution (computed on its "
                          "own, frozen transformer) on every clip, while the world model and the "
                          "reward and value heads learn from the data")
+    ap.add_argument("--bc_anchor", type=float, default=0.0,
+                    help="with --distill: weight of an extra cloning loss on the demonstrations of the --base_parts "
+                         "data dirs (the expert's recorded actions), next to the distillation of the current policy. "
+                         "It holds the policy near the expert where the dreams give RL no signal (HandOver: which "
+                         "grasps hold). NOT in the paper (whose phase 2 clones and whose phase 3 keeps a BC prior)")
     ap.add_argument("--bc_frac", type=float, default=1.0,
                     help="fraction of the dataset's demonstrations to clone")
     ap.add_argument("--bc_seed", type=int, default=0)
@@ -620,7 +625,7 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
     combiner = LossCombiner({"policy": cfg.bc_loss_weight, "reward": cfg.reward_weight,
                              "flow": cfg.dyn_weight, "proprio": cfg.dyn_weight * 0.3,
                              "bootstrap": cfg.dyn_weight * 0.5, "value": cfg.value_weight,
-                             "forward": cfg.fwd_weight},
+                             "forward": cfg.fwd_weight, "anchor": cfg.bc_anchor},
                             normalize=bool(cfg.loss_norm), device=dev)
     if combiner.normalizer is not None and world.loss_norm is not None:
         # "Reuse the pretraining setting" includes the loss scales. A fresh normaliser divides each
@@ -680,6 +685,14 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
                              w0 * (1.0 - cfg.dyn_recent_frac) / w0[~recent].sum())
             print(f"video prediction: {cfg.dyn_recent_frac:.0%} of the windows from the {int(recent.sum())} "
                   f"episodes of the newest {cfg.dyn_recent_parts} data dirs", flush=True)
+    anchor_ids, anchor_b = [], max(1, cfg.batch // 4)
+    if cfg.bc_anchor > 0:
+        n_base = sum(len(p) for p in parts[:cfg.base_parts])
+        anchor_ids = [i for i in range(min(n_base, n_train)) if episodes[i]["bc_weight"] > 0]
+        if not anchor_ids:
+            raise ValueError("--bc_anchor: the --base_parts data dirs hold no demonstration")
+        print(f"cloning anchor: {len(anchor_ids)} demonstrations of the first {cfg.base_parts} data dirs, "
+              f"{anchor_b} clips per step, weight {cfg.bc_anchor:g}", flush=True)
     run = Run(cfg, world, out, writer)
     half = max(1, cfg.batch // 2)
     t_last = time.time()
@@ -701,6 +714,11 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
             pol, rew = agent_losses(heads, h.float(), clip, mtp=cfg.mtp, demo_mask=demo_mask,
                                     teacher_logits=t_logits)
             terms = {"policy": pol, "reward": rew}
+            if anchor_ids:
+                a_clip = sample_clips(episodes, anchor_ids, anchor_b, T, rng, dev)
+                h_a = agent_forward(world, heads, a_clip, **fwd)
+                a_tgt, a_msk = mtp_targets(heads.policy.encode(a_clip["a_vec"]), a_clip["valid_a"], cfg.mtp)
+                terms["anchor"] = heads.policy.clone_loss(heads.policy(h_a.float()), a_tgt, a_msk)
             if cfg.value_weight > 0:
                 terms["value"] = heads.value.loss(heads.value(h.float()), clip["ret"][..., None],
                                                   clip["valid_v"][..., None])
@@ -742,6 +760,7 @@ def train(cfg, world, out, writer, episodes, demos, n_train, dev, rng, init=None
                 writer.add_scalar(("bc/cross_entropy" if k == "policy" else
                                    "reward/loss" if k == "reward" else
                                    "critic/pretrain_loss" if k == "value" else
+                                   "bc/anchor_cross_entropy" if k == "anchor" else
                                    "aux/forward_model_loss" if k == "forward" else f"dyn/{k}"), x, s)
             for k, x in dyn_aux.items():
                 writer.add_scalar(f"dyn/{k}", x, s)
