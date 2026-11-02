@@ -42,6 +42,9 @@ ap.add_argument("--batch", type=int, default=48)
 ap.add_argument("--lift_r", type=float, default=0.7)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--label", default="")
+ap.add_argument("--grasp", action="store_true",
+                help="HandOver: also compare, episode by episode, whether the left hand held the box in the dream "
+                     "and in reality (the gripper rule of plot_ho_failures.py on the dreamed / recorded joints)")
 cfg = ap.parse_args()
 
 dev = torch.device("cuda")
@@ -108,19 +111,41 @@ def replay(eps, mode):
         h = dream_context(world, heads, z_hist=z[:, -1:], prop_hist=prop[:, -1:], act_hist=act[:, -1:],
                           tau_ctx=world.tau_ctx, task_ids=task, cache=cache, commit=True)
         rewards[:, t - S - 1] = agent.decode_reward(heads.reward.at(h, 0).float().softmax(-1))
-    return rewards.cpu().numpy(), z
+    return rewards.cpu().numpy(), z, prop[:, W:].float().cpu().numpy()      # proprio of frames S+1 .. END-1
 
 
+def holds(g, lo=0.040, hi=0.052, n=8):
+    """Rows whose gripper stopped closing at the box's width for n steps: it held the box."""
+    ok = (g > lo) & (g < hi)
+    run = np.zeros(len(g), int)
+    best = np.zeros(len(g), int)
+    for t in range(g.shape[1]):
+        run = np.where(ok[:, t], run + 1, 0)
+        best = np.maximum(best, run)
+    return best >= n
+
+
+if cfg.grasp:
+    leaf = (getattr(ds, "parts", None) or [ds])[0]          # the standardisation is the base's in every dir
+    z0, z1 = leaf.standardise(np.zeros(leaf.proprio_dim)), leaf.standardise(np.ones(leaf.proprio_dim))
+    p_std = 1.0 / (z1 - z0)
+    p_mean = -z0 * p_std
 real_r, dream_r, teach_r, gen_r = [], [], [], []
+grasp_real, grasp_dream = [], []
 show = set(fail[:cfg.video_n] + succ[:2]) if cfg.video else set()
 shown = {}
 for s in range(0, len(picks), cfg.batch):
     idx = picks[s:s + cfg.batch]
     eps = encode_episodes(world.tok, ds, idx, keep_video=bool(show & set(idx)))
     real_r.append(np.stack([e["rewards"][S:END - 1] for e in eps]))   # reward INTO frames S+1 .. END-1
-    dr, zd = replay(eps, "dream")
+    dr, zd, pd = replay(eps, "dream")
     dream_r.append(dr)
     teach_r.append(replay(eps, "real")[0])
+    if cfg.grasp:
+        pr = np.stack([e["proprio"][S + 1:END] for e in eps])
+        # left hand (the first grasp) and right hand (the hand-over grasp), dreamed and real
+        grasp_dream.append(np.stack([holds(pd[..., j] * p_std[j] + p_mean[j]) for j in (6, 13)], 1))
+        grasp_real.append(np.stack([holds(pr[..., j] * p_std[j] + p_mean[j]) for j in (6, 13)], 1))
     if gen is not None:
         gen_r.append(replay(eps, "gen")[0])
     for j, i in enumerate(idx):
@@ -161,6 +186,22 @@ res = {"dyn": cfg.dyn, "heads": cfg.heads, "gen_dyn": cfg.gen_dyn, "data": cfg.d
        "episodes": [{"i": int(i), "success": bool(is_succ[j]),
                      **{k: round(float(r[j].sum()), 2) for k, r in srcs.items()}}
                     for j, i in enumerate(picks)]}
+if cfg.grasp:
+    g_real, g_dream = np.concatenate(grasp_real), np.concatenate(grasp_dream)
+    gr, gd = g_real[:, 0], g_dream[:, 0]
+    res["grasp"] = {"real_held": int(gr.sum()), "real_missed": int((~gr).sum()),
+                    "dream_held_when_real_held": round(float(gd[gr].mean()), 3) if gr.any() else None,
+                    "dream_missed_when_real_missed": round(float((~gd[~gr]).mean()), 3) if (~gr).any() else None,
+                    "agree": round(float((gr == gd).mean()), 3)}
+    # the hand-over, among the episodes whose first grasp held in reality AND in the dream
+    both = gr & gd
+    hr, hd = g_real[both, 1], g_dream[both, 1]
+    res["handover"] = {"n": int(both.sum()), "real_taken": int(hr.sum()), "real_missed": int((~hr).sum()),
+                       "dream_taken_when_real_taken": round(float(hd[hr].mean()), 3) if hr.any() else None,
+                       "dream_missed_when_real_missed": round(float((~hd[~hr]).mean()), 3) if (~hr).any() else None}
+    for j, e in enumerate(res["episodes"]):
+        e.update(real_left_held=bool(g_real[j, 0]), dream_left_held=bool(g_dream[j, 0]),
+                 real_right_held=bool(g_real[j, 1]), dream_right_held=bool(g_dream[j, 1]))
 json.dump(res, open(cfg.out, "w"), indent=1)
 print(json.dumps({k: v for k, v in res.items() if k != "episodes"}), flush=True)
 
